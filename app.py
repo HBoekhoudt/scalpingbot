@@ -4,12 +4,15 @@ import threading
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-from modules.ib_watchdog import ensure_connection, is_ib_connected
+from modules.ib_watchdog import ensure_connection, is_ib_connected, watchdog_loop
 from modules.session_filter import session_filter
 from modules.execution_queue import execution_queue
 from modules.position_manager import get_open_positions
 from modules.position_sync import has_open_position
 from modules.fill_tracker import monitor_trade
+from modules.bot_mode import is_live
+from modules.contract_resolver import resolve_contract
+
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
@@ -83,12 +86,17 @@ def startup():
 
     logger.info("Scalping bot started")
 
-    ensure_connection()
-
+    # Execution worker
     worker = threading.Thread(target=execution_worker, daemon=True)
     worker.start()
 
-    monitor_trade()
+    # IB watchdog
+    watchdog = threading.Thread(target=watchdog_loop, daemon=True)
+    watchdog.start()
+
+    # Fill tracker
+    fill_thread = threading.Thread(target=monitor_trade, daemon=True)
+    fill_thread.start()
 
 
 # ==========================================
@@ -133,15 +141,15 @@ async def webhook(request: Request):
     if data.get("secret") != "FDAX_bot_secure_2026":
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    if not session_filter():
+    if is_live() and not session_filter():
         logger.warning("Session filter blocked trade")
         return JSONResponse({"status": "blocked"})
 
-    if has_open_position():
+    if is_live() and has_open_position():
         logger.warning("Position sync blocked trade")
         return JSONResponse({"status": "blocked"})
 
-    if trade_state != "IDLE":
+    if is_live() and trade_state != "IDLE":
         logger.warning("Trade state blocked trade")
         return JSONResponse({"status": "blocked"})
 
@@ -154,6 +162,8 @@ async def webhook(request: Request):
 
     qty = 1
 
+    contract = resolve_contract(symbol)
+
     job = {
         "symbol": symbol,
         "side": side,
@@ -161,7 +171,7 @@ async def webhook(request: Request):
         "stop": stop,
         "target": target,
         "qty": qty,
-        "contract": None
+        "contract": contract
     }
 
     execution_queue.put(job)
