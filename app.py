@@ -12,6 +12,7 @@ from modules.position_sync import has_open_position
 from modules.fill_tracker import monitor_trade
 from modules.bot_mode import is_live
 from modules.contract_resolver import resolve_contract
+from modules.execution_engine import execution_worker
 
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -20,61 +21,6 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
 trade_state = "IDLE"
-
-
-# ==========================================
-# EXECUTION WORKER
-# ==========================================
-
-def execution_worker():
-
-    global trade_state
-
-    logger.info("Execution queue worker started")
-
-    while True:
-
-        job = execution_queue.get()
-
-        try:
-
-            ib = ensure_connection()
-
-            symbol = job["symbol"]
-            side = job["side"]
-            entry = job["entry"]
-            stop = job["stop"]
-            target = job["target"]
-            qty = job["qty"]
-            contract = job["contract"]
-
-            logger.info(
-                f"EXECUTION -> {symbol} {side.upper()} Entry {entry} Stop {stop} Target {target} Qty {qty}"
-            )
-
-            bracket = ib.bracketOrder(
-                action="BUY" if side == "long" else "SELL",
-                quantity=qty,
-                limitPrice=entry,
-                takeProfitPrice=target,
-                stopLossPrice=stop
-            )
-
-            for order in bracket:
-                ib.placeOrder(contract, order)
-
-            trade_state = "IN_TRADE"
-
-            logger.info("Bracket order sent")
-
-        except Exception as e:
-
-            logger.error(f"Execution error {e}")
-            trade_state = "IDLE"
-
-        finally:
-
-            execution_queue.task_done()
 
 
 # ==========================================

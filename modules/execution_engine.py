@@ -1,49 +1,75 @@
-from ib_insync import Future
-from modules.ibkr_connection import get_ib
 import logging
+
+from modules.ib_watchdog import ensure_connection
+from modules.execution_queue import execution_queue
+from modules.order_id_manager import get_next_order_id
+
 
 logger = logging.getLogger("ikbr_scalpingbot")
 
-EXCHANGE_MAP = {
-    "FDXM": "EUREX",
-    "MES": "CME",
-    "MNQ": "CME",
-    "M6E": "CME"
-}
+trade_state = "IDLE"
 
 
-def place_bracket_order(
-    symbol,
-    side,
-    quantity,
-    entry,
-    target,
-    stop
-):
+# ==========================================
+# EXECUTION WORKER
+# ==========================================
 
-    ib = get_ib()
+def execution_worker():
 
-    exchange = EXCHANGE_MAP[symbol]
+    global trade_state
 
-    contract = Future(
-        symbol=symbol,
-        exchange=exchange
-    )
+    logger.info("Execution queue worker started")
 
-    ib.qualifyContracts(contract)
+    while True:
 
-    action = "BUY" if side == "long" else "SELL"
+        job = execution_queue.get()
 
-    parent, tp, sl = ib.bracketOrder(
-        action=action,
-        quantity=quantity,
-        limitPrice=entry,
-        takeProfitPrice=target,
-        stopLossPrice=stop
-    )
+        try:
 
-    ib.placeOrder(contract, parent)
-    ib.placeOrder(contract, tp)
-    ib.placeOrder(contract, sl)
+            ib = ensure_connection()
 
-    logger.info("Bracket order placed")
+            symbol = job["symbol"]
+            side = job["side"]
+            entry = job["entry"]
+            stop = job["stop"]
+            target = job["target"]
+            qty = job["qty"]
+            contract = job["contract"]
+
+            # Ensure IBKR contract is fully qualified
+            contract = ib.qualifyContracts(contract)[0]
+
+            logger.info(
+                f"EXECUTION -> {symbol} {side.upper()} Entry {entry} Stop {stop} Target {target} Qty {qty}"
+            )
+
+            bracket = ib.bracketOrder(
+                action="BUY" if side == "long" else "SELL",
+                quantity=qty,
+                limitPrice=entry,
+                takeProfitPrice=target,
+                stopLossPrice=stop
+            )
+
+            # Controlled order IDs
+            base_order_id = get_next_order_id()
+
+            bracket[0].orderId = base_order_id
+            bracket[1].orderId = base_order_id + 1
+            bracket[2].orderId = base_order_id + 2
+
+            for order in bracket:
+                ib.placeOrder(contract, order)
+
+            trade_state = "IN_TRADE"
+
+            logger.info("Bracket order sent")
+
+        except Exception as e:
+
+            logger.error(f"Execution error {e}")
+            trade_state = "IDLE"
+
+        finally:
+
+            execution_queue.task_done()

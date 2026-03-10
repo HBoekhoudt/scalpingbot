@@ -1,4 +1,5 @@
 from ib_insync import Future, Forex
+from modules.symbol_normalizer import normalize_symbol
 
 
 def resolve_contract(symbol):
@@ -6,13 +7,7 @@ def resolve_contract(symbol):
     Translate TradingView symbol into an IBKR contract object.
     """
 
-    symbol = symbol.upper().strip()
-
-    # ------------------------------------------------
-    # Normalize TradingView continuous futures
-    # ------------------------------------------------
-    if symbol.endswith("1!"):
-        symbol = symbol.replace("1!", "")
+    symbol = normalize_symbol(symbol)
 
     # ------------------------------------------------
     # DAX Mini (EUREX)

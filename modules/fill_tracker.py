@@ -6,6 +6,9 @@ from modules.ib_watchdog import ensure_connection
 
 logger = logging.getLogger("ikbr_scalpingbot")
 
+# Track processed executions to avoid duplicates
+seen_exec_ids = set()
+
 
 def monitor_trade():
     """
@@ -25,6 +28,14 @@ def monitor_trade():
                 fills = ib.fills()
 
                 for f in fills:
+
+                    exec_id = f.execution.execId
+
+                    # Skip already processed executions
+                    if exec_id in seen_exec_ids:
+                        continue
+
+                    seen_exec_ids.add(exec_id)
 
                     contract = f.contract.symbol
                     side = f.execution.side
