@@ -2,6 +2,7 @@ import logging
 import time
 import threading
 from ib_insync import IB
+from modules.order_id_manager import set_next_order_id
 import asyncio
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -34,11 +35,8 @@ def ensure_connection():
 
         try:
 
-            # Python 3.12 thread event loop fix
-            try:
-                asyncio.get_event_loop()
-            except RuntimeError:
-                asyncio.set_event_loop(asyncio.new_event_loop())
+            # Always create a fresh event loop in this thread
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
             logger.info("Connecting to IBKR...")
 
@@ -48,7 +46,11 @@ def ensure_connection():
                 clientId=IB_CLIENT_ID
             )
 
-            logger.info("IBKR connected")
+            if ib.isConnected():
+                logger.info("IBKR connected")
+                set_next_order_id(ib.client.getReqId())
+            else:
+                logger.error("IBKR connection failed")
 
         except Exception as e:
 

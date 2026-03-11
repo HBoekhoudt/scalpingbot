@@ -1,13 +1,13 @@
 import logging
+import asyncio
 
 from modules.ib_watchdog import ensure_connection
 from modules.execution_queue import execution_queue
 from modules.order_id_manager import get_next_order_id
+import modules.trade_state as trade_state
 
 
 logger = logging.getLogger("ikbr_scalpingbot")
-
-trade_state = "IDLE"
 
 
 # ==========================================
@@ -16,13 +16,15 @@ trade_state = "IDLE"
 
 def execution_worker():
 
-    global trade_state
+    # Create event loop for this thread (required by ib_insync)
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     logger.info("Execution queue worker started")
 
     while True:
 
         job = execution_queue.get()
+        logger.info(f"Worker received job: {job}")
 
         try:
 
@@ -61,14 +63,14 @@ def execution_worker():
             for order in bracket:
                 ib.placeOrder(contract, order)
 
-            trade_state = "IN_TRADE"
+            trade_state.set_state("IN_TRADE")
 
             logger.info("Bracket order sent")
 
         except Exception as e:
 
-            logger.error(f"Execution error {e}")
-            trade_state = "IDLE"
+            logger.exception("Execution error")
+            trade_state.set_state("IDLE")
 
         finally:
 
