@@ -1,413 +1,124 @@
-# IBKR Scalping Bot – System Architecture
+# IBKR Scalping Bot — Architecture (OOP Version)
 
-This document describes the architecture of the IBKR scalping bot.
+## System Overview
 
-The purpose of this document is to:
+The scalping bot is a real-time automated trading engine designed for low-latency execution using Interactive Brokers.
 
-- document the current system architecture
-- explain the responsibility of each module
-- guide future engineering sessions
-- prevent accidental architecture changes
+The system receives trading signals from TradingView and executes bracket orders on IBKR.
 
-The system is designed for **stable, production-grade automated trading**.
+The architecture uses a **single object-oriented runtime engine** implemented in:
 
+scalpingbot.py
 
-==================================================
-SYSTEM OVERVIEW
-==================================================
+This ensures a **single source of truth for runtime state**.
 
-This repository contains a professional IBKR scalping bot that converts
-TradingView alerts into executable orders on Interactive Brokers (IBKR).
+---
 
-The bot runs a FastAPI server that receives webhook signals from TradingView.
+# Execution Flow
 
-These signals are validated, transformed into trade jobs, and processed by a
-dedicated execution engine that sends orders to IBKR.
+TradingView
+↓
+Webhook
+↓
+FastAPI endpoint
+↓
+ScalpingBot.enqueue_signal()
+↓
+Execution Queue
+↓
+Worker Thread
+↓
+IBKR Order Submission
 
-The architecture is designed to prevent:
+---
 
-- race conditions
-- duplicate orders
-- ghost positions
-- reconnect bugs
-- inconsistent symbol handling
+# Core Engine
 
+All runtime logic is centralized in the class:
 
-==================================================
-TRADING MODES
-==================================================
+ScalpingBot
 
-The bot supports two trading modes:
+This class manages:
 
-PAPER  
-LIVE  
+• IB connection  
+• contract registry  
+• order id management  
+• signal queue  
+• worker thread  
+• order execution  
+• fill tracking  
+• position tracking  
 
-Defined in:
+---
 
-modules/bot_mode.py
+# Thread Model
 
+The system uses a single worker thread responsible for order execution.
 
---------------------------------------------------
-PAPER MODE
---------------------------------------------------
+The worker initializes its own asyncio event loop:
 
-Purpose:
+asyncio.set_event_loop(asyncio.new_event_loop())
 
-Order execution testing and data collection.
+This ensures compatibility with ib_insync.
 
+---
 
-Behavior:
+# Contract Management
 
-- orders may be executed without strategy restrictions
-- multiple simultaneous trades allowed
-- session_filter may be bypassed
-- duplicate signals may be allowed
-- position limits may be ignored
+Contracts are created through:
 
+bot.get_contract(symbol)
 
-Reason:
+The system maintains a contract cache:
 
-PAPER mode is used to evaluate order execution,
-tick size behaviour, fills, TP/SL performance and latency.
+bot.contract_cache
 
+This prevents inconsistent contract construction.
 
---------------------------------------------------
-LIVE MODE
---------------------------------------------------
+---
 
-Purpose:
+# Order Model
 
-Real trading with full safety controls.
+Orders are submitted as bracket orders:
 
+Entry
+Stop
+Target
 
-Behavior:
+The final order in the bracket has:
 
-All safety systems must be active:
+transmit = True
 
-session_filter  
-position limits  
-duplicate signal protection  
-risk_manager  
-trade_state protection  
+---
 
-Only one trade allowed at a time (unless strategy changes later).
+# State Management
 
+Runtime state is stored inside the ScalpingBot instance.
 
-==================================================
-EXECUTION PIPELINE
-==================================================
+Example:
 
-The execution pipeline is strictly defined and must never be bypassed.
+bot.ib  
+bot.contract_cache  
+bot.execution_queue  
+bot.trade_state  
+bot.positions
 
-TradingView alert  
-→ FastAPI webhook  
-→ resolve_contract  
-→ execution_queue  
-→ execution_engine  
-→ IBKR order execution  
+---
 
-Every trade must pass through this pipeline.
+# Startup Sequence
 
-No module is allowed to send orders directly to IBKR except
-`execution_engine`.
+1. Start FastAPI server
+2. Initialize ScalpingBot
+3. Connect to IBKR
+4. Qualify futures contracts
+5. Start execution worker
 
-This separation ensures safe and deterministic execution.
+---
 
+# Deterministic Execution
 
-==================================================
-CURRENT MODULE STRUCTURE
-==================================================
+The architecture ensures that:
 
-
---------------------------------------------------
-app.py
---------------------------------------------------
-
-FastAPI application server.
-
-Responsibilities:
-
-- Receive TradingView webhook alerts
-- Validate webhook payloads
-- Apply session and position checks
-- Convert signals into execution jobs
-- Push jobs into `execution_queue`
-
-This module **never sends orders to IBKR directly**.
-
-
---------------------------------------------------
-modules/bot_mode.py
---------------------------------------------------
-
-Defines the trading mode.
-
-Responsibilities:
-
-- Toggle between LIVE and PAPER mode
-- Prevent live order execution when the bot is not in live mode
-
-
---------------------------------------------------
-modules/contract_resolver.py
---------------------------------------------------
-
-Responsible for converting TradingView symbols into IBKR contracts.
-
-Example conversion:
-
-FDAX1!  
-→ FDAX  
-→ FDXM  
-→ IBKR Future(EUREX)
-
-This module ensures the correct IBKR contract is used before execution.
-
-
---------------------------------------------------
-modules/execution_queue.py
---------------------------------------------------
-
-Thread-safe queue for pending trade jobs.
-
-Responsibilities:
-
-- Store trade jobs generated by the webhook
-- Ensure deterministic order execution
-- Prevent race conditions
-
-All trade execution must pass through this queue.
-
-
---------------------------------------------------
-modules/execution_engine.py
---------------------------------------------------
-
-The only module allowed to send orders to IBKR.
-
-Responsibilities:
-
-- Consume jobs from `execution_queue`
-- Maintain IBKR connection via watchdog
-- Qualify IBKR contracts
-- Create bracket orders
-- Submit orders to IBKR
-
-Each trade must produce a **bracket order** consisting of:
-
-Entry  
-StopLoss  
-TakeProfit  
-
-
---------------------------------------------------
-modules/ib_watchdog.py
---------------------------------------------------
-
-Maintains the IBKR connection.
-
-Responsibilities:
-
-- Monitor IBKR connectivity
-- Automatically reconnect if the connection is lost
-- Provide a stable connection for execution_engine
-
-
---------------------------------------------------
-modules/fill_tracker.py
---------------------------------------------------
-
-Monitors fills and execution events.
-
-Responsibilities:
-
-- Track order fills
-- Log execution results
-- Provide debugging visibility into trades
-
-
---------------------------------------------------
-modules/session_filter.py
---------------------------------------------------
-
-Controls when trading is allowed.
-
-Responsibilities:
-
-- Prevent trades outside configured trading hours
-- Enforce session-based trading rules
-
-
---------------------------------------------------
-modules/position_manager.py
---------------------------------------------------
-
-Tracks open positions.
-
-Responsibilities:
-
-- Retrieve open positions
-- Provide position visibility to the bot
-
-
---------------------------------------------------
-modules/position_sync.py
---------------------------------------------------
-
-Synchronizes bot state with IBKR.
-
-Responsibilities:
-
-- Detect open positions on IBKR
-- Prevent duplicate entries
-- Ensure the bot does not trade against an existing position
-
-
-==================================================
-TARGET ARCHITECTURE (PLANNED MODULES)
-==================================================
-
-The system will gradually expand with additional modules to improve
-robustness and safety.
-
-
---------------------------------------------------
-modules/symbol_normalizer.py
---------------------------------------------------
-
-Normalize TradingView symbols before contract resolution.
-
-Examples:
-
-FDAX1! → FDXM  
-MES1! → MES  
-MNQ1! → MNQ  
-
-This module ensures symbol consistency across the system.
-
-
---------------------------------------------------
-modules/order_manager.py
---------------------------------------------------
-
-Track order lifecycle.
-
-Responsibilities:
-
-- Track entry submission
-- Detect entry fills
-- Activate TP/SL
-- Detect trade closure
-
-
---------------------------------------------------
-modules/signal_guard.py
---------------------------------------------------
-
-Prevent duplicate TradingView signals.
-
-TradingView alerts may be triggered multiple times.
-
-This module ensures duplicate alerts do not create duplicate trades.
-
-
---------------------------------------------------
-modules/order_sync.py
---------------------------------------------------
-
-Synchronize orders after IBKR reconnect.
-
-Responsibilities:
-
-- Recover active orders
-- Detect orphan orders
-- Prevent ghost positions
-
-
---------------------------------------------------
-modules/risk_manager.py
---------------------------------------------------
-
-Apply trading risk controls.
-
-Responsibilities:
-
-- Maximum number of open trades
-- Daily loss limits
-- Position sizing rules
-
-
-==================================================
-ENGINEERING PRINCIPLES
-==================================================
-
-The architecture follows several core engineering principles.
-
-
---------------------------------------------------
-Single Responsibility
---------------------------------------------------
-
-Each module has one clearly defined responsibility.
-
-This makes the system easier to reason about and maintain.
-
-
---------------------------------------------------
-Deterministic Execution
---------------------------------------------------
-
-Trade execution must always pass through `execution_queue`.
-
-This prevents race conditions and ensures predictable execution.
-
-
---------------------------------------------------
-Centralized Order Execution
---------------------------------------------------
-
-Only one module may send orders to IBKR:
-
-execution_engine
-
-
---------------------------------------------------
-Consistent Symbol Handling
---------------------------------------------------
-
-TradingView symbols must always be normalized before contract resolution.
-
-This ensures symbol consistency across the system.
-
-
---------------------------------------------------
-Contract Qualification
---------------------------------------------------
-
-All IBKR contracts must be qualified before order submission:
-
-ib.qualifyContracts()
-
-
---------------------------------------------------
-Bracket Order Safety
---------------------------------------------------
-
-Every entry order must always create a bracket order containing:
-
-Entry  
-StopLoss  
-TakeProfit  
-
-
-==================================================
-ARCHITECTURE STABILITY
-==================================================
-
-Future development must respect the execution pipeline and module boundaries.
-
-The architecture is designed to prevent the most common trading bot failures.
-
-All engineering sessions must follow the rules defined in:
-
-ENGINEERING_RULES.md
+• webhook processing is non-blocking  
+• order execution occurs only in the worker thread  
+• broker interaction is isolated

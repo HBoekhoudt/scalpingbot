@@ -1,87 +1,74 @@
 from ib_insync import Future, Forex
-from datetime import datetime
 from modules.symbol_normalizer import normalize_symbol
 
 
-def _front_month():
+def resolve_contract(symbol: str):
     """
-    Determine the current front-month futures contract.
-    Futures roll quarterly: Mar, Jun, Sep, Dec.
-    """
+    Translate a TradingView symbol into an IBKR contract object.
 
-    now = datetime.utcnow()
-
-    year = now.year
-    month = now.month
-
-    if month <= 3:
-        expiry_month = "03"
-    elif month <= 6:
-        expiry_month = "06"
-    elif month <= 9:
-        expiry_month = "09"
-    else:
-        expiry_month = "12"
-
-    return f"{year}{expiry_month}"
-
-
-def resolve_contract(symbol):
-    """
-    Translate TradingView symbol into an IBKR contract object.
+    Supported TradingView symbols (examples):
+        MNQ1!   → MNQ
+        MES1!   → MES
+        M6E1!   → M6E
+        FDAX1!  → FDXM
+        EURUSD  → EURUSD
+        EUR/USD → EURUSD
     """
 
     symbol = normalize_symbol(symbol)
-    expiry = _front_month()
 
     # ------------------------------------------------
-    # DAX Mini (EUREX)
-    # ------------------------------------------------
-    if symbol in ["FDXM", "DAX"]:
-        return Future(
-            symbol="FDXM",
-            exchange="EUREX",
-            currency="EUR",
-            lastTradeDateOrContractMonth=expiry
-        )
-
-    # ------------------------------------------------
-    # Micro ES
-    # ------------------------------------------------
-    if symbol == "MES":
-        return Future(
-            symbol="MES",
-            exchange="GLOBEX",
-            currency="USD",
-            lastTradeDateOrContractMonth=expiry
-        )
-
-    # ------------------------------------------------
-    # Micro Nasdaq
+    # Micro Nasdaq (CME / GLOBEX)
     # ------------------------------------------------
     if symbol == "MNQ":
         return Future(
             symbol="MNQ",
+            lastTradeDateOrContractMonth="20260320",
             exchange="GLOBEX",
             currency="USD",
-            lastTradeDateOrContractMonth=expiry
+            tradingClass="MNQ"
         )
 
     # ------------------------------------------------
-    # Micro EUR/USD
+    # Micro S&P500 (CME / GLOBEX)
+    # ------------------------------------------------
+    if symbol == "MES":
+        return Future(
+            symbol="MES",
+            lastTradeDateOrContractMonth="20260320",
+            exchange="GLOBEX",
+            currency="USD",
+            tradingClass="MES"
+        )
+
+    # ------------------------------------------------
+    # Micro EURUSD Future (CME / GLOBEX)
     # ------------------------------------------------
     if symbol == "M6E":
         return Future(
             symbol="M6E",
+            lastTradeDateOrContractMonth="20260316",
             exchange="GLOBEX",
             currency="USD",
-            lastTradeDateOrContractMonth=expiry
+            tradingClass="M6E"
+        )
+
+    # ------------------------------------------------
+    # Mini DAX (EUREX)
+    # ------------------------------------------------
+    if symbol == "FDXM":
+        return Future(
+            symbol="FDXM",
+            lastTradeDateOrContractMonth="20260320",
+            exchange="EUREX",
+            currency="EUR",
+            tradingClass="FDXM"
         )
 
     # ------------------------------------------------
     # Forex EURUSD
     # ------------------------------------------------
-    if symbol in ["EURUSD", "EUR/USD"]:
+    if symbol == "EURUSD":
         return Forex("EURUSD")
 
     # ------------------------------------------------

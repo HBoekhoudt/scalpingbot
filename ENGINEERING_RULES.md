@@ -1,149 +1,69 @@
-# ENGINEERING RULES – IBKR SCALPING BOT
+# Engineering Rules
 
-This repository contains a professional IBKR scalping bot.  
-The purpose of this document is to enforce strict engineering discipline and prevent regressions during development.
+The scalping bot follows strict engineering constraints.
 
-These rules are mandatory for all future engineering tasks.
+---
 
+# Single Source of Truth
 
-==================================================
-PROJECT CONTEXT
-==================================================
+All runtime state must exist inside:
 
-This repository implements an automated trading system connected to Interactive Brokers.
+ScalpingBot
 
-The system follows a strict execution pipeline which must never be bypassed.
+Do not introduce global state.
 
-TradingView
-→ webhook
-→ resolve_contract
-→ execution_queue
-→ execution_engine
-→ IBKR
+---
 
-Every order must follow this exact path.
+# Contract Creation
 
+Contracts must only be created using:
 
-==================================================
-CRITICAL INVARIANTS
-==================================================
+bot.get_contract(symbol)
 
-These invariants must never be broken.
+Do not construct Future() objects elsewhere.
 
-Symbol normalization must always work:
+---
 
-FDAX1! → FDAX → FDXM  
-MES1! → MES  
-MNQ1! → MNQ  
+# IBKR Interaction
 
+IBKR API calls must occur only inside the execution worker.
 
-Order safety rules:
+Never call IBKR inside the FastAPI webhook.
 
-Orders may ONLY be sent from execution_engine.
+---
 
-The webhook must NEVER send orders directly.
+# Webhook Rules
 
-All trades must pass through execution_queue.
+Webhook endpoints must:
 
+• validate payload
+• enqueue signals
+• return immediately
 
-Contract safety:
+Webhook handlers must never execute trading logic.
 
-IBKR contracts must ALWAYS be qualified before order placement.
+---
 
-ib.qualifyContracts()
+# Worker Thread
 
+All order execution must occur inside the worker thread.
 
-Order structure:
+Worker threads must initialize their own event loop.
 
-Every entry must always create a bracket order:
+---
 
-Entry  
-StopLoss  
-TakeProfit  
+# Deterministic Execution
 
+Signal → Queue → Worker → Broker
 
-==================================================
-ENGINEERING PROTOCOL
-==================================================
+This pipeline must never change.
 
-All development must follow strict engineering procedures.
+---
 
+# Module Restrictions
 
---------------------------------------------------
-PATCH PROTOCOL (existing files)
---------------------------------------------------
+Do not split the trading engine across multiple modules.
 
-When modifying an existing file, the following steps are mandatory:
+All trading runtime logic must remain inside scalpingbot.py.
 
-1. Ask for the CURRENT file first.
-2. Analyze the file.
-3. Describe the minimal change required.
-4. Return the FULL updated file.
-
-Never rewrite files without seeing the current version first.
-
-
---------------------------------------------------
-CREATE PROTOCOL (new modules)
---------------------------------------------------
-
-New modules may be created directly.
-
-Constraints:
-
-- Do NOT modify existing files.
-- Return the FULL module code.
-- Follow the existing architecture.
-
-
-==================================================
-DEVELOPMENT RULES
-==================================================
-
-Each engineering task may perform ONLY ONE of the following:
-
-modify ONE module  
-or  
-create ONE module  
-
-Never both.
-
-Never redesign the architecture unless explicitly requested.
-
-Never remove existing functionality unless explicitly requested.
-
-Previously fixed bugs must never be reintroduced.
-
-
-==================================================
-ARCHITECTURE SAFETY
-==================================================
-
-The execution pipeline must always remain:
-
-TradingView  
-→ webhook  
-→ resolve_contract  
-→ execution_queue  
-→ execution_engine  
-→ IBKR
-
-Orders must always originate from execution_engine.
-
-No shortcuts are allowed.
-
-
-==================================================
-RETURN FORMAT
-==================================================
-
-PATCH:
-
-analysis  
-minimal change  
-FULL updated file  
-
-
-CREATE:
-
-FULL file content
+This prevents state fragmentation.

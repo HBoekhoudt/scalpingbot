@@ -3,7 +3,6 @@ import asyncio
 
 from modules.ib_watchdog import ensure_connection
 from modules.execution_queue import execution_queue
-from modules.order_id_manager import get_next_order_id
 import modules.trade_state as trade_state
 
 
@@ -24,11 +23,20 @@ def execution_worker():
     while True:
 
         job = execution_queue.get()
+
+        # Step A
+        logger.info("DEBUG A — Worker pulled job from queue")
         logger.info(f"Worker received job: {job}")
 
         try:
 
+            # Step B
+            logger.info("DEBUG B — Before ensure_connection()")
+
             ib = ensure_connection()
+
+            # Step C
+            logger.info("DEBUG C — After ensure_connection()")
 
             symbol = job["symbol"]
             side = job["side"]
@@ -38,12 +46,12 @@ def execution_worker():
             qty = job["qty"]
             contract = job["contract"]
 
-            # Ensure IBKR contract is fully qualified
-            contract = ib.qualifyContracts(contract)[0]
-
             logger.info(
                 f"EXECUTION -> {symbol} {side.upper()} Entry {entry} Stop {stop} Target {target} Qty {qty}"
             )
+
+            # Step F
+            logger.info("DEBUG F — Before bracketOrder creation")
 
             bracket = ib.bracketOrder(
                 action="BUY" if side == "long" else "SELL",
@@ -53,15 +61,14 @@ def execution_worker():
                 stopLossPrice=stop
             )
 
-            # Controlled order IDs
-            base_order_id = get_next_order_id()
-
-            bracket[0].orderId = base_order_id
-            bracket[1].orderId = base_order_id + 1
-            bracket[2].orderId = base_order_id + 2
+            # Step G
+            logger.info("DEBUG G — Before sending orders to IBKR")
 
             for order in bracket:
                 ib.placeOrder(contract, order)
+
+            # Step H
+            logger.info("DEBUG H — After orders sent")
 
             trade_state.set_state("IN_TRADE")
 
