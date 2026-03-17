@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from ib_insync import IB, Future, Forex
+from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
@@ -35,12 +35,10 @@ class ScalpingBot:
 
         self.trade_state = "IDLE"
 
-        self.order_id = None
-
         self.connection_lock = threading.Lock()
         self.trade_lock = threading.Lock()
 
-        # PATCH 1 — duplicate signal guard
+        # duplicate signal guard
         self.last_signal = None
         self.last_signal_time = 0
 
@@ -48,15 +46,13 @@ class ScalpingBot:
             target=self.execution_worker,
             daemon=True
         )
-
         self.worker_thread.start()
 
-        # PATCH 3 — IB reconnect watchdog
+        # IB reconnect watchdog
         self.watchdog_thread = threading.Thread(
             target=self.ib_watchdog,
             daemon=True
         )
-
         self.watchdog_thread.start()
 
     # ======================================================
@@ -73,8 +69,6 @@ class ScalpingBot:
             if self.ib.isConnected():
                 return
 
-            asyncio.set_event_loop(asyncio.new_event_loop())
-
             logger.info("Connecting to IBKR...")
 
             self.ib.connect(
@@ -90,11 +84,6 @@ class ScalpingBot:
 
             self.attach_ib_events()
 
-            self.order_id = self.ib.client.getReqId()
-
-            logger.info(f"Order ID initialized to {self.order_id}")
-
-            # PATCH 4 — crash recovery position check
             positions = self.ib.positions()
 
             for pos in positions:
@@ -115,16 +104,23 @@ class ScalpingBot:
 
         def on_order_status(trade):
             logger.info(
-                f"ORDER STATUS: id={trade.order.orderId} "
+                f"ORDER STATUS | "
+                f"orderId={trade.order.orderId} "
+                f"parentId={getattr(trade.order,'parentId',None)} "
+                f"action={trade.order.action} "
+                f"orderType={trade.order.orderType} "
                 f"status={trade.orderStatus.status} "
                 f"filled={trade.orderStatus.filled} "
-                f"remaining={trade.orderStatus.remaining}"
+                f"remaining={trade.orderStatus.remaining} "
+                f"avgFillPrice={trade.orderStatus.avgFillPrice}"
             )
+
+            if "Modify" in str(trade.orderStatus.status):
+                logger.error("CRITICAL: MODIFY DETECTED → ORDER CHAIN CORRUPTION")
 
         def on_exec_details(trade, fill):
             logger.info(f"FILL: {fill}")
 
-            # PATCH 2 — trade_state reset after position closes
             positions = self.ib.positions()
 
             if not any(p.position != 0 for p in positions):
@@ -132,7 +128,10 @@ class ScalpingBot:
                 logger.info("Position closed — trade_state reset to IDLE")
 
         def on_ib_error(reqId, errorCode, errorString, contract):
-            logger.error(f"IB ERROR {errorCode}: {errorString}")
+            symbol = getattr(contract, "symbol", None) if contract else None
+            logger.error(
+                f"IB ERROR | reqId={reqId} code={errorCode} symbol={symbol} message={errorString}"
+            )
 
         self.ib.orderStatusEvent += on_order_status
         self.ib.execDetailsEvent += on_exec_details
@@ -162,22 +161,6 @@ class ScalpingBot:
     # CONTRACTS
     # ======================================================
 
-    def _front_month(self):
-
-        now = datetime.utcnow()
-
-        year = now.year
-        month = now.month
-
-        if month <= 3:
-            return f"{year}0321"
-        elif month <= 6:
-            return f"{year}0621"
-        elif month <= 9:
-            return f"{year}0921"
-        else:
-            return f"{year}1221"
-
     def qualify_contracts(self):
 
         logger.info("Qualifying futures contracts...")
@@ -192,30 +175,30 @@ class ScalpingBot:
         for sym, exch, cur in symbols:
 
             if sym == "FDXM":
-                details = self.ib.reqContractDetails(
-                    Future(
-                        symbol=sym,
-                        exchange=exch,
-                        currency=cur,
-                        tradingClass=sym
-                    )
+                contract = Future(
+                    symbol=sym,
+                    exchange=exch,
+                    currency=cur,
+                    tradingClass=sym
                 )
             else:
-                details = self.ib.reqContractDetails(
-                    Future(
-                        symbol=sym,
-                        exchange=exch,
-                        currency=cur
-                    )
+                contract = Future(
+                    symbol=sym,
+                    exchange=exch,
+                    currency=cur
                 )
+
+            details = self.ib.reqContractDetails(contract)
 
             if not details:
                 logger.error(f"Contract qualification failed for {sym}")
                 continue
 
-            contract = details[0].contract
+            self.contract_cache[sym] = details[0].contract
 
-            self.contract_cache[sym] = contract
+            logger.info(
+                f"Qualified {sym} → {details[0].contract.lastTradeDateOrContractMonth}"
+            )
 
         logger.info(
             f"Contract cache initialized: {list(self.contract_cache.keys())}"
@@ -233,25 +216,7 @@ class ScalpingBot:
         if symbol == "EURUSD":
             return Forex("EURUSD")
 
-        logger.warning(f"Contract {symbol} not cached — attempting dynamic qualification")
-
-        if symbol == "FDXM":
-            details = self.ib.reqContractDetails(
-                Future(symbol=symbol, exchange="EUREX", currency="EUR", tradingClass=symbol)
-            )
-        else:
-            details = self.ib.reqContractDetails(
-                Future(symbol=symbol, exchange="CME", currency="USD")
-            )
-
-        if not details:
-            raise ValueError(f"Unable to qualify contract {symbol}")
-
-        contract = details[0].contract
-
-        self.contract_cache[symbol] = contract
-
-        return contract
+        raise ValueError(f"Contract {symbol} not cached")
 
     # ======================================================
     # SIGNAL HANDLING
@@ -266,7 +231,6 @@ class ScalpingBot:
         side = signal["side"]
         entry = float(signal["entry_price"])
 
-        # PATCH 1 — duplicate TradingView signal guard
         current_time = time.time()
 
         signal_key = f"{symbol}-{side}-{entry}"
@@ -313,19 +277,14 @@ class ScalpingBot:
         while True:
 
             job = self.execution_queue.get()
+            logger.info(f"WORKER RECEIVED JOB: {job}")
 
             try:
-
                 self.connect_ib()
-
                 self.place_bracket_order(job)
-
             except Exception:
-
                 logger.exception("Execution failure")
-
             finally:
-
                 self.execution_queue.task_done()
 
     # ======================================================
@@ -334,14 +293,20 @@ class ScalpingBot:
 
     def place_bracket_order(self, job):
 
-        # PATCH — atomic trade_state guard
-        with self.trade_lock:
+        # 🔧 FIX 1 — FORCE IB SYNC
+        self.ib.reqOpenOrders()
+        self.ib.sleep(0.3)
+        open_orders = self.ib.openOrders()
 
-            if self.trade_state == "IN_TRADE":
-                logger.info("Trade ignored — already in position")
-                return
-
-            self.trade_state = "IN_TRADE"
+        # 🔧 FIX 2 — HARD BLOCK
+        #if open_orders:
+        #    logger.error("HARD BLOCK → EXISTING IB ORDERS STILL ACTIVE")
+        #
+        #    for o in open_orders:
+        #        logger.error(
+        #            f"ACTIVE ORDER | id={o.orderId} parent={o.parentId} action={o.action}"
+        #        )
+        #    return
 
         symbol = job["symbol"]
         side = job["side"]
@@ -349,63 +314,77 @@ class ScalpingBot:
 
         contract = self.get_contract(symbol)
 
-        logger.info(f"Using contract conId={contract.conId}")
-
         if symbol in ("MES", "MNQ"):
             stop_distance = 2
             target_distance = 4
-
         elif symbol == "M6E":
             stop_distance = 0.002
             target_distance = 0.004
-
         else:
             stop_distance = 2
             target_distance = 4
 
         if side == "long":
-
             stop = entry - stop_distance
             target = entry + target_distance
             action = "BUY"
-
         else:
-
             stop = entry + stop_distance
             target = entry - target_distance
             action = "SELL"
 
-        logger.info(
-            f"Placing bracket order {symbol} entry={entry} stop={stop} target={target}"
-        )
+        opposite_action = "SELL" if action == "BUY" else "BUY"
 
-        self.ib.client.setConnectOptions("+PACEAPI")
+        parent_id = self.ib.client.getReqId()
 
-        bracket = self.ib.bracketOrder(
-            action=action,
-            quantity=1,
-            limitPrice=entry,
-            takeProfitPrice=target,
-            stopLossPrice=stop
-        )
+        existing_ids = {o.orderId for o in open_orders}
 
-        # PATCH — ensure bracket is transmitted
-        bracket[0].transmit = False
-        bracket[1].transmit = False
-        bracket[2].transmit = True
+        if parent_id in existing_ids:
+            logger.error("ORDER ID REUSE DETECTED → FORCING NEW ID")
+            parent_id = self.ib.client.getReqId()
 
-        for order in bracket:
-            self.ib.placeOrder(contract, order)
+        tp_id = parent_id + 1
+        sl_id = parent_id + 2
 
-        self.ib.waitOnUpdate(timeout=1)
+        logger.info("ORDER DEBUG →")
+        logger.info(f"parent_id={parent_id} tp_id={tp_id} sl_id={sl_id}")
 
-        logger.info(f"Bracket order placed for {symbol}")
+        parent = LimitOrder(action=action, totalQuantity=1, lmtPrice=entry, transmit=False)
+        parent.orderId = parent_id
+        parent.parentId = 0
+
+        tp = LimitOrder(action=opposite_action, totalQuantity=1, lmtPrice=target, transmit=False)
+        tp.orderId = tp_id
+        tp.parentId = parent_id
+
+        sl = StopOrder(action=opposite_action, totalQuantity=1, stopPrice=stop, transmit=True)
+        sl.orderId = sl_id
+        sl.parentId = parent_id
+
+        for o in [parent, tp, sl]:
+            logger.info(
+                f"ORDER → action={o.action} type={o.orderType} parentId={o.parentId} transmit={o.transmit}"
+            )
+
+        self.ib.placeOrder(contract, parent)
+        self.ib.placeOrder(contract, tp)
+        self.ib.placeOrder(contract, sl)
+
+        trades = self.ib.trades()
+
+        for t in trades:
+            logger.info(
+                f"POST TRADE | orderId={t.order.orderId} parentId={t.order.parentId} "
+                f"permId={t.order.permId} status={t.orderStatus.status}"
+            )
 
     # ======================================================
     # IB WATCHDOG
     # ======================================================
 
     def ib_watchdog(self):
+
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
         while True:
 

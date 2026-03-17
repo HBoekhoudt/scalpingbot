@@ -38,7 +38,7 @@ Start-Process powershell `
 -ArgumentList "-NoExit", "-Command", "
 cd '$projectPath';
 & '$venvActivate';
-uvicorn app:app --host 0.0.0.0 --port 8000
+uvicorn scalpingbot:app --host 0.0.0.0 --port 8000
 "
 
 Start-Sleep -Seconds 3
