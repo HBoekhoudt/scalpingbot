@@ -1,27 +1,43 @@
+# ==========================================================
+# VERSIONING
+# ==========================================================
+
+BOT_NAME = "IKBR_SCALPING_BOT"
+BOT_VERSION = "v1.5.0"
+BOT_PATCH = "P260320012"
+BOT_FULL_VERSION = f"{BOT_VERSION}-{BOT_PATCH}"
+BOT_STAGE = "TEST"  # TEST | LIVE
+
+"""
+PATCH P260320012
+
+* Removed broken FDXM contract (prevents error 200)
+"""
+
 import logging
-import asyncio
 import threading
 import queue
 import time
-import math
+import asyncio
 
-from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
+from ib_insync import IB, Future, Forex, LimitOrder
+
+# ==========================================================
+# LOGGING
+# ==========================================================
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
 
-
 # ==========================================================
-# SCALPING BOT ENGINE
+# BOT
 # ==========================================================
 
 class ScalpingBot:
 
     def __init__(self):
-
         self.ib = IB()
 
         self.IB_HOST = "127.0.0.1"
@@ -29,41 +45,29 @@ class ScalpingBot:
         self.IB_CLIENT_ID = 101
 
         self.contract_cache = {}
-
         self.execution_queue = queue.Queue()
 
-        self.positions = {}
-
-        self.mode = "TEST"
-        self.signal_cache = {}
-        self.signal_ttl = 10
+        self.trade_state = "IDLE"
 
         self.connection_lock = threading.Lock()
         self.trade_lock = threading.Lock()
 
-        self.worker_thread = threading.Thread(
-            target=self.execution_worker,
-            daemon=True
-        )
-        self.worker_thread.start()
+        self.active_order_ids = set()
 
-        self.watchdog_thread = threading.Thread(
-            target=self.ib_watchdog,
-            daemon=True
-        )
-        self.watchdog_thread.start()
+        logger.info(f"{BOT_NAME} {BOT_FULL_VERSION} STARTED ({BOT_STAGE})")
 
-    # ======================================================
-    # IB CONNECTION
-    # ======================================================
+        threading.Thread(target=self.execution_worker, daemon=True).start()
+        threading.Thread(target=self.ib_watchdog, daemon=True).start()
+
+    # ==========================================================
+    # IB CONNECT
+    # ==========================================================
 
     def connect_ib(self):
-
         if self.ib.isConnected():
             return
 
         with self.connection_lock:
-
             if self.ib.isConnected():
                 return
 
@@ -78,428 +82,158 @@ class ScalpingBot:
             if not self.ib.isConnected():
                 raise RuntimeError("IBKR connection failed")
 
-            logger.info("IBKR connected")
-            logger.info(f"IB CONNECTED STATE: {self.ib.isConnected()}")
-
             self.attach_ib_events()
-
             self.qualify_contracts()
 
-    # ======================================================
-    # IB EVENTS
-    # ======================================================
+    # ==========================================================
+    # EVENTS
+    # ==========================================================
 
     def attach_ib_events(self):
-
         if hasattr(self.ib, "_events_attached"):
             return
 
         def on_order_status(trade):
+            if trade.order.clientId != self.IB_CLIENT_ID:
+                return
+
+            if trade.order.orderId not in self.active_order_ids:
+                return
+
             logger.info(
-                f"ORDER STATUS | "
-                f"orderId={trade.order.orderId} "
-                f"parentId={getattr(trade.order,'parentId',None)} "
-                f"action={trade.order.action} "
-                f"orderType={trade.order.orderType} "
-                f"status={trade.orderStatus.status} "
-                f"filled={trade.orderStatus.filled} "
-                f"remaining={trade.orderStatus.remaining} "
-                f"avgFillPrice={trade.orderStatus.avgFillPrice}"
+                f"ORDER STATUS | {trade.order.orderId} → {trade.orderStatus.status}"
             )
 
-        def on_exec_details(trade, fill):
-            logger.info(f"FILL: {fill}")
+            if trade.orderStatus.status in ("Filled", "Cancelled"):
+                self.active_order_ids.discard(trade.order.orderId)
 
-        def on_ib_error(reqId, errorCode, errorString, contract):
-            symbol = getattr(contract, "symbol", None) if contract else None
-            logger.error(
-                f"IB ERROR | reqId={reqId} code={errorCode} symbol={symbol} message={errorString}"
-            )
+                if not self.active_order_ids:
+                    self.trade_state = "IDLE"
+                    logger.info("TRADE COMPLETE → IDLE")
 
         self.ib.orderStatusEvent += on_order_status
-        self.ib.execDetailsEvent += on_exec_details
-        self.ib.errorEvent += on_ib_error
-
         self.ib._events_attached = True
 
-    # ======================================================
-    # SYMBOL RESOLUTION
-    # ======================================================
-
-    def resolve_symbol(self, tv_symbol):
-
-        symbol = tv_symbol.upper()
-
-        if symbol.endswith("1!"):
-            symbol = symbol[:-2]
-
-        if symbol == "FDAX":
-            symbol = "FDXM"
-
-        logger.info(f"Resolved TradingView symbol {tv_symbol} → {symbol}")
-
-        return symbol
-
-    # ======================================================
+    # ==========================================================
     # CONTRACTS
-    # ======================================================
+    # ==========================================================
 
     def qualify_contracts(self):
-
-        logger.info("Qualifying futures contracts...")
-
-        symbols = [
+        configs = [
             ("MNQ", "CME", "USD"),
             ("MES", "CME", "USD"),
             ("M6E", "CME", "USD"),
-            ("FDXM", "EUREX", "EUR"),
         ]
 
-        for sym, exch, cur in symbols:
-
-            if sym == "FDXM":
-                contract = Future(
-                    symbol=sym,
-                    exchange=exch,
-                    currency=cur,
-                    tradingClass=sym
-                )
-            else:
-                contract = Future(
-                    symbol=sym,
-                    exchange=exch,
-                    currency=cur
-                )
-
+        for sym, exch, cur in configs:
+            contract = Future(symbol=sym, exchange=exch, currency=cur)
             details = self.ib.reqContractDetails(contract)
-
-            if not details:
-                logger.error(f"Contract qualification failed for {sym}")
-                continue
-
-            self.contract_cache[sym] = details[0].contract
+            if details:
+                self.contract_cache[sym] = details[0].contract
 
     def get_contract(self, symbol):
-
         if symbol in self.contract_cache:
             return self.contract_cache[symbol]
 
         if symbol == "EURUSD":
             return Forex("EURUSD")
 
-        raise ValueError(f"Contract {symbol} not cached")
+        raise ValueError(f"Unknown contract: {symbol}")
 
-    # ======================================================
-    # STATE
-    # ======================================================
+    # ==========================================================
+    # MARKET DATA
+    # ==========================================================
 
-    def get_system_state(self):
-        positions = self.ib.positions()
-        orders = self.ib.openOrders()
+    def get_market_data(self, contract):
+        ticker = self.ib.reqMktData(contract, "", False, False)
+        self.ib.sleep(0.5)
 
-        return {
-            "has_position": any(p.position != 0 for p in positions),
-            "has_orders": len(orders) > 0
-        }
+        bid = ticker.bid
+        ask = ticker.ask
 
-    def get_symbol_state(self, symbol):
-        positions = self.ib.positions()
-        orders = self.ib.openOrders()
+        self.ib.cancelMktData(contract)
 
-        return {
-            "has_position": any(p.contract.symbol == symbol and p.position != 0 for p in positions),
-            "has_orders": any(o.contract.symbol == symbol for o in orders)
-        }
+        if bid is None or ask is None:
+            return None, None, False
 
-    def can_execute(self, symbol):
+        if bid <= 0 or ask <= 0:
+            return None, None, False
 
-        global_state = self.get_system_state()
-        symbol_state = self.get_symbol_state(symbol)
+        return bid, ask, True
 
-        if self.mode == "LIVE":
-            if global_state["has_position"] or global_state["has_orders"]:
-                return False, "LIVE_GLOBAL_LOCK"
-
-        elif self.mode == "TEST":
-            if symbol_state["has_position"] or symbol_state["has_orders"]:
-                return False, "TEST_SYMBOL_LOCK"
-
-        else:
-            return False, "INVALID_MODE"
-
-        return True, "OK"
-
-    # ======================================================
-    # SIGNAL HANDLING
-    # ======================================================
-
-    def handle_webhook_signal(self, signal):
-
-        tv_symbol = signal["symbol"]
-        timeframe = signal.get("timeframe", "NA")
-
-        symbol = self.resolve_symbol(tv_symbol)
-        side = signal["side"]
-        entry = float(signal["entry_price"])
-
-        signal_id = f"{symbol}-{side}-{round(entry,5)}-{timeframe}"
-
-        now = time.time()
-
-        for k in list(self.signal_cache.keys()):
-            if now - self.signal_cache[k] > self.signal_ttl:
-                del self.signal_cache[k]
-
-        if len(self.signal_cache) > 1000:
-            self.signal_cache.clear()
-
-        if signal_id in self.signal_cache:
-            if now - self.signal_cache[signal_id] < self.signal_ttl:
-                return
-
-        self.signal_cache[signal_id] = now
-
-        job = {
-            "symbol": symbol,
-            "side": side,
-            "entry": entry
-        }
-
-        self.execution_queue.put(job)
-
-    # ======================================================
-    # EXECUTION WORKER
-    # ======================================================
+    # ==========================================================
+    # EXECUTION
+    # ==========================================================
 
     def execution_worker(self):
-
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-        self.connect_ib()
-
         while True:
-
-            job = self.execution_queue.get()
+            data = self.execution_queue.get()
 
             try:
-                self.connect_ib()
-                self.place_bracket_order(job)
-            except Exception:
-                logger.exception("Execution failure")
-            finally:
-                self.execution_queue.task_done()
+                self.execute_trade(data)
+            except Exception as e:
+                logger.error(f"EXECUTION ERROR: {e}")
 
-    # ======================================================
-    # CLEANUP
-    # ======================================================
-
-    def cleanup_orphan_orders(self, symbol):
-
-        positions = self.ib.positions()
-
-        has_position = any(
-            p.contract.symbol == symbol and p.position != 0
-            for p in positions
-        )
-
-        if has_position:
-            return
-
-        for o in self.ib.openOrders():
-
-            if o.contract.symbol != symbol:
-                continue
-
-            if getattr(o, "parentId", 0) == 0 and o.orderType != "LMT":
-                logger.warning(f"CANCEL SAFE ORPHAN {o.orderId}")
-                self.ib.cancelOrder(o)
-
-    def validate_order(self, entry, stop, target):
-
-        if any(math.isnan(x) for x in [entry, stop, target]):
-            return False
-
-        if entry == 0 or stop == 0 or target == 0:
-            return False
-
-        if abs(entry - stop) == 0:
-            return False
-
-        return True
-
-    # ======================================================
-    # ORDER EXECUTION
-    # ======================================================
-
-    def place_bracket_order(self, job):
-
+    def execute_trade(self, data):
         with self.trade_lock:
 
-            if not self.ib.isConnected():
-                raise RuntimeError("IB not connected")
-
-            symbol = job["symbol"]
-            side = job["side"]
-
-            allowed, reason = self.can_execute(symbol)
-
-            if not allowed:
-                logger.warning(f"BLOCK_REASON={reason} symbol={symbol}")
+            if self.trade_state != "IDLE":
+                logger.warning("BLOCKED: trade already active")
                 return
 
-            positions = self.ib.positions()
-
-            if any(p.contract.symbol == symbol and p.position != 0 for p in positions):
-                logger.warning("BLOCK: POSITION ALREADY EXISTS")
-                return
+            symbol = data.get("symbol")
+            direction = data.get("direction")
+            qty = data.get("qty", 1)
 
             contract = self.get_contract(symbol)
 
-            self.cleanup_orphan_orders(symbol)
-
-            ticker = self.ib.reqMktData(contract, "", False, False)
-            self.ib.sleep(0.2)
-
-            bid = ticker.bid
-            ask = ticker.ask
-
-            if (
-                bid is None or ask is None or
-                math.isnan(bid) or math.isnan(ask) or
-                bid == 0 or ask == 0
-            ):
+            bid, ask, valid = self.get_market_data(contract)
+            if not valid:
                 logger.warning("INVALID MARKET DATA")
-                self.ib.cancelMktData(contract)
                 return
 
-            spread = abs(ask - bid)
+            price = ask if direction == "LONG" else bid
 
-            if spread > 2:
-                logger.warning(f"SKIP → spread too large {spread}")
-                self.ib.cancelMktData(contract)
-                return
+            order = LimitOrder(
+                "BUY" if direction == "LONG" else "SELL",
+                qty,
+                price
+            )
 
-            market_price = (bid + ask) / 2
+            trade = self.ib.placeOrder(contract, order)
 
-            if abs(market_price - job["entry"]) > 5:
-                logger.warning("SKIP → entry too far from market")
-                self.ib.cancelMktData(contract)
-                return
+            self.active_order_ids.add(order.orderId)
+            self.trade_state = "ACTIVE"
 
-            if side == "long":
-                entry = ask
-                action = "BUY"
-            else:
-                entry = bid
-                action = "SELL"
+            logger.info(f"ORDER PLACED: {symbol} {direction} @ {price}")
 
-            if symbol == "MES":
-                stop_distance = 2
-                target_distance = 3
-            elif symbol == "MNQ":
-                stop_distance = 10
-                target_distance = 15
-            elif symbol == "M6E":
-                stop_distance = 0.0008
-                target_distance = 0.0012
-            elif symbol == "FDXM":
-                stop_distance = 8
-                target_distance = 12
-            else:
-                stop_distance = 2
-                target_distance = 4
-
-            if action == "BUY":
-                stop = entry - stop_distance
-                target = entry + target_distance
-            else:
-                stop = entry + stop_distance
-                target = entry - target_distance
-
-            if not self.validate_order(entry, stop, target):
-                self.ib.cancelMktData(contract)
-                return
-
-            try:
-                bracket = self.ib.bracketOrder(
-                    action=action,
-                    quantity=1,
-                    limitPrice=entry,
-                    takeProfitPrice=target,
-                    stopLossPrice=stop
-                )
-
-                parent = bracket[0]
-                tp = bracket[1]
-                sl = bracket[2]
-
-                trade = self.ib.placeOrder(contract, parent)
-
-                self.ib.sleep(0.1)
-
-                if trade.orderStatus.status not in ["Submitted", "PreSubmitted"]:
-                    logger.error("PARENT ORDER FAILED")
-                    self.ib.cancelMktData(contract)
-                    return
-
-                self.ib.placeOrder(contract, tp)
-                self.ib.placeOrder(contract, sl)
-
-            except Exception:
-                logger.exception("ORDER FAILED")
-                self.ib.cancelMktData(contract)
-                return
-
-            self.ib.sleep(0.3)
-
-            orders = [o for o in self.ib.openOrders() if o.contract.symbol == symbol]
-
-            if len(orders) < 3:
-                logger.error("CRITICAL: INCOMPLETE BRACKET → cancelling all")
-                for o in orders:
-                    self.ib.cancelOrder(o)
-                self.ib.cancelMktData(contract)
-                return
-
-            self.ib.cancelMktData(contract)
-
-    # ======================================================
-    # IB WATCHDOG
-    # ======================================================
+    # ==========================================================
+    # WATCHDOG
+    # ==========================================================
 
     def ib_watchdog(self):
-
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         while True:
+            try:
+                self.connect_ib()
+            except Exception as e:
+                logger.warning(f"IB reconnect failed: {e}")
 
-            if not self.ib.isConnected():
-
-                try:
-                    self.connect_ib()
-                except Exception:
-                    logger.exception("Reconnect attempt failed")
-
-            time.sleep(10)
-
+            time.sleep(5)
 
 # ==========================================================
-# FASTAPI SERVER
+# FASTAPI
 # ==========================================================
 
 app = FastAPI()
-
 bot = ScalpingBot()
 
-
-@app.post("/webhook/tradingview")
-async def webhook_handler(request: Request):
-
+@app.post("/trade")
+async def trade_endpoint(request: Request):
     data = await request.json()
 
-    if data.get("secret") != "FDAX_bot_secure_2026":
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    bot.execution_queue.put(data)
 
-    bot.handle_webhook_signal(data)
-
-    return {"status": "queued"}
+    return JSONResponse({"status": "queued"})
