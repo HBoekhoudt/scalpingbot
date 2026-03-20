@@ -3,6 +3,7 @@ import asyncio
 import threading
 import queue
 import time
+import math
 
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
@@ -33,14 +34,12 @@ class ScalpingBot:
 
         self.positions = {}
 
-        self.trade_state = "IDLE"
+        self.mode = "TEST"
+        self.signal_cache = {}
+        self.signal_ttl = 10
 
         self.connection_lock = threading.Lock()
         self.trade_lock = threading.Lock()
-
-        # duplicate signal guard
-        self.last_signal = None
-        self.last_signal_time = 0
 
         self.worker_thread = threading.Thread(
             target=self.execution_worker,
@@ -48,7 +47,6 @@ class ScalpingBot:
         )
         self.worker_thread.start()
 
-        # IB reconnect watchdog
         self.watchdog_thread = threading.Thread(
             target=self.ib_watchdog,
             daemon=True
@@ -81,15 +79,9 @@ class ScalpingBot:
                 raise RuntimeError("IBKR connection failed")
 
             logger.info("IBKR connected")
+            logger.info(f"IB CONNECTED STATE: {self.ib.isConnected()}")
 
             self.attach_ib_events()
-
-            positions = self.ib.positions()
-
-            for pos in positions:
-                if pos.position != 0:
-                    self.trade_state = "IN_TRADE"
-                    logger.info(f"Existing position detected: {pos.contract.symbol}")
 
             self.qualify_contracts()
 
@@ -115,17 +107,8 @@ class ScalpingBot:
                 f"avgFillPrice={trade.orderStatus.avgFillPrice}"
             )
 
-            if "Modify" in str(trade.orderStatus.status):
-                logger.error("CRITICAL: MODIFY DETECTED → ORDER CHAIN CORRUPTION")
-
         def on_exec_details(trade, fill):
             logger.info(f"FILL: {fill}")
-
-            positions = self.ib.positions()
-
-            if not any(p.position != 0 for p in positions):
-                self.trade_state = "IDLE"
-                logger.info("Position closed — trade_state reset to IDLE")
 
         def on_ib_error(reqId, errorCode, errorString, contract):
             symbol = getattr(contract, "symbol", None) if contract else None
@@ -196,27 +179,55 @@ class ScalpingBot:
 
             self.contract_cache[sym] = details[0].contract
 
-            logger.info(
-                f"Qualified {sym} → {details[0].contract.lastTradeDateOrContractMonth}"
-            )
-
-        logger.info(
-            f"Contract cache initialized: {list(self.contract_cache.keys())}"
-        )
-
     def get_contract(self, symbol):
 
         if symbol in self.contract_cache:
-            contract = self.contract_cache[symbol]
-            logger.info(
-                f"Using cached contract {contract.symbol} {contract.lastTradeDateOrContractMonth}"
-            )
-            return contract
+            return self.contract_cache[symbol]
 
         if symbol == "EURUSD":
             return Forex("EURUSD")
 
         raise ValueError(f"Contract {symbol} not cached")
+
+    # ======================================================
+    # STATE
+    # ======================================================
+
+    def get_system_state(self):
+        positions = self.ib.positions()
+        orders = self.ib.openOrders()
+
+        return {
+            "has_position": any(p.position != 0 for p in positions),
+            "has_orders": len(orders) > 0
+        }
+
+    def get_symbol_state(self, symbol):
+        positions = self.ib.positions()
+        orders = self.ib.openOrders()
+
+        return {
+            "has_position": any(p.contract.symbol == symbol and p.position != 0 for p in positions),
+            "has_orders": any(o.contract.symbol == symbol for o in orders)
+        }
+
+    def can_execute(self, symbol):
+
+        global_state = self.get_system_state()
+        symbol_state = self.get_symbol_state(symbol)
+
+        if self.mode == "LIVE":
+            if global_state["has_position"] or global_state["has_orders"]:
+                return False, "LIVE_GLOBAL_LOCK"
+
+        elif self.mode == "TEST":
+            if symbol_state["has_position"] or symbol_state["has_orders"]:
+                return False, "TEST_SYMBOL_LOCK"
+
+        else:
+            return False, "INVALID_MODE"
+
+        return True, "OK"
 
     # ======================================================
     # SIGNAL HANDLING
@@ -225,22 +236,28 @@ class ScalpingBot:
     def handle_webhook_signal(self, signal):
 
         tv_symbol = signal["symbol"]
+        timeframe = signal.get("timeframe", "NA")
 
         symbol = self.resolve_symbol(tv_symbol)
-
         side = signal["side"]
         entry = float(signal["entry_price"])
 
-        current_time = time.time()
+        signal_id = f"{symbol}-{side}-{round(entry,5)}-{timeframe}"
 
-        signal_key = f"{symbol}-{side}-{entry}"
+        now = time.time()
 
-        if signal_key == self.last_signal and current_time - self.last_signal_time < 5:
-            logger.info("Duplicate signal ignored")
-            return
+        for k in list(self.signal_cache.keys()):
+            if now - self.signal_cache[k] > self.signal_ttl:
+                del self.signal_cache[k]
 
-        self.last_signal = signal_key
-        self.last_signal_time = current_time
+        if len(self.signal_cache) > 1000:
+            self.signal_cache.clear()
+
+        if signal_id in self.signal_cache:
+            if now - self.signal_cache[signal_id] < self.signal_ttl:
+                return
+
+        self.signal_cache[signal_id] = now
 
         job = {
             "symbol": symbol,
@@ -248,19 +265,7 @@ class ScalpingBot:
             "entry": entry
         }
 
-        self.enqueue_signal(job)
-
-    # ======================================================
-    # QUEUE
-    # ======================================================
-
-    def enqueue_signal(self, signal):
-
-        self.execution_queue.put(signal)
-
-        logger.info(
-            f"Signal queued. Queue size: {self.execution_queue.qsize()}"
-        )
+        self.execution_queue.put(job)
 
     # ======================================================
     # EXECUTION WORKER
@@ -270,14 +275,11 @@ class ScalpingBot:
 
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-        logger.info("Execution worker started")
-
         self.connect_ib()
 
         while True:
 
             job = self.execution_queue.get()
-            logger.info(f"WORKER RECEIVED JOB: {job}")
 
             try:
                 self.connect_ib()
@@ -288,95 +290,178 @@ class ScalpingBot:
                 self.execution_queue.task_done()
 
     # ======================================================
+    # CLEANUP
+    # ======================================================
+
+    def cleanup_orphan_orders(self, symbol):
+
+        positions = self.ib.positions()
+
+        has_position = any(
+            p.contract.symbol == symbol and p.position != 0
+            for p in positions
+        )
+
+        if has_position:
+            return
+
+        for o in self.ib.openOrders():
+
+            if o.contract.symbol != symbol:
+                continue
+
+            if getattr(o, "parentId", 0) == 0 and o.orderType != "LMT":
+                logger.warning(f"CANCEL SAFE ORPHAN {o.orderId}")
+                self.ib.cancelOrder(o)
+
+    def validate_order(self, entry, stop, target):
+
+        if any(math.isnan(x) for x in [entry, stop, target]):
+            return False
+
+        if entry == 0 or stop == 0 or target == 0:
+            return False
+
+        if abs(entry - stop) == 0:
+            return False
+
+        return True
+
+    # ======================================================
     # ORDER EXECUTION
     # ======================================================
 
     def place_bracket_order(self, job):
 
-        # 🔧 FIX 1 — FORCE IB SYNC
-        self.ib.reqOpenOrders()
-        self.ib.sleep(0.3)
-        open_orders = self.ib.openOrders()
+        with self.trade_lock:
 
-        # 🔧 FIX 2 — HARD BLOCK
-        #if open_orders:
-        #    logger.error("HARD BLOCK → EXISTING IB ORDERS STILL ACTIVE")
-        #
-        #    for o in open_orders:
-        #        logger.error(
-        #            f"ACTIVE ORDER | id={o.orderId} parent={o.parentId} action={o.action}"
-        #        )
-        #    return
+            if not self.ib.isConnected():
+                raise RuntimeError("IB not connected")
 
-        symbol = job["symbol"]
-        side = job["side"]
-        entry = job["entry"]
+            symbol = job["symbol"]
+            side = job["side"]
 
-        contract = self.get_contract(symbol)
+            allowed, reason = self.can_execute(symbol)
 
-        if symbol in ("MES", "MNQ"):
-            stop_distance = 2
-            target_distance = 4
-        elif symbol == "M6E":
-            stop_distance = 0.002
-            target_distance = 0.004
-        else:
-            stop_distance = 2
-            target_distance = 4
+            if not allowed:
+                logger.warning(f"BLOCK_REASON={reason} symbol={symbol}")
+                return
 
-        if side == "long":
-            stop = entry - stop_distance
-            target = entry + target_distance
-            action = "BUY"
-        else:
-            stop = entry + stop_distance
-            target = entry - target_distance
-            action = "SELL"
+            positions = self.ib.positions()
 
-        opposite_action = "SELL" if action == "BUY" else "BUY"
+            if any(p.contract.symbol == symbol and p.position != 0 for p in positions):
+                logger.warning("BLOCK: POSITION ALREADY EXISTS")
+                return
 
-        parent_id = self.ib.client.getReqId()
+            contract = self.get_contract(symbol)
 
-        existing_ids = {o.orderId for o in open_orders}
+            self.cleanup_orphan_orders(symbol)
 
-        if parent_id in existing_ids:
-            logger.error("ORDER ID REUSE DETECTED → FORCING NEW ID")
-            parent_id = self.ib.client.getReqId()
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            self.ib.sleep(0.2)
 
-        tp_id = parent_id + 1
-        sl_id = parent_id + 2
+            bid = ticker.bid
+            ask = ticker.ask
 
-        logger.info("ORDER DEBUG →")
-        logger.info(f"parent_id={parent_id} tp_id={tp_id} sl_id={sl_id}")
+            if (
+                bid is None or ask is None or
+                math.isnan(bid) or math.isnan(ask) or
+                bid == 0 or ask == 0
+            ):
+                logger.warning("INVALID MARKET DATA")
+                self.ib.cancelMktData(contract)
+                return
 
-        parent = LimitOrder(action=action, totalQuantity=1, lmtPrice=entry, transmit=False)
-        parent.orderId = parent_id
-        parent.parentId = 0
+            spread = abs(ask - bid)
 
-        tp = LimitOrder(action=opposite_action, totalQuantity=1, lmtPrice=target, transmit=False)
-        tp.orderId = tp_id
-        tp.parentId = parent_id
+            if spread > 2:
+                logger.warning(f"SKIP → spread too large {spread}")
+                self.ib.cancelMktData(contract)
+                return
 
-        sl = StopOrder(action=opposite_action, totalQuantity=1, stopPrice=stop, transmit=True)
-        sl.orderId = sl_id
-        sl.parentId = parent_id
+            market_price = (bid + ask) / 2
 
-        for o in [parent, tp, sl]:
-            logger.info(
-                f"ORDER → action={o.action} type={o.orderType} parentId={o.parentId} transmit={o.transmit}"
-            )
+            if abs(market_price - job["entry"]) > 5:
+                logger.warning("SKIP → entry too far from market")
+                self.ib.cancelMktData(contract)
+                return
 
-        self.ib.placeOrder(contract, parent)
-        self.ib.placeOrder(contract, tp)
-        self.ib.placeOrder(contract, sl)
+            if side == "long":
+                entry = ask
+                action = "BUY"
+            else:
+                entry = bid
+                action = "SELL"
 
-        trades = self.ib.trades()
+            if symbol == "MES":
+                stop_distance = 2
+                target_distance = 3
+            elif symbol == "MNQ":
+                stop_distance = 10
+                target_distance = 15
+            elif symbol == "M6E":
+                stop_distance = 0.0008
+                target_distance = 0.0012
+            elif symbol == "FDXM":
+                stop_distance = 8
+                target_distance = 12
+            else:
+                stop_distance = 2
+                target_distance = 4
 
-        for t in trades:
-            logger.info(
-                f"POST TRADE | orderId={t.order.orderId} parentId={t.order.parentId} "
-                f"permId={t.order.permId} status={t.orderStatus.status}"
-            )
+            if action == "BUY":
+                stop = entry - stop_distance
+                target = entry + target_distance
+            else:
+                stop = entry + stop_distance
+                target = entry - target_distance
+
+            if not self.validate_order(entry, stop, target):
+                self.ib.cancelMktData(contract)
+                return
+
+            try:
+                bracket = self.ib.bracketOrder(
+                    action=action,
+                    quantity=1,
+                    limitPrice=entry,
+                    takeProfitPrice=target,
+                    stopLossPrice=stop
+                )
+
+                parent = bracket[0]
+                tp = bracket[1]
+                sl = bracket[2]
+
+                trade = self.ib.placeOrder(contract, parent)
+
+                self.ib.sleep(0.1)
+
+                if trade.orderStatus.status not in ["Submitted", "PreSubmitted"]:
+                    logger.error("PARENT ORDER FAILED")
+                    self.ib.cancelMktData(contract)
+                    return
+
+                self.ib.placeOrder(contract, tp)
+                self.ib.placeOrder(contract, sl)
+
+            except Exception:
+                logger.exception("ORDER FAILED")
+                self.ib.cancelMktData(contract)
+                return
+
+            self.ib.sleep(0.3)
+
+            orders = [o for o in self.ib.openOrders() if o.contract.symbol == symbol]
+
+            if len(orders) < 3:
+                logger.error("CRITICAL: INCOMPLETE BRACKET → cancelling all")
+                for o in orders:
+                    self.ib.cancelOrder(o)
+                self.ib.cancelMktData(contract)
+                return
+
+            self.ib.cancelMktData(contract)
 
     # ======================================================
     # IB WATCHDOG
@@ -389,8 +474,6 @@ class ScalpingBot:
         while True:
 
             if not self.ib.isConnected():
-
-                logger.warning("IB connection lost — attempting reconnect")
 
                 try:
                     self.connect_ib()
@@ -407,11 +490,6 @@ class ScalpingBot:
 app = FastAPI()
 
 bot = ScalpingBot()
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 
 @app.post("/webhook/tradingview")
