@@ -9,7 +9,8 @@ from ib_insync import IB, Future, Forex
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P260323006"
+BOT_PATCH = "P260323008"
+BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
@@ -177,7 +178,7 @@ class ScalpingBot:
         entry = float(data["entry_price"])
 
         now = time.time()
-        key = f"{symbol}-{side}-{round(entry,2)}"
+        key = f"{symbol}-{side}-{round(entry, 2)}"
 
         if key == self.last_signal and now - self.last_signal_time < 5:
             logger.info("Duplicate ignored")
@@ -201,6 +202,7 @@ class ScalpingBot:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
         logger.info("EXECUTION WORKER STARTED")
+        logger.info(f"BOT STAGE: {BOT_STAGE}")
 
         self.connect_ib()
 
@@ -223,19 +225,65 @@ class ScalpingBot:
 
             self.execution_queue.task_done()
 
+    def log_trade_snapshot(self, label, trade):
+
+        try:
+            order = trade.order
+            status = trade.orderStatus
+
+            logger.info(
+                f"{label} | "
+                f"orderId={getattr(order, 'orderId', None)} "
+                f"parentId={getattr(order, 'parentId', None)} "
+                f"action={getattr(order, 'action', None)} "
+                f"orderType={getattr(order, 'orderType', None)} "
+                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
+                f"auxPrice={getattr(order, 'auxPrice', None)} "
+                f"transmit={getattr(order, 'transmit', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)} "
+                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
+                f"permId={getattr(status, 'permId', None)} "
+                f"whyHeld={getattr(status, 'whyHeld', None)}"
+            )
+
+            if getattr(trade, "advancedError", None):
+                logger.warning(f"{label} ADVANCED ERROR | {trade.advancedError}")
+
+            if getattr(trade, "log", None):
+                for entry in trade.log:
+                    logger.info(
+                        f"{label} TRADE LOG | "
+                        f"time={getattr(entry, 'time', None)} "
+                        f"status={getattr(entry, 'status', None)} "
+                        f"message={getattr(entry, 'message', None)} "
+                        f"errorCode={getattr(entry, 'errorCode', None)}"
+                    )
+        except Exception:
+            logger.exception(f"{label} | failed to log trade snapshot")
+
     def place_bracket_order(self, job):
 
         logger.info("ENTER place_bracket_order")
+        logger.info(f"STAGE CHECK → {BOT_STAGE}")
 
         positions = self.ib.positions()
 
-        if any(p.position != 0 for p in positions):
-            logger.warning("BLOCK → existing position")
-            return
+        if BOT_STAGE in ("PAPER", "LIVE"):
+            if any(p.position != 0 for p in positions):
+                logger.warning(f"BLOCK → existing position ({BOT_STAGE} mode)")
+                return
 
-        if self.trade_state == "IN_TRADE":
-            logger.warning("BLOCK → in trade")
-            return
+            if self.trade_state == "IN_TRADE":
+                logger.warning(f"BLOCK → in trade ({BOT_STAGE} mode)")
+                return
+        else:
+            if any(p.position != 0 for p in positions):
+                logger.info("TEST MODE → existing position ignored")
+
+            if self.trade_state == "IN_TRADE":
+                logger.info("TEST MODE → trade_state ignored")
 
         symbol = job["symbol"]
         side = job["side"]
@@ -267,6 +315,20 @@ class ScalpingBot:
         stop = self.round_to_tick(symbol, stop)
         target = self.round_to_tick(symbol, target)
 
+        logger.info(
+            f"BRACKET PREP | stage={BOT_STAGE} {symbol} {side} "
+            f"entry={entry} stop={stop} target={target}"
+        )
+
+        if BOT_STAGE == "PAPER":
+            logger.info(
+                f"PAPER MODE → simulated bracket only | "
+                f"{symbol} {side} entry={entry} stop={stop} target={target}"
+            )
+            self.trade_state = "IN_TRADE"
+            logger.info("PAPER MODE → trade_state set to IN_TRADE")
+            return
+
         bracket = self.ib.bracketOrder(
             action,
             1,
@@ -279,13 +341,56 @@ class ScalpingBot:
         bracket[1].transmit = False
         bracket[2].transmit = True
 
+        for i, o in enumerate(bracket):
+            logger.info(
+                f"ORDER DEF {i} | "
+                f"orderId={getattr(o, 'orderId', None)} "
+                f"parentId={getattr(o, 'parentId', None)} "
+                f"action={getattr(o, 'action', None)} "
+                f"orderType={getattr(o, 'orderType', None)} "
+                f"lmtPrice={getattr(o, 'lmtPrice', None)} "
+                f"auxPrice={getattr(o, 'auxPrice', None)} "
+                f"transmit={getattr(o, 'transmit', None)}"
+            )
+
+        logger.info(
+            f"CONTRACT SNAPSHOT | "
+            f"symbol={getattr(contract, 'symbol', None)} "
+            f"localSymbol={getattr(contract, 'localSymbol', None)} "
+            f"expiry={getattr(contract, 'lastTradeDateOrContractMonth', None)} "
+            f"exchange={getattr(contract, 'exchange', None)} "
+            f"currency={getattr(contract, 'currency', None)} "
+            f"conId={getattr(contract, 'conId', None)}"
+        )
+
         logger.info("PLACING BRACKET ORDER (ALL 3 ORDERS)")
 
-        for o in bracket:
-            self.ib.placeOrder(contract, o)
-            self.ib.sleep(0.05)
+        placed_trades = []
 
-        self.trade_state = "IN_TRADE"
+        for i, o in enumerate(bracket):
+            trade = self.ib.placeOrder(contract, o)
+            placed_trades.append(trade)
+
+            self.log_trade_snapshot(f"POST PLACE {i}", trade)
+
+            self.ib.sleep(0.20)
+
+            self.log_trade_snapshot(f"POST WAIT {i}", trade)
+
+        self.ib.sleep(1.00)
+
+        logger.info("FINAL BRACKET SNAPSHOT START")
+
+        for i, trade in enumerate(placed_trades):
+            self.log_trade_snapshot(f"FINAL SNAPSHOT {i}", trade)
+
+        logger.info("FINAL BRACKET SNAPSHOT END")
+
+        if BOT_STAGE == "LIVE":
+            self.trade_state = "IN_TRADE"
+            logger.info("LIVE MODE → trade_state set to IN_TRADE")
+        else:
+            logger.info("TEST MODE → trade_state not locked")
 
         logger.info(f"BRACKET ORDER | {symbol} {side} entry={entry} stop={stop} target={target}")
 
@@ -311,7 +416,13 @@ bot = ScalpingBot()
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "bot_name": BOT_NAME,
+        "bot_version": BOT_VERSION,
+        "bot_patch": BOT_PATCH,
+        "bot_stage": BOT_STAGE
+    }
 
 
 @app.post("/webhook/tradingview")
