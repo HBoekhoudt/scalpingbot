@@ -1,20 +1,32 @@
+# ==========================================================
+# IKBR SCALPING BOT — P026
+# ==========================================================
+
 import logging
 import asyncio
 import threading
 import queue
 import time
+import decimal
 
 from fastapi import FastAPI, Request, HTTPException
-from ib_insync import IB, Future, Forex
+from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
+
+# ==========================================================
+# VERSIONING
+# ==========================================================
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P260323008"
+BOT_PATCH = "P260324026"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
 
+# ==========================================================
+# CONFIG
+# ==========================================================
 
 SPREADS = {
     "MNQ": 0.25,
@@ -30,6 +42,9 @@ TICK_SIZES = {
     "M6E": 0.00005,
 }
 
+# ==========================================================
+# BOT
+# ==========================================================
 
 class ScalpingBot:
 
@@ -39,7 +54,7 @@ class ScalpingBot:
 
         self.IB_HOST = "127.0.0.1"
         self.IB_PORT = 7497
-        self.IB_CLIENT_ID = 101
+        self.IB_CLIENT_ID = 1
 
         self.contract_cache = {}
         self.execution_queue = queue.Queue()
@@ -54,11 +69,14 @@ class ScalpingBot:
         threading.Thread(target=self.execution_worker, daemon=True).start()
         threading.Thread(target=self.ib_watchdog, daemon=True).start()
 
+    # ==========================================================
+    # PRICE LOGIC
+    # ==========================================================
+
     def round_to_tick(self, symbol, price):
-        tick = TICK_SIZES.get(symbol)
-        if not tick:
-            return price
-        return round(price / tick) * tick
+        tick = decimal.Decimal(str(TICK_SIZES[symbol]))
+        price = decimal.Decimal(str(price))
+        return float((price / tick).quantize(0) * tick)
 
     def apply_spread(self, symbol, side, price):
         spread = SPREADS.get(symbol, 0)
@@ -70,6 +88,10 @@ class ScalpingBot:
 
         logger.info(f"SPREAD | {symbol} {side} → {price}")
         return price
+
+    # ==========================================================
+    # IB CONNECTION
+    # ==========================================================
 
     def connect_ib(self):
 
@@ -93,6 +115,45 @@ class ScalpingBot:
             self.attach_ib_events()
             self.qualify_contracts()
 
+    def log_trade_snapshot(self, label, trade):
+
+        try:
+            order = trade.order
+            status = trade.orderStatus
+
+            logger.info(
+                f"{label} → "
+                f"orderId={getattr(order, 'orderId', None)} "
+                f"parentId={getattr(order, 'parentId', None)} "
+                f"action={getattr(order, 'action', None)} "
+                f"orderType={getattr(order, 'orderType', None)} "
+                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
+                f"auxPrice={getattr(order, 'auxPrice', None)} "
+                f"transmit={getattr(order, 'transmit', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)} "
+                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
+                f"whyHeld={getattr(status, 'whyHeld', None)} "
+                f"permId={getattr(status, 'permId', None)}"
+            )
+
+            if getattr(trade, "advancedError", None):
+                logger.error(f"{label} ADVANCED ERROR → {trade.advancedError}")
+
+            if getattr(trade, "log", None):
+                for entry in trade.log:
+                    logger.info(
+                        f"{label} TRADE LOG → "
+                        f"time={getattr(entry, 'time', None)} "
+                        f"status={getattr(entry, 'status', None)} "
+                        f"message={getattr(entry, 'message', None)} "
+                        f"errorCode={getattr(entry, 'errorCode', None)}"
+                    )
+
+        except Exception:
+            logger.exception(f"{label} SNAPSHOT FAILED")
+
     def attach_ib_events(self):
 
         if hasattr(self.ib, "_events_attached"):
@@ -106,8 +167,62 @@ class ScalpingBot:
                 self.trade_state = "IDLE"
                 logger.info("→ IDLE")
 
+        def on_open_order(trade):
+            order = trade.order
+            status = trade.orderStatus
+            logger.info(
+                f"OPEN ORDER EVENT → "
+                f"orderId={getattr(order, 'orderId', None)} "
+                f"parentId={getattr(order, 'parentId', None)} "
+                f"action={getattr(order, 'action', None)} "
+                f"orderType={getattr(order, 'orderType', None)} "
+                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
+                f"auxPrice={getattr(order, 'auxPrice', None)} "
+                f"transmit={getattr(order, 'transmit', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)} "
+                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
+                f"whyHeld={getattr(status, 'whyHeld', None)} "
+                f"permId={getattr(status, 'permId', None)}"
+            )
+
+        def on_order_status(trade):
+            order = trade.order
+            status = trade.orderStatus
+            logger.info(
+                f"ORDER STATUS EVENT → "
+                f"orderId={getattr(order, 'orderId', None)} "
+                f"parentId={getattr(order, 'parentId', None)} "
+                f"action={getattr(order, 'action', None)} "
+                f"orderType={getattr(order, 'orderType', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)} "
+                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
+                f"whyHeld={getattr(status, 'whyHeld', None)} "
+                f"permId={getattr(status, 'permId', None)}"
+            )
+
+        def on_error(reqId, errorCode, errorString, contract):
+            logger.error(
+                f"ERROR EVENT → "
+                f"reqId={reqId} "
+                f"errorCode={errorCode} "
+                f"errorString={errorString} "
+                f"contract={contract}"
+            )
+
         self.ib.execDetailsEvent += on_exec
+        self.ib.openOrderEvent += on_open_order
+        self.ib.orderStatusEvent += on_order_status
+        self.ib.errorEvent += on_error
+
         self.ib._events_attached = True
+
+    # ==========================================================
+    # CONTRACTS
+    # ==========================================================
 
     def build_base_contract(self, symbol):
 
@@ -166,6 +281,10 @@ class ScalpingBot:
 
         raise ValueError(f"{symbol} not cached")
 
+    # ==========================================================
+    # SIGNAL HANDLING
+    # ==========================================================
+
     def handle_webhook_signal(self, data):
 
         logger.info(f"WEBHOOK RECEIVED: {data}")
@@ -197,6 +316,10 @@ class ScalpingBot:
 
         self.execution_queue.put(job)
 
+    # ==========================================================
+    # WORKER
+    # ==========================================================
+
     def execution_worker(self):
 
         asyncio.set_event_loop(asyncio.new_event_loop())
@@ -225,65 +348,11 @@ class ScalpingBot:
 
             self.execution_queue.task_done()
 
-    def log_trade_snapshot(self, label, trade):
-
-        try:
-            order = trade.order
-            status = trade.orderStatus
-
-            logger.info(
-                f"{label} | "
-                f"orderId={getattr(order, 'orderId', None)} "
-                f"parentId={getattr(order, 'parentId', None)} "
-                f"action={getattr(order, 'action', None)} "
-                f"orderType={getattr(order, 'orderType', None)} "
-                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
-                f"auxPrice={getattr(order, 'auxPrice', None)} "
-                f"transmit={getattr(order, 'transmit', None)} "
-                f"status={getattr(status, 'status', None)} "
-                f"filled={getattr(status, 'filled', None)} "
-                f"remaining={getattr(status, 'remaining', None)} "
-                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
-                f"permId={getattr(status, 'permId', None)} "
-                f"whyHeld={getattr(status, 'whyHeld', None)}"
-            )
-
-            if getattr(trade, "advancedError", None):
-                logger.warning(f"{label} ADVANCED ERROR | {trade.advancedError}")
-
-            if getattr(trade, "log", None):
-                for entry in trade.log:
-                    logger.info(
-                        f"{label} TRADE LOG | "
-                        f"time={getattr(entry, 'time', None)} "
-                        f"status={getattr(entry, 'status', None)} "
-                        f"message={getattr(entry, 'message', None)} "
-                        f"errorCode={getattr(entry, 'errorCode', None)}"
-                    )
-        except Exception:
-            logger.exception(f"{label} | failed to log trade snapshot")
+    # ==========================================================
+    # 🔥 P026 — OFFICIAL BRACKET MODEL + EXPANDED LOGGING
+    # ==========================================================
 
     def place_bracket_order(self, job):
-
-        logger.info("ENTER place_bracket_order")
-        logger.info(f"STAGE CHECK → {BOT_STAGE}")
-
-        positions = self.ib.positions()
-
-        if BOT_STAGE in ("PAPER", "LIVE"):
-            if any(p.position != 0 for p in positions):
-                logger.warning(f"BLOCK → existing position ({BOT_STAGE} mode)")
-                return
-
-            if self.trade_state == "IN_TRADE":
-                logger.warning(f"BLOCK → in trade ({BOT_STAGE} mode)")
-                return
-        else:
-            if any(p.position != 0 for p in positions):
-                logger.info("TEST MODE → existing position ignored")
-
-            if self.trade_state == "IN_TRADE":
-                logger.info("TEST MODE → trade_state ignored")
 
         symbol = job["symbol"]
         side = job["side"]
@@ -306,93 +375,87 @@ class ScalpingBot:
         if side == "long":
             stop = entry - stop_dist
             target = entry + target_dist
-            action = "BUY"
+            parent_action = "BUY"
+            child_action = "SELL"
         else:
             stop = entry + stop_dist
             target = entry - target_dist
-            action = "SELL"
+            parent_action = "SELL"
+            child_action = "BUY"
 
         stop = self.round_to_tick(symbol, stop)
         target = self.round_to_tick(symbol, target)
 
         logger.info(
-            f"BRACKET PREP | stage={BOT_STAGE} {symbol} {side} "
-            f"entry={entry} stop={stop} target={target}"
+            f"OFFICIAL BRACKET | {symbol} {side} entry={entry} stop={stop} target={target}"
         )
 
-        if BOT_STAGE == "PAPER":
-            logger.info(
-                f"PAPER MODE → simulated bracket only | "
-                f"{symbol} {side} entry={entry} stop={stop} target={target}"
-            )
-            self.trade_state = "IN_TRADE"
-            logger.info("PAPER MODE → trade_state set to IN_TRADE")
-            return
+        parent_id = self.ib.client.getReqId()
+        tp_id = parent_id + 1
+        sl_id = parent_id + 2
 
-        bracket = self.ib.bracketOrder(
-            action,
-            1,
-            entry,
-            target,
-            stop
-        )
+        parent = LimitOrder(parent_action, 1, entry)
+        parent.orderId = parent_id
+        parent.transmit = False
+        parent.tif = "GTC"
 
-        bracket[0].transmit = False
-        bracket[1].transmit = False
-        bracket[2].transmit = True
+        tp = LimitOrder(child_action, 1, target)
+        tp.orderId = tp_id
+        tp.parentId = parent_id
+        tp.transmit = False
+        tp.tif = "GTC"
 
-        for i, o in enumerate(bracket):
-            logger.info(
-                f"ORDER DEF {i} | "
-                f"orderId={getattr(o, 'orderId', None)} "
-                f"parentId={getattr(o, 'parentId', None)} "
-                f"action={getattr(o, 'action', None)} "
-                f"orderType={getattr(o, 'orderType', None)} "
-                f"lmtPrice={getattr(o, 'lmtPrice', None)} "
-                f"auxPrice={getattr(o, 'auxPrice', None)} "
-                f"transmit={getattr(o, 'transmit', None)}"
-            )
+        sl = StopOrder(child_action, 1, stop)
+        sl.orderId = sl_id
+        sl.parentId = parent_id
+        sl.transmit = True
+        sl.tif = "GTC"
 
         logger.info(
-            f"CONTRACT SNAPSHOT | "
-            f"symbol={getattr(contract, 'symbol', None)} "
-            f"localSymbol={getattr(contract, 'localSymbol', None)} "
-            f"expiry={getattr(contract, 'lastTradeDateOrContractMonth', None)} "
-            f"exchange={getattr(contract, 'exchange', None)} "
-            f"currency={getattr(contract, 'currency', None)} "
-            f"conId={getattr(contract, 'conId', None)}"
+            f"ORDER DEF PARENT → orderId={parent.orderId} parentId={parent.parentId} "
+            f"action={parent.action} orderType={parent.orderType} "
+            f"lmtPrice={getattr(parent, 'lmtPrice', None)} auxPrice={getattr(parent, 'auxPrice', None)} "
+            f"transmit={parent.transmit}"
+        )
+        logger.info(
+            f"ORDER DEF TP → orderId={tp.orderId} parentId={tp.parentId} "
+            f"action={tp.action} orderType={tp.orderType} "
+            f"lmtPrice={getattr(tp, 'lmtPrice', None)} auxPrice={getattr(tp, 'auxPrice', None)} "
+            f"transmit={tp.transmit}"
+        )
+        logger.info(
+            f"ORDER DEF SL → orderId={sl.orderId} parentId={sl.parentId} "
+            f"action={sl.action} orderType={sl.orderType} "
+            f"lmtPrice={getattr(sl, 'lmtPrice', None)} auxPrice={getattr(sl, 'auxPrice', None)} "
+            f"transmit={sl.transmit}"
         )
 
-        logger.info("PLACING BRACKET ORDER (ALL 3 ORDERS)")
+        parent_trade = self.ib.placeOrder(contract, parent)
+        tp_trade = self.ib.placeOrder(contract, tp)
+        sl_trade = self.ib.placeOrder(contract, sl)
 
-        placed_trades = []
+        self.log_trade_snapshot("POST PLACE PARENT", parent_trade)
+        self.log_trade_snapshot("POST PLACE TP", tp_trade)
+        self.log_trade_snapshot("POST PLACE SL", sl_trade)
 
-        for i, o in enumerate(bracket):
-            trade = self.ib.placeOrder(contract, o)
-            placed_trades.append(trade)
+        self.ib.sleep(0.20)
 
-            self.log_trade_snapshot(f"POST PLACE {i}", trade)
+        self.log_trade_snapshot("POST WAIT PARENT", parent_trade)
+        self.log_trade_snapshot("POST WAIT TP", tp_trade)
+        self.log_trade_snapshot("POST WAIT SL", sl_trade)
 
-            self.ib.sleep(0.20)
+        self.ib.reqOpenOrders()
+        self.ib.sleep(0.20)
 
-            self.log_trade_snapshot(f"POST WAIT {i}", trade)
+        self.log_trade_snapshot("POST REQOPENORDERS PARENT", parent_trade)
+        self.log_trade_snapshot("POST REQOPENORDERS TP", tp_trade)
+        self.log_trade_snapshot("POST REQOPENORDERS SL", sl_trade)
 
-        self.ib.sleep(1.00)
+        logger.info("BRACKET SUBMITTED (P026 FIXED)")
 
-        logger.info("FINAL BRACKET SNAPSHOT START")
-
-        for i, trade in enumerate(placed_trades):
-            self.log_trade_snapshot(f"FINAL SNAPSHOT {i}", trade)
-
-        logger.info("FINAL BRACKET SNAPSHOT END")
-
-        if BOT_STAGE == "LIVE":
-            self.trade_state = "IN_TRADE"
-            logger.info("LIVE MODE → trade_state set to IN_TRADE")
-        else:
-            logger.info("TEST MODE → trade_state not locked")
-
-        logger.info(f"BRACKET ORDER | {symbol} {side} entry={entry} stop={stop} target={target}")
+    # ==========================================================
+    # WATCHDOG
+    # ==========================================================
 
     def ib_watchdog(self):
 
@@ -409,10 +472,12 @@ class ScalpingBot:
 
             time.sleep(10)
 
+# ==========================================================
+# API
+# ==========================================================
 
 app = FastAPI()
 bot = ScalpingBot()
-
 
 @app.get("/health")
 def health():
@@ -423,7 +488,6 @@ def health():
         "bot_patch": BOT_PATCH,
         "bot_stage": BOT_STAGE
     }
-
 
 @app.post("/webhook/tradingview")
 async def webhook_handler(request: Request):
