@@ -67,3 +67,71 @@ Do not split the trading engine across multiple modules.
 All trading runtime logic must remain inside scalpingbot.py.
 
 This prevents state fragmentation.
+
+==========================================================
+BRACKET IMPLEMENTATION RULES (FROZEN)
+==========================================================
+🔒 1. NO BRACKET MODIFICATION
+
+De volgende structuur is frozen:
+
+3 orders (parent + TP + SL)
+parentId linking
+transmit chain False/False/True
+
+👉 Engineer mag dit NIET wijzigen zonder architect approval
+
+🔒 2. NO ORDER SEPARATION
+
+Verboden:
+
+TP of SL los plaatsen
+orders later toevoegen
+
+👉 Bracket moet atomisch worden geplaatst
+
+🔒 3. ORDER PLACEMENT SEQUENCE
+
+Verplicht:
+
+parent
+TP
+SL (transmit=True)
+🔒 4. NO POST-FILL LOGIC
+
+Bot mag:
+
+❌ GEEN TP/SL aanpassen na fill
+❌ GEEN OCO zelf beheren
+
+👉 IBKR doet dit
+
+🔒 5. EXECUTION LOCK (VERPLICHT VOLGENDE FASE)
+
+Er mag slechts:
+
+👉 1 actieve trade tegelijk bestaan
+
+Nieuwe signals moeten worden geblokkeerd als:
+
+positie open is
+bracket actief is
+🔒 6. CLEAN STATE REQUIREMENT
+
+Voor testen:
+
+geen oude open orders
+geen orphan brackets
+🔒 7. EVENT-DRIVEN VALIDATION
+
+Alle lifecycle beslissingen moeten gebaseerd zijn op:
+
+IBKR events (niet aannames)
+🧩 3. WAAR PLAATS JE DIT (BELANGRIJK)
+In jouw repo:
+📁 ARCHITECTURE.md
+
+👉 Voeg toe onder:
+
+"Order Model" of "Execution Model"
+(of onderaan als nieuwe sectie)

@@ -1,0 +1,553 @@
+//@version=6
+indicator("DET A / A+ Classifier v6", shorttitle="DET A/A+", overlay=true, max_labels_count=500)
+
+// ==========================================================
+// DET A / A+ CLASSIFIER
+// 2-STAGE MTF MODEL
+// 5m context/setup armed -> 1m trigger confirmed -> fire once
+// Pine Script v6
+// ==========================================================
+
+// ----------------------
+// Inputs
+// ----------------------
+groupCore = "Core"
+groupFilters = "Filters"
+groupMTF = "MTF"
+groupVisuals = "Visuals"
+groupAlerts = "Alerts"
+
+useSessionFilter = input.bool(true, "Use session filter", group=groupCore)
+sessionInput = input.session("0700-1700", "Allowed session (exchange time)", group=groupCore)
+
+riskRewardMin = input.float(2.0, "Minimum R multiple required", minval=1.0, step=0.1, group=groupCore)
+stopATRMult = input.float(0.60, "Stop ATR multiple", minval=0.1, step=0.05, group=groupCore)
+targetATRMult = input.float(1.20, "Target ATR multiple", minval=0.1, step=0.05, group=groupCore)
+
+vwapSlopeLookback = input.int(5, "VWAP slope lookback", minval=1, group=groupFilters)
+atrLen = input.int(14, "ATR length", minval=1, group=groupFilters)
+fastEmaLen = input.int(9, "Fast EMA", minval=1, group=groupFilters)
+slowEmaLen = input.int(21, "Slow EMA", minval=2, group=groupFilters)
+trendLookback = input.int(8, "Trend structure lookback", minval=2, group=groupFilters)
+wickThreshold = input.float(0.35, "Minimum wick ratio", minval=0.05, maxval=0.95, step=0.05, group=groupFilters)
+bodyStrengthThreshold = input.float(0.55, "Minimum body strength ratio", minval=0.10, maxval=1.00, step=0.05, group=groupFilters)
+chopThreshold = input.float(0.35, "Max EMA spread / ATR for chop", minval=0.05, step=0.05, group=groupFilters)
+lateEntryATRMult = input.float(1.10, "Max distance from VWAP in ATR for valid entry", minval=0.1, step=0.05, group=groupFilters)
+minMoveAwayFromVWAPATR = input.float(0.10, "Min move away from VWAP in ATR", minval=0.0, step=0.05, group=groupFilters)
+
+htfTf = input.timeframe("5", "Higher timeframe for context/setup", group=groupMTF)
+armedTimeoutBars = input.int(5, "Armed setup timeout (1m bars)", minval=1, maxval=30, group=groupMTF)
+invalidateDistanceATR = input.float(1.35, "Invalidate if distance from VWAP exceeds ATR multiple", minval=0.5, step=0.05, group=groupMTF)
+
+showLabels = input.bool(true, "Show A / A+ labels", group=groupVisuals)
+showDebugTable = input.bool(true, "Show debug table", group=groupVisuals)
+showBackground = input.bool(false, "Background by classification", group=groupVisuals)
+plotVWAP = input.bool(true, "Plot VWAP", group=groupVisuals)
+plotEMAs = input.bool(true, "Plot fast/slow EMA", group=groupVisuals)
+
+enableLongs = input.bool(true, "Classify longs", group=groupAlerts)
+enableShorts = input.bool(true, "Classify shorts", group=groupAlerts)
+
+// ----------------------
+// Helpers
+// ----------------------
+f_bool_to_int(bool x) =>
+    if x
+        1
+    else
+        0
+
+f_safe_div(float a, float b) =>
+    b == 0.0 ? 0.0 : a / b
+
+f_round(float x) =>
+    math.round(x * 100.0) / 100.0
+
+f_label(bool _cond, float _y, string _txt, _style, color _color, color _txtColor) =>
+    if _cond and showLabels
+        label.new(bar_index, _y, _txt, style=_style, color=_color, textcolor=_txtColor, size=size.small)
+
+// ----------------------
+// Base series (1m execution layer)
+// ----------------------
+atr = ta.atr(atrLen)
+vwap = ta.vwap(hlc3)
+emaFast = ta.ema(close, fastEmaLen)
+emaSlow = ta.ema(close, slowEmaLen)
+
+sessionOk = not useSessionFilter or not na(time(timeframe.period, sessionInput))
+executionTimeframeOk = timeframe.isminutes and timeframe.multiplier == 1
+
+barRange = high - low
+barBody = math.abs(close - open)
+bodyStrength = f_safe_div(barBody, barRange)
+
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+upperWickRatio = f_safe_div(upperWick, barRange)
+lowerWickRatio = f_safe_div(lowerWick, barRange)
+
+vwapSlope = vwap - vwap[vwapSlopeLookback]
+vwapUp = vwapSlope > 0
+vwapDown = vwapSlope < 0
+vwapNotFlat = math.abs(vwapSlope) > (atr * 0.02)
+
+emaSpreadAtr = f_safe_div(math.abs(emaFast - emaSlow), atr)
+notChoppy = emaSpreadAtr > chopThreshold
+
+distanceFromVWAPAtr = f_safe_div(math.abs(close - vwap), atr)
+notLateLong = distanceFromVWAPAtr <= lateEntryATRMult and close >= vwap
+notLateShort = distanceFromVWAPAtr <= lateEntryATRMult and close <= vwap
+
+movedAwayFromVWAPLong = f_safe_div(close - vwap, atr) >= minMoveAwayFromVWAPATR
+movedAwayFromVWAPShort = f_safe_div(vwap - close, atr) >= minMoveAwayFromVWAPATR
+
+trendUp = emaFast > emaSlow and close > emaFast and close > vwap
+trendDown = emaFast < emaSlow and close < emaFast and close < vwap
+
+recentHigherLows = low > low[1] or low[1] > low[2]
+recentLowerHighs = high < high[1] or high[1] < high[2]
+
+// ----------------------
+// DET-style proxies (1m)
+// ----------------------
+sweepRejectionLong = (
+    low < low[1] and
+    close > open and
+    lowerWickRatio >= wickThreshold and
+    close > (low + barRange * 0.55)
+)
+
+sweepRejectionShort = (
+    high > high[1] and
+    close < open and
+    upperWickRatio >= wickThreshold and
+    close < (high - barRange * 0.55)
+)
+
+reAccelLong = (
+    close > open and
+    bodyStrength >= bodyStrengthThreshold and
+    close > high[1] and
+    close > emaFast and
+    close > vwap
+)
+
+reAccelShort = (
+    close < open and
+    bodyStrength >= bodyStrengthThreshold and
+    close < low[1] and
+    close < emaFast and
+    close < vwap
+)
+
+wickSupportLong = lowerWickRatio >= wickThreshold or sweepRejectionLong
+wickSupportShort = upperWickRatio >= wickThreshold or sweepRejectionShort
+
+stopDist = atr * stopATRMult
+targetDist = atr * targetATRMult
+rr = f_safe_div(targetDist, stopDist)
+tradeableLong = rr >= riskRewardMin and atr > 0
+tradeableShort = rr >= riskRewardMin and atr > 0
+
+// ----------------------
+// Current timeframe quality metrics (used only after 5m armed)
+// ----------------------
+ctxLong1 = trendUp
+ctxLong2 = vwapUp and vwapNotFlat
+ctxLong3 = notChoppy
+ctxLong4 = notLateLong and movedAwayFromVWAPLong
+
+ctxShort1 = trendDown
+ctxShort2 = vwapDown and vwapNotFlat
+ctxShort3 = notChoppy
+ctxShort4 = notLateShort and movedAwayFromVWAPShort
+
+ctxLongScore = f_bool_to_int(ctxLong1) + f_bool_to_int(ctxLong2) + f_bool_to_int(ctxLong3) + f_bool_to_int(ctxLong4)
+ctxShortScore = f_bool_to_int(ctxShort1) + f_bool_to_int(ctxShort2) + f_bool_to_int(ctxShort3) + f_bool_to_int(ctxShort4)
+
+s1Long1 = reAccelLong or close > high[1]
+s1Long2 = reAccelLong
+s1Long3 = bodyStrength >= bodyStrengthThreshold
+s1Long4 = low >= low[1] or sweepRejectionLong
+
+s1Short1 = reAccelShort or close < low[1]
+s1Short2 = reAccelShort
+s1Short3 = bodyStrength >= bodyStrengthThreshold
+s1Short4 = high <= high[1] or sweepRejectionShort
+
+s1LongScore = f_bool_to_int(s1Long1) + f_bool_to_int(s1Long2) + f_bool_to_int(s1Long3) + f_bool_to_int(s1Long4)
+s1ShortScore = f_bool_to_int(s1Short1) + f_bool_to_int(s1Short2) + f_bool_to_int(s1Short3) + f_bool_to_int(s1Short4)
+
+plusLong1 = sweepRejectionLong
+plusLong2 = lowerWickRatio >= wickThreshold
+plusLong3 = reAccelLong
+plusLong4 = trendUp and vwapUp and close > emaFast and close > emaSlow
+plusLong5 = bodyStrength >= 0.70
+
+plusShort1 = sweepRejectionShort
+plusShort2 = upperWickRatio >= wickThreshold
+plusShort3 = reAccelShort
+plusShort4 = trendDown and vwapDown and close < emaFast and close < emaSlow
+plusShort5 = bodyStrength >= 0.70
+
+plusLongScore = f_bool_to_int(plusLong1) + f_bool_to_int(plusLong2) + f_bool_to_int(plusLong3) + f_bool_to_int(plusLong4) + f_bool_to_int(plusLong5)
+plusShortScore = f_bool_to_int(plusShort1) + f_bool_to_int(plusShort2) + f_bool_to_int(plusShort3) + f_bool_to_int(plusShort4) + f_bool_to_int(plusShort5)
+
+// ----------------------
+// Higher timeframe (5m context/setup layer)
+// ----------------------
+htfTime = request.security(syminfo.tickerid, htfTf, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+htfAtr = request.security(syminfo.tickerid, htfTf, ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfVwap = request.security(syminfo.tickerid, htfTf, ta.vwap(hlc3), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, fastEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTf, ta.ema(close, slowEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htfTf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfOpen = request.security(syminfo.tickerid, htfTf, open, barmerge.gaps_off, barmerge.lookahead_off)
+htfHigh = request.security(syminfo.tickerid, htfTf, high, barmerge.gaps_off, barmerge.lookahead_off)
+htfLow = request.security(syminfo.tickerid, htfTf, low, barmerge.gaps_off, barmerge.lookahead_off)
+
+htfRange = htfHigh - htfLow
+htfBody = math.abs(htfClose - htfOpen)
+htfBodyStrength = f_safe_div(htfBody, htfRange)
+
+htfUpperWick = htfHigh - math.max(htfOpen, htfClose)
+htfLowerWick = math.min(htfOpen, htfClose) - htfLow
+htfUpperWickRatio = f_safe_div(htfUpperWick, htfRange)
+htfLowerWickRatio = f_safe_div(htfLowerWick, htfRange)
+
+htfVwapSlope = request.security(syminfo.tickerid, htfTf, ta.vwap(hlc3) - ta.vwap(hlc3)[vwapSlopeLookback], barmerge.gaps_off, barmerge.lookahead_off)
+htfVwapUp = htfVwapSlope > 0
+htfVwapDown = htfVwapSlope < 0
+htfVwapNotFlat = math.abs(htfVwapSlope) > (htfAtr * 0.02)
+
+htfEmaSpreadAtr = f_safe_div(math.abs(htfEmaFast - htfEmaSlow), htfAtr)
+htfNotChoppy = htfEmaSpreadAtr > chopThreshold
+
+htfDistanceFromVWAPAtr = f_safe_div(math.abs(htfClose - htfVwap), htfAtr)
+htfNotLateLong = htfDistanceFromVWAPAtr <= lateEntryATRMult and htfClose >= htfVwap
+htfNotLateShort = htfDistanceFromVWAPAtr <= lateEntryATRMult and htfClose <= htfVwap
+
+htfMovedAwayFromVWAPLong = f_safe_div(htfClose - htfVwap, htfAtr) >= minMoveAwayFromVWAPATR
+htfMovedAwayFromVWAPShort = f_safe_div(htfVwap - htfClose, htfAtr) >= minMoveAwayFromVWAPATR
+
+htfTrendUp = htfEmaFast > htfEmaSlow and htfClose > htfEmaFast and htfClose > htfVwap
+htfTrendDown = htfEmaFast < htfEmaSlow and htfClose < htfEmaFast and htfClose < htfVwap
+
+htfLowestLowPrev = request.security(syminfo.tickerid, htfTf, ta.lowest(low[1], 3), barmerge.gaps_off, barmerge.lookahead_off)
+htfHighestHighPrev = request.security(syminfo.tickerid, htfTf, ta.highest(high[1], 3), barmerge.gaps_off, barmerge.lookahead_off)
+
+htfCloseLocationInRange = f_safe_div(htfClose - htfLow, math.max(htfRange, syminfo.mintick))
+
+htfStructureLong = (
+    htfLow >= htfLowestLowPrev and
+    (htfClose > htfEmaSlow or htfClose > htfVwap) and
+    htfCloseLocationInRange >= 0.45
+)
+
+htfStructureShort = (
+    htfHigh <= htfHighestHighPrev and
+    (htfClose < htfEmaSlow or htfClose < htfVwap) and
+    htfCloseLocationInRange <= 0.55
+)
+
+htfSweepRejectionLong = request.security(
+    syminfo.tickerid,
+    htfTf,
+    low < low[1] and close > open and ((math.min(open, close) - low) / math.max(high - low, syminfo.mintick)) >= wickThreshold and close > (low + (high - low) * 0.55),
+    barmerge.gaps_off,
+    barmerge.lookahead_off
+)
+
+htfSweepRejectionShort = request.security(
+    syminfo.tickerid,
+    htfTf,
+    high > high[1] and close < open and ((high - math.max(open, close)) / math.max(high - low, syminfo.mintick)) >= wickThreshold and close < (high - (high - low) * 0.55),
+    barmerge.gaps_off,
+    barmerge.lookahead_off
+)
+
+htfContextLong = sessionOk and htfTrendUp and htfVwapUp and htfVwapNotFlat and htfNotChoppy and htfNotLateLong and htfMovedAwayFromVWAPLong and rr >= riskRewardMin
+htfContextShort = sessionOk and htfTrendDown and htfVwapDown and htfVwapNotFlat and htfNotChoppy and htfNotLateShort and htfMovedAwayFromVWAPShort and rr >= riskRewardMin
+
+htfSetupLong = htfContextLong and htfStructureLong and (
+    htfSweepRejectionLong or
+    (htfLowerWickRatio >= wickThreshold and htfClose > htfOpen and htfClose > htfEmaSlow)
+)
+
+htfSetupShort = htfContextShort and htfStructureShort and (
+    htfSweepRejectionShort or
+    (htfUpperWickRatio >= wickThreshold and htfClose < htfOpen and htfClose < htfEmaSlow)
+)
+
+htfPlusCandidateLong = htfSetupLong and htfBodyStrength >= 0.60 and (htfSweepRejectionLong or htfLowerWickRatio >= math.min(0.95, wickThreshold + 0.10)) and htfClose > htfEmaFast and htfClose > htfEmaSlow
+htfPlusCandidateShort = htfSetupShort and htfBodyStrength >= 0.60 and (htfSweepRejectionShort or htfUpperWickRatio >= math.min(0.95, wickThreshold + 0.10)) and htfClose < htfEmaFast and htfClose < htfEmaSlow
+
+// ----------------------
+// Armed state machine
+// ----------------------
+var bool armedActive = false
+var int armedDir = 0
+var int armedStartBarIndex = na
+var int armedHtfTime = na
+var bool armedFired = false
+var bool armedPlusCandidate = false
+
+newHtfBar = ta.change(htfTime) != 0
+
+armedExpired = armedActive and not na(armedStartBarIndex) and (bar_index - armedStartBarIndex > armedTimeoutBars)
+
+armedInvalidLong = armedActive and armedDir == 1 and (
+    not htfContextLong or
+    htfSetupShort or
+    distanceFromVWAPAtr > invalidateDistanceATR or
+    not sessionOk
+)
+
+armedInvalidShort = armedActive and armedDir == -1 and (
+    not htfContextShort or
+    htfSetupLong or
+    distanceFromVWAPAtr > invalidateDistanceATR or
+    not sessionOk
+)
+
+if armedActive and (armedExpired or armedInvalidLong or armedInvalidShort)
+    armedActive := false
+    armedDir := 0
+    armedStartBarIndex := na
+    armedHtfTime := na
+    armedFired := false
+    armedPlusCandidate := false
+
+if newHtfBar
+    if not armedActive
+        if htfSetupLong and not htfSetupShort
+            armedActive := true
+            armedDir := 1
+            armedStartBarIndex := bar_index
+            armedHtfTime := int(htfTime)
+            armedFired := false
+            armedPlusCandidate := htfPlusCandidateLong
+        else if htfSetupShort and not htfSetupLong
+            armedActive := true
+            armedDir := -1
+            armedStartBarIndex := bar_index
+            armedHtfTime := int(htfTime)
+            armedFired := false
+            armedPlusCandidate := htfPlusCandidateShort
+    else
+        if armedDir == 1 and htfSetupShort
+            armedActive := true
+            armedDir := -1
+            armedStartBarIndex := bar_index
+            armedHtfTime := int(htfTime)
+            armedFired := false
+            armedPlusCandidate := htfPlusCandidateShort
+        else if armedDir == -1 and htfSetupLong
+            armedActive := true
+            armedDir := 1
+            armedStartBarIndex := bar_index
+            armedHtfTime := int(htfTime)
+            armedFired := false
+            armedPlusCandidate := htfPlusCandidateLong
+
+// ----------------------
+// 1m confirmation layer
+// ----------------------
+longTriggerBase = executionTimeframeOk and enableLongs and armedActive and armedDir == 1 and not armedFired and sessionOk and tradeableLong and ctxLongScore >= 3 and s1LongScore >= 3 and notLateLong and (
+    reAccelLong or
+    (close > high[1] and bodyStrength >= bodyStrengthThreshold and wickSupportLong)
+)
+
+shortTriggerBase = executionTimeframeOk and enableShorts and armedActive and armedDir == -1 and not armedFired and sessionOk and tradeableShort and ctxShortScore >= 3 and s1ShortScore >= 3 and notLateShort and (
+    reAccelShort or
+    (close < low[1] and bodyStrength >= bodyStrengthThreshold and wickSupportShort)
+)
+
+longTriggerPlus = longTriggerBase and armedPlusCandidate and plusLongScore >= 3 and ctxLongScore >= 4 and bodyStrength >= 0.70 and close > emaFast and close > emaSlow
+shortTriggerPlus = shortTriggerBase and armedPlusCandidate and plusShortScore >= 3 and ctxShortScore >= 4 and bodyStrength >= 0.70 and close < emaFast and close < emaSlow
+
+// ----------------------
+// Fire once per armed setup
+// ----------------------
+bool aLongFire = false
+bool aShortFire = false
+bool aPlusLongFire = false
+bool aPlusShortFire = false
+
+if longTriggerPlus
+    aPlusLongFire := true
+    armedFired := true
+    armedActive := false
+else if longTriggerBase
+    aLongFire := true
+    armedFired := true
+    armedActive := false
+
+if shortTriggerPlus
+    aPlusShortFire := true
+    armedFired := true
+    armedActive := false
+else if shortTriggerBase
+    aShortFire := true
+    armedFired := true
+    armedActive := false
+
+if not armedActive and armedFired
+    armedDir := 0
+    armedStartBarIndex := na
+    armedHtfTime := na
+    armedPlusCandidate := false
+
+// ----------------------
+// Final class (for visuals/debug)
+// ----------------------
+longClass = aPlusLongFire ? 3 : aLongFire ? 2 : 0
+shortClass = aPlusShortFire ? 3 : aShortFire ? 2 : 0
+
+finalClass = longClass > shortClass ? longClass : shortClass > longClass ? -shortClass : 0
+isLong = finalClass > 0
+isShort = finalClass < 0
+classAbs = math.abs(finalClass)
+
+// ----------------------
+// Visuals
+// ----------------------
+plot(plotVWAP ? vwap : na, "VWAP", color=color.orange, linewidth=2)
+plot(plotEMAs ? emaFast : na, "EMA Fast", color=color.aqua, linewidth=1)
+plot(plotEMAs ? emaSlow : na, "EMA Slow", color=color.blue, linewidth=1)
+
+bgcolor(
+    showBackground ?
+        (armedActive and armedDir == 1 ? color.new(color.green, 92) :
+         armedActive and armedDir == -1 ? color.new(color.red, 92) :
+         aPlusLongFire ? color.new(color.green, 84) :
+         aLongFire ? color.new(color.lime, 88) :
+         aPlusShortFire ? color.new(color.red, 84) :
+         aShortFire ? color.new(color.maroon, 88) : na) : na
+)
+
+plotshape(aLongFire, title="A Long", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="A")
+plotshape(aPlusLongFire, title="A+ Long", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="A+")
+plotshape(aShortFire, title="A Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="A")
+plotshape(aPlusShortFire, title="A+ Short", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small, text="A+")
+
+f_label(aLongFire, low, "A L", label.style_label_up, color.lime, color.black)
+f_label(aPlusLongFire, low, "A+ L", label.style_label_up, color.green, color.white)
+f_label(aShortFire, high, "A S", label.style_label_down, color.red, color.white)
+f_label(aPlusShortFire, high, "A+ S", label.style_label_down, color.maroon, color.white)
+
+// ----------------------
+// Alerts
+// ----------------------
+alertcondition(aLongFire, title="DET A Long", message="DET A Long")
+alertcondition(aPlusLongFire, title="DET A+ Long", message="DET A+ Long")
+alertcondition(aShortFire, title="DET A Short", message="DET A Short")
+alertcondition(aPlusShortFire, title="DET A+ Short", message="DET A+ Short")
+
+// ----------------------
+// Debug table
+// ----------------------
+var table t = table.new(position.top_right, 2, 32, border_width=1)
+
+if barstate.islast and showDebugTable
+    table.cell(t, 0, 0, "Metric", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 0, "Value", text_color=color.white, bgcolor=color.black)
+
+    sideTxt = finalClass > 0 ? (classAbs == 3 ? "A+ LONG" : "A LONG") : finalClass < 0 ? (classAbs == 3 ? "A+ SHORT" : "A SHORT") : "NO FIRE"
+    armedTxt = armedActive ? (armedDir == 1 ? "ARMED LONG" : armedDir == -1 ? "ARMED SHORT" : "ARMED") : "IDLE"
+    htfTxt = htfSetupLong ? "5m LONG SETUP" : htfSetupShort ? "5m SHORT SETUP" : htfContextLong ? "5m LONG CTX" : htfContextShort ? "5m SHORT CTX" : "NO 5m EDGE"
+
+    table.cell(t, 0, 1, "Class")
+    table.cell(t, 1, 1, sideTxt)
+
+    table.cell(t, 0, 2, "Armed state")
+    table.cell(t, 1, 2, armedTxt)
+
+    table.cell(t, 0, 3, "5m state")
+    table.cell(t, 1, 3, htfTxt)
+
+    table.cell(t, 0, 4, "5m plus candidate")
+    table.cell(t, 1, 4, str.tostring(armedPlusCandidate))
+
+    table.cell(t, 0, 5, "1m timeframe ok")
+    table.cell(t, 1, 5, str.tostring(executionTimeframeOk))
+
+    table.cell(t, 0, 6, "5m VWAP slope")
+    table.cell(t, 1, 6, str.tostring(f_round(htfVwapSlope)))
+
+    table.cell(t, 0, 7, "5m EMA spread / ATR")
+    table.cell(t, 1, 7, str.tostring(f_round(htfEmaSpreadAtr)))
+
+    table.cell(t, 0, 8, "1m Dist from VWAP / ATR")
+    table.cell(t, 1, 8, str.tostring(f_round(distanceFromVWAPAtr)))
+
+    table.cell(t, 0, 9, "1m body strength")
+    table.cell(t, 1, 9, str.tostring(f_round(bodyStrength)))
+
+    table.cell(t, 0, 10, "1m S1 score")
+    table.cell(t, 1, 10, isLong ? str.tostring(s1LongScore) : isShort ? str.tostring(s1ShortScore) : str.tostring(math.max(s1LongScore, s1ShortScore)))
+
+    table.cell(t, 0, 11, "1m Plus score")
+    table.cell(t, 1, 11, isLong ? str.tostring(plusLongScore) : isShort ? str.tostring(plusShortScore) : str.tostring(math.max(plusLongScore, plusShortScore)))
+
+    table.cell(t, 0, 12, "RR proxy")
+    table.cell(t, 1, 12, str.tostring(f_round(rr)))
+
+    table.cell(t, 0, 13, "Armed age bars")
+    table.cell(t, 1, 13, armedActive and not na(armedStartBarIndex) ? str.tostring(bar_index - armedStartBarIndex) : "-")
+
+    table.cell(t, 0, 14, "5m trend up")
+    table.cell(t, 1, 14, str.tostring(htfTrendUp))
+
+    table.cell(t, 0, 15, "5m trend down")
+    table.cell(t, 1, 15, str.tostring(htfTrendDown))
+
+    table.cell(t, 0, 16, "5m vwap up")
+    table.cell(t, 1, 16, str.tostring(htfVwapUp))
+
+    table.cell(t, 0, 17, "5m vwap down")
+    table.cell(t, 1, 17, str.tostring(htfVwapDown))
+
+    table.cell(t, 0, 18, "5m vwap not flat")
+    table.cell(t, 1, 18, str.tostring(htfVwapNotFlat))
+
+    table.cell(t, 0, 19, "5m not choppy")
+    table.cell(t, 1, 19, str.tostring(htfNotChoppy))
+
+    table.cell(t, 0, 20, "5m not late long")
+    table.cell(t, 1, 20, str.tostring(htfNotLateLong))
+
+    table.cell(t, 0, 21, "5m not late short")
+    table.cell(t, 1, 21, str.tostring(htfNotLateShort))
+
+    table.cell(t, 0, 22, "5m moved away long")
+    table.cell(t, 1, 22, str.tostring(htfMovedAwayFromVWAPLong))
+
+    table.cell(t, 0, 23, "5m moved away short")
+    table.cell(t, 1, 23, str.tostring(htfMovedAwayFromVWAPShort)
+
+  table.cell(t, 0, 24, "5m structure long")
+table.cell(t, 1, 24, str.tostring(htfStructureLong))
+
+table.cell(t, 0, 25, "5m structure short")
+table.cell(t, 1, 25, str.tostring(htfStructureShort))
+
+    table.cell(t, 0, 26, "5m sweep long")
+    table.cell(t, 1, 26, str.tostring(htfSweepRejectionLong))
+
+    table.cell(t, 0, 27, "5m sweep short")
+    table.cell(t, 1, 27, str.tostring(htfSweepRejectionShort))
+
+    table.cell(t, 0, 28, "5m ctx long")
+    table.cell(t, 1, 28, str.tostring(htfContextLong))
+
+    table.cell(t, 0, 29, "5m ctx short")
+    table.cell(t, 1, 29, str.tostring(htfContextShort))
+
+    table.cell(t, 0, 30, "5m setup long")
+    table.cell(t, 1, 30, str.tostring(htfSetupLong))
+
+    table.cell(t, 0, 31, "5m setup short")
+    table.cell(t, 1, 31, str.tostring(htfSetupShort))
