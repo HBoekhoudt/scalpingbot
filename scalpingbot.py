@@ -8,6 +8,7 @@ import threading
 import queue
 import time
 import decimal
+import json
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, HTTPException
@@ -69,6 +70,9 @@ class ScalpingBot:
 
         self.last_signal = None
         self.last_signal_time = 0
+
+        self.last_diagnostic = None
+        self.last_diagnostic_time = 0
 
         self.trade_analysis_lock = threading.Lock()
         self.trade_analysis = {}
@@ -139,6 +143,54 @@ class ScalpingBot:
 
     def extract_grade(self, data):
         return data.get("grade", "")
+
+    def is_diagnostic_payload(self, data):
+        if not isinstance(data, dict):
+            return False
+
+        if data.get("mode") == "diagnostic":
+            return True
+
+        event = data.get("event")
+        return event in {
+            "ctx_long_on",
+            "ctx_short_on",
+            "setup_long_on",
+            "setup_short_on",
+            "blocked_snapshot",
+        }
+
+    def log_diagnostic_signal(self, data):
+        event = data.get("event", "")
+        symbol = str(data.get("symbol", "")).upper().replace("1!", "")
+        if symbol == "FDAX":
+            symbol = "FDXM"
+
+        timeframe = data.get("timeframe", "")
+        price = data.get("price")
+        signal_time = data.get("time")
+        blocker = data.get("blocker", "")
+        now = time.time()
+
+        key = f"{symbol}-{timeframe}-{event}-{blocker}-{price}"
+
+        if key == self.last_diagnostic and now - self.last_diagnostic_time < 5:
+            logger.info("DIAGNOSTIC DUPLICATE IGNORED")
+            return
+
+        self.last_diagnostic = key
+        self.last_diagnostic_time = now
+
+        logger.info(
+            "DIAGNOSTIC EVENT | "
+            f"symbol={symbol} "
+            f"timeframe={timeframe} "
+            f"event={event} "
+            f"time={signal_time} "
+            f"price={price} "
+            f"blocker={blocker}"
+        )
+        logger.info(f"DIAGNOSTIC PAYLOAD | {json.dumps(data, sort_keys=True)}")
 
     def calculate_expected_gross_pnl(self, record):
         mult_map = {
@@ -635,6 +687,221 @@ class ScalpingBot:
             logger.exception("TRADE ERROR ANALYSIS FAILED")
 
     # ==========================================================
+    # SIGNAL NORMALIZATION / OBSERVABILITY
+    # ==========================================================
+
+    def _safe_float(self, value, default=None):
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _safe_int(self, value, default=None):
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _safe_bool(self, value, default=False):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+        return default
+
+    def _safe_str(self, value, default="unknown"):
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text if text else default
+
+    def _normalize_symbol(self, value):
+        symbol = self._safe_str(value, default="")
+        symbol = symbol.upper().replace("1!", "")
+        if symbol == "FDAX":
+            symbol = "FDXM"
+        return symbol
+
+    def _normalize_side(self, payload):
+        side = payload.get("candidate_side")
+        if side is None:
+            side = payload.get("side")
+        if side is None:
+            side = payload.get("direction")
+
+        side = self._safe_str(side, default="").lower()
+
+        if side in {"buy", "bull", "up"}:
+            side = "long"
+        elif side in {"sell", "bear", "down"}:
+            side = "short"
+
+        if side not in {"long", "short"}:
+            return None
+        return side
+
+    def _normalize_reason_flags(self, value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(x) for x in value if str(x).strip()]
+        if isinstance(value, tuple):
+            return [str(x) for x in value if str(x).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return [str(value)]
+
+    def detect_payload_format(self, payload):
+        candidate_keys = {
+            "schema_version",
+            "signal_id",
+            "timestamp_utc",
+            "candidate_side",
+            "strategy_family",
+            "tv_score",
+            "tv_candidate_grade",
+            "reason_flags",
+            "bias_5m",
+        }
+        if any(key in payload for key in candidate_keys):
+            return "candidate"
+        return "legacy"
+
+    def normalize_signal(self, payload):
+        payload_format = self.detect_payload_format(payload)
+
+        symbol = self._normalize_symbol(payload.get("symbol"))
+        side = self._normalize_side(payload)
+
+        entry_price = self._safe_float(
+            payload.get("entry_price", payload.get("entry")),
+            default=None,
+        )
+        stop_loss = self._safe_float(
+            payload.get("stop_loss", payload.get("stop")),
+            default=None,
+        )
+        take_profit = self._safe_float(
+            payload.get("take_profit", payload.get("target")),
+            default=None,
+        )
+
+        grade = self._safe_str(payload.get("grade"), default="")
+        candidate_grade = self._safe_str(payload.get("tv_candidate_grade"), default="")
+        if not candidate_grade:
+            candidate_grade = grade
+
+        normalized = {
+            "raw_payload": payload,
+            "payload_format": payload_format,
+            "schema_version": payload.get("schema_version"),
+            "signal_id": self._safe_str(payload.get("signal_id"), default=""),
+            "timestamp_utc": self._safe_str(
+                payload.get("timestamp_utc", payload.get("time")),
+                default="",
+            ),
+            "symbol": symbol,
+            "timeframe": self._safe_str(payload.get("timeframe"), default=""),
+            "instrument_type": self._safe_str(payload.get("instrument_type"), default="unknown"),
+            "strategy_family": self._safe_str(payload.get("strategy_family"), default="unknown"),
+            "side": side,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "grade": grade,
+            "candidate_grade": candidate_grade,
+            "tv_score": self._safe_float(payload.get("tv_score"), default=None),
+            "reason_flags": self._normalize_reason_flags(payload.get("reason_flags")),
+            "session_name": self._safe_str(payload.get("session_name"), default="unknown"),
+            "minutes_from_open": self._safe_int(payload.get("minutes_from_open"), default=None),
+            "vwap_price": self._safe_float(payload.get("vwap_price"), default=None),
+            "vwap_distance_points": self._safe_float(payload.get("vwap_distance_points"), default=None),
+            "vwap_distance_atr": self._safe_float(payload.get("vwap_distance_atr"), default=None),
+            "vwap_slope_1m": self._safe_float(payload.get("vwap_slope_1m"), default=None),
+            "vwap_slope_5m": self._safe_float(payload.get("vwap_slope_5m"), default=None),
+            "above_vwap": self._safe_bool(payload.get("above_vwap"), default=False),
+            "bias_5m": self._safe_str(payload.get("bias_5m"), default="unknown"),
+            "trend_strength_5m": self._safe_float(payload.get("trend_strength_5m"), default=None),
+            "range_state_5m": self._safe_str(payload.get("range_state_5m"), default="unknown"),
+            "overlap_ratio_5m": self._safe_float(payload.get("overlap_ratio_5m"), default=None),
+            "sweep_detected": self._safe_bool(payload.get("sweep_detected"), default=False),
+            "sweep_side": self._safe_str(payload.get("sweep_side"), default="unknown"),
+            "rejection_detected": self._safe_bool(payload.get("rejection_detected"), default=False),
+            "rejection_wick_ratio": self._safe_float(payload.get("rejection_wick_ratio"), default=None),
+            "structure_1m_ok": self._safe_bool(payload.get("structure_1m_ok"), default=False),
+            "reacceleration_1m_ok": self._safe_bool(payload.get("reacceleration_1m_ok"), default=False),
+            "pullback_depth_1m": self._safe_float(payload.get("pullback_depth_1m"), default=None),
+            "rr_estimate": self._safe_float(payload.get("rr_estimate"), default=None),
+            "spread_estimate_ticks": self._safe_float(payload.get("spread_estimate_ticks"), default=None),
+            "execution_quality_hint": self._safe_str(payload.get("execution_quality_hint"), default="unknown"),
+        }
+
+        normalized["execution_ready"] = (
+            bool(normalized["symbol"]) and
+            normalized["side"] in {"long", "short"} and
+            normalized["entry_price"] is not None
+        )
+
+        return normalized
+
+    def build_normalized_summary(self, normalized):
+        summary = {
+            "payload_format": normalized["payload_format"],
+            "schema_version": normalized["schema_version"],
+            "signal_id": normalized["signal_id"],
+            "symbol": normalized["symbol"],
+            "side": normalized["side"],
+            "entry_price": normalized["entry_price"],
+            "grade": normalized["grade"],
+            "candidate_grade": normalized["candidate_grade"],
+            "tv_score": normalized["tv_score"],
+            "session_name": normalized["session_name"],
+            "bias_5m": normalized["bias_5m"],
+            "reason_flags": normalized["reason_flags"],
+            "execution_ready": normalized["execution_ready"],
+        }
+        return summary
+
+    def log_normalized_signal(self, normalized):
+        logger.info(f"RAW PAYLOAD RECEIVED | {json.dumps(normalized['raw_payload'], sort_keys=True)}")
+        logger.info(f"NORMALIZED SIGNAL | {json.dumps(self.build_normalized_summary(normalized), sort_keys=True)}")
+        logger.info(
+            "PAYLOAD OBSERVABILITY | "
+            f"payload_format={normalized['payload_format']} "
+            f"schema_version={normalized['schema_version']} "
+            f"signal_id={normalized['signal_id']} "
+            f"symbol={normalized['symbol']} "
+            f"side={normalized['side']} "
+            f"grade={normalized['grade']} "
+            f"candidate_grade={normalized['candidate_grade']} "
+            f"tv_score={normalized['tv_score']} "
+            f"session_name={normalized['session_name']} "
+            f"bias_5m={normalized['bias_5m']} "
+            f"reason_flags={normalized['reason_flags']}"
+        )
+
+    # ==========================================================
     # IB CONNECTION
     # ==========================================================
 
@@ -861,30 +1128,49 @@ class ScalpingBot:
 
         logger.info(f"WEBHOOK RECEIVED: {data}")
 
-        symbol = data["symbol"].upper().replace("1!", "")
-        if symbol == "FDAX":
-            symbol = "FDXM"
+        if not isinstance(data, dict):
+            logger.error(f"INVALID PAYLOAD TYPE: {type(data)}")
+            return "invalid_payload_type"
 
-        side = data["side"]
-        entry = float(data["entry_price"])
-        signal_time = data.get("time")
-        grade = self.extract_grade(data)
+        if self.is_diagnostic_payload(data):
+            self.log_diagnostic_signal(data)
+            return "diagnostic_logged"
+
+        normalized = self.normalize_signal(data)
+        self.log_normalized_signal(normalized)
+
+        if not normalized["symbol"] or not normalized["side"]:
+            logger.error(
+                "INVALID SIGNAL PAYLOAD | "
+                f"missing_canonical_fields symbol={normalized['symbol']} side={normalized['side']} "
+                f"payload_format={normalized['payload_format']}"
+            )
+            return "invalid_signal_payload"
+
+        if not normalized["execution_ready"]:
+            logger.info(
+                "CANDIDATE PAYLOAD LOGGED NO EXECUTION | "
+                f"payload_format={normalized['payload_format']} "
+                f"signal_id={normalized['signal_id']} "
+                f"symbol={normalized['symbol']} "
+                f"side={normalized['side']} "
+                f"missing_execution_field=entry_price"
+            )
+            return "candidate_logged_no_execution"
+
+        symbol = normalized["symbol"]
+        side = normalized["side"]
+        entry = normalized["entry_price"]
+        signal_time = normalized["timestamp_utc"] or data.get("time")
+        grade = normalized["grade"] or normalized["candidate_grade"]
         enqueue_time = self.utc_now_iso()
 
-        if symbol == "MES" and grade != "A+":
-            logger.info(f"MES SIGNAL BLOCKED: grade={grade} requires A+")
-            return
-
-        if symbol == "FDXM" and grade != "A+":
-            logger.info(f"FDXM SIGNAL BLOCKED: grade={grade} requires A+")
-            return
-
         now = time.time()
-        key = f"{symbol}-{side}-{round(entry, 2)}"
+        key = f"{symbol}-{side}-{round(entry, 8)}"
 
         if key == self.last_signal and now - self.last_signal_time < 5:
             logger.info("Duplicate ignored")
-            return
+            return "duplicate_ignored"
 
         self.last_signal = key
         self.last_signal_time = now
@@ -896,11 +1182,25 @@ class ScalpingBot:
             "signal_time": signal_time,
             "enqueue_time": enqueue_time,
             "grade": grade,
+            "normalized_signal": normalized,
+            "raw_payload": data,
+            "payload_format": normalized["payload_format"],
+            "schema_version": normalized["schema_version"],
+            "signal_id": normalized["signal_id"],
         }
 
-        logger.info(f"QUEUE PUT: {job}")
+        logger.info(
+            "QUEUE PUT | "
+            f"symbol={job['symbol']} "
+            f"side={job['side']} "
+            f"entry={job['entry']} "
+            f"grade={job['grade']} "
+            f"payload_format={job['payload_format']} "
+            f"signal_id={job['signal_id']}"
+        )
 
         self.execution_queue.put(job)
+        return "queued"
 
     # ==========================================================
     # WORKER
@@ -1131,11 +1431,27 @@ def health():
 @app.post("/webhook/tradingview")
 async def webhook_handler(request: Request):
 
-    data = await request.json()
+    raw_body = await request.body()
+    raw_text = raw_body.decode("utf-8", errors="replace")
+    logger.info(f"WEBHOOK RAW BODY: {raw_text}")
+
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        logger.exception("WEBHOOK JSON PARSE FAILED")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if not isinstance(data, dict):
+        logger.error(f"WEBHOOK JSON ROOT MUST BE OBJECT, GOT: {type(data)}")
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
     if data.get("secret") != "FDAX_bot_secure_2026":
         raise HTTPException(status_code=403)
 
-    bot.handle_webhook_signal(data)
+    try:
+        status = bot.handle_webhook_signal(data)
+    except Exception:
+        logger.exception("WEBHOOK PROCESSING FAILED")
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
 
-    return {"status": "queued"}
+    return {"status": status}
