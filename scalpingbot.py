@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT — P034
+# IKBR SCALPING BOT — P039
 # ==========================================================
 
 import logging
@@ -20,7 +20,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P260326034"
+BOT_PATCH = "P260407039"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -734,6 +734,74 @@ class ScalpingBot:
             symbol = "FDXM"
         return symbol
 
+    def _infer_side_from_context(self, payload):
+        event = self._safe_str(payload.get("event"), default="").lower()
+
+        if event in {"ctx_long_on", "setup_long_on"}:
+            return "long"
+        if event in {"ctx_short_on", "setup_short_on"}:
+            return "short"
+
+        long_score = 0
+        short_score = 0
+
+        if self._safe_bool(payload.get("htf_setup_long"), default=False):
+            long_score += 4
+        if self._safe_bool(payload.get("htf_setup_short"), default=False):
+            short_score += 4
+
+        if self._safe_bool(payload.get("htf_structure_long"), default=False):
+            long_score += 3
+        if self._safe_bool(payload.get("htf_structure_short"), default=False):
+            short_score += 3
+
+        if self._safe_bool(payload.get("htf_trend_up"), default=False):
+            long_score += 2
+        if self._safe_bool(payload.get("htf_trend_down"), default=False):
+            short_score += 2
+
+        if self._safe_bool(payload.get("htf_vwap_up"), default=False):
+            long_score += 2
+        if self._safe_bool(payload.get("htf_vwap_down"), default=False):
+            short_score += 2
+
+        if self._safe_bool(payload.get("htf_moved_away_long"), default=False):
+            long_score += 1
+        if self._safe_bool(payload.get("htf_moved_away_short"), default=False):
+            short_score += 1
+
+        bias_5m = self._safe_str(payload.get("bias_5m"), default="").lower()
+        if bias_5m in {"long", "bull", "up"}:
+            long_score += 1
+        elif bias_5m in {"short", "bear", "down"}:
+            short_score += 1
+
+        candidate_side = self._safe_str(payload.get("candidate_side"), default="").lower()
+        if candidate_side in {"long", "buy", "bull", "up"}:
+            long_score += 5
+        elif candidate_side in {"short", "sell", "bear", "down"}:
+            short_score += 5
+
+        sweep_side = self._safe_str(payload.get("sweep_side"), default="").lower()
+        if sweep_side == "down":
+            long_score += 1
+        elif sweep_side == "up":
+            short_score += 1
+
+        blocker = self._safe_str(payload.get("blocker"), default="").lower()
+        if blocker == "late_failed":
+            if self._safe_bool(payload.get("htf_not_late_long"), default=True) is False and self._safe_bool(payload.get("htf_not_late_short"), default=True):
+                long_score += 1
+            elif self._safe_bool(payload.get("htf_not_late_short"), default=True) is False and self._safe_bool(payload.get("htf_not_late_long"), default=True):
+                short_score += 1
+
+        if long_score > short_score:
+            return "long"
+        if short_score > long_score:
+            return "short"
+
+        return None
+
     def _normalize_side(self, payload):
         side = payload.get("candidate_side")
         if side is None:
@@ -748,9 +816,10 @@ class ScalpingBot:
         elif side in {"sell", "bear", "down"}:
             side = "short"
 
-        if side not in {"long", "short"}:
-            return None
-        return side
+        if side in {"long", "short"}:
+            return side
+
+        return self._infer_side_from_context(payload)
 
     def _normalize_reason_flags(self, value):
         if value is None:
@@ -769,11 +838,14 @@ class ScalpingBot:
                     return [str(x) for x in parsed if str(x).strip()]
             except Exception:
                 pass
-            return [item.strip() for item in raw.split(",") if item.strip()]
+            return [item.strip() for item in raw.replace("|", ",").split(",") if item.strip()]
         return [str(value)]
 
     def detect_payload_format(self, payload):
-        candidate_keys = {
+        if self.is_diagnostic_payload(payload):
+            return "diagnostic"
+
+        enriched_keys = {
             "schema_version",
             "signal_id",
             "timestamp_utc",
@@ -783,10 +855,30 @@ class ScalpingBot:
             "tv_candidate_grade",
             "reason_flags",
             "bias_5m",
+            "mode",
+            "event",
+            "blocker",
+            "htf_trend_up",
+            "htf_trend_down",
+            "htf_vwap_up",
+            "htf_vwap_down",
+            "htf_vwap_not_flat",
+            "htf_not_choppy",
+            "htf_not_late_long",
+            "htf_not_late_short",
+            "htf_moved_away_long",
+            "htf_moved_away_short",
+            "htf_structure_long",
+            "htf_structure_short",
+            "htf_setup_long",
+            "htf_setup_short",
+            "distance_from_vwap_atr",
+            "htf_ema_spread_atr",
+            "body_strength",
         }
-        if any(key in payload for key in candidate_keys):
-            return "candidate"
-        return "legacy"
+        if any(key in payload for key in enriched_keys):
+            return "enriched_candidate"
+        return "legacy_execution"
 
     def normalize_signal(self, payload):
         payload_format = self.detect_payload_format(payload)
@@ -812,23 +904,31 @@ class ScalpingBot:
         if not candidate_grade:
             candidate_grade = grade
 
+        timestamp_utc = self._safe_str(
+            payload.get("timestamp_utc", payload.get("time")),
+            default="",
+        )
+
         normalized = {
             "raw_payload": payload,
             "payload_format": payload_format,
             "schema_version": payload.get("schema_version"),
             "signal_id": self._safe_str(payload.get("signal_id"), default=""),
-            "timestamp_utc": self._safe_str(
-                payload.get("timestamp_utc", payload.get("time")),
-                default="",
-            ),
+            "timestamp_utc": timestamp_utc,
+            "time": timestamp_utc,
             "symbol": symbol,
+            "normalized_symbol": symbol,
             "timeframe": self._safe_str(payload.get("timeframe"), default=""),
             "instrument_type": self._safe_str(payload.get("instrument_type"), default="unknown"),
             "strategy_family": self._safe_str(payload.get("strategy_family"), default="unknown"),
+            "mode": self._safe_str(payload.get("mode"), default="").lower(),
+            "event": self._safe_str(payload.get("event"), default="").lower(),
             "side": side,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "price": self._safe_float(payload.get("price"), default=entry_price),
+            "blocker": self._safe_str(payload.get("blocker"), default=""),
             "grade": grade,
             "candidate_grade": candidate_grade,
             "tv_score": self._safe_float(payload.get("tv_score"), default=None),
@@ -855,9 +955,27 @@ class ScalpingBot:
             "rr_estimate": self._safe_float(payload.get("rr_estimate"), default=None),
             "spread_estimate_ticks": self._safe_float(payload.get("spread_estimate_ticks"), default=None),
             "execution_quality_hint": self._safe_str(payload.get("execution_quality_hint"), default="unknown"),
+            "htf_trend_up": self._safe_bool(payload.get("htf_trend_up"), default=False),
+            "htf_trend_down": self._safe_bool(payload.get("htf_trend_down"), default=False),
+            "htf_vwap_up": self._safe_bool(payload.get("htf_vwap_up"), default=False),
+            "htf_vwap_down": self._safe_bool(payload.get("htf_vwap_down"), default=False),
+            "htf_vwap_not_flat": self._safe_bool(payload.get("htf_vwap_not_flat"), default=False),
+            "htf_not_choppy": self._safe_bool(payload.get("htf_not_choppy"), default=True),
+            "htf_not_late_long": self._safe_bool(payload.get("htf_not_late_long"), default=True),
+            "htf_not_late_short": self._safe_bool(payload.get("htf_not_late_short"), default=True),
+            "htf_moved_away_long": self._safe_bool(payload.get("htf_moved_away_long"), default=False),
+            "htf_moved_away_short": self._safe_bool(payload.get("htf_moved_away_short"), default=False),
+            "htf_structure_long": self._safe_bool(payload.get("htf_structure_long"), default=False),
+            "htf_structure_short": self._safe_bool(payload.get("htf_structure_short"), default=False),
+            "htf_setup_long": self._safe_bool(payload.get("htf_setup_long"), default=False),
+            "htf_setup_short": self._safe_bool(payload.get("htf_setup_short"), default=False),
+            "distance_from_vwap_atr": self._safe_float(payload.get("distance_from_vwap_atr"), default=None),
+            "htf_ema_spread_atr": self._safe_float(payload.get("htf_ema_spread_atr"), default=None),
+            "body_strength": self._safe_float(payload.get("body_strength"), default=None),
         }
 
         normalized["execution_ready"] = (
+            payload_format == "legacy_execution" and
             bool(normalized["symbol"]) and
             normalized["side"] in {"long", "short"} and
             normalized["entry_price"] is not None
@@ -870,9 +988,14 @@ class ScalpingBot:
             "payload_format": normalized["payload_format"],
             "schema_version": normalized["schema_version"],
             "signal_id": normalized["signal_id"],
+            "mode": normalized["mode"],
+            "event": normalized["event"],
             "symbol": normalized["symbol"],
+            "normalized_symbol": normalized["normalized_symbol"],
             "side": normalized["side"],
             "entry_price": normalized["entry_price"],
+            "price": normalized["price"],
+            "blocker": normalized["blocker"],
             "grade": normalized["grade"],
             "candidate_grade": normalized["candidate_grade"],
             "tv_score": normalized["tv_score"],
@@ -880,6 +1003,23 @@ class ScalpingBot:
             "bias_5m": normalized["bias_5m"],
             "reason_flags": normalized["reason_flags"],
             "execution_ready": normalized["execution_ready"],
+            "htf_trend_up": normalized["htf_trend_up"],
+            "htf_trend_down": normalized["htf_trend_down"],
+            "htf_vwap_up": normalized["htf_vwap_up"],
+            "htf_vwap_down": normalized["htf_vwap_down"],
+            "htf_vwap_not_flat": normalized["htf_vwap_not_flat"],
+            "htf_not_choppy": normalized["htf_not_choppy"],
+            "htf_not_late_long": normalized["htf_not_late_long"],
+            "htf_not_late_short": normalized["htf_not_late_short"],
+            "htf_moved_away_long": normalized["htf_moved_away_long"],
+            "htf_moved_away_short": normalized["htf_moved_away_short"],
+            "htf_structure_long": normalized["htf_structure_long"],
+            "htf_structure_short": normalized["htf_structure_short"],
+            "htf_setup_long": normalized["htf_setup_long"],
+            "htf_setup_short": normalized["htf_setup_short"],
+            "distance_from_vwap_atr": normalized["distance_from_vwap_atr"],
+            "htf_ema_spread_atr": normalized["htf_ema_spread_atr"],
+            "body_strength": normalized["body_strength"],
         }
         return summary
 
@@ -900,6 +1040,257 @@ class ScalpingBot:
             f"bias_5m={normalized['bias_5m']} "
             f"reason_flags={normalized['reason_flags']}"
         )
+
+    def evaluate_stage_execution_policy(self, normalized):
+        stage = BOT_STAGE
+        payload_format = normalized["payload_format"]
+        policy_branch = "classification_only"
+        policy_reason = (
+            "non-legacy execution paths remain classification-only; "
+            "diagnostic payloads follow this branch"
+        )
+        allow_queue = False
+
+        if payload_format == "enriched_candidate":
+            policy_branch = "future_det_gated_execution"
+            allow_queue = False
+            policy_reason = (
+                "DET-gated execution is the intended target architecture; "
+                "enriched candidates are explicitly modeled for this path but execution is not enabled yet in this patch"
+            )
+        elif payload_format == "legacy_execution":
+            if stage == "TEST":
+                policy_branch = "temporary_legacy_execution_compatibility"
+                allow_queue = True
+                policy_reason = (
+                    "TEST stage allows the temporary legacy execution compatibility path "
+                    "for manual legacy execution testing"
+                )
+            else:
+                policy_branch = "legacy_execution_restricted"
+                allow_queue = False
+                policy_reason = (
+                    "legacy execution payloads are restricted to TEST stage only; "
+                    "PAPER/LIVE deny queueing for temporary legacy execution"
+                )
+        else:
+            policy_branch = "classification_only"
+
+        return {
+            "stage": stage,
+            "policy_branch": policy_branch,
+            "allow_queue": allow_queue,
+            "reason": policy_reason,
+        }
+
+    def assess_det_signal(self, normalized):
+        side = normalized["side"]
+        hard_blockers = []
+        soft_blockers = []
+        secondary_reasons = []
+
+        session_valid = True
+
+        vwap_bias_valid = False
+        if side == "long":
+            vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_up"] and not normalized["htf_vwap_down"]
+        elif side == "short":
+            vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_down"] and not normalized["htf_vwap_up"]
+
+        structure_valid = False
+        if side == "long":
+            structure_valid = normalized["htf_structure_long"] and not normalized["htf_structure_short"]
+        elif side == "short":
+            structure_valid = normalized["htf_structure_short"] and not normalized["htf_structure_long"]
+
+        setup_valid = False
+        if side == "long":
+            setup_valid = normalized["htf_setup_long"]
+        elif side == "short":
+            setup_valid = normalized["htf_setup_short"]
+
+        trigger_valid = (
+            normalized["reacceleration_1m_ok"]
+            or normalized["structure_1m_ok"]
+            or normalized["rejection_detected"]
+            or (
+                normalized["body_strength"] is not None
+                and normalized["body_strength"] >= 0.70
+            )
+        )
+
+        if normalized["event"] == "blocked_snapshot":
+            trigger_valid = False
+
+        conflicting_context = False
+        if side == "long":
+            conflicting_context = normalized["htf_trend_down"] or normalized["htf_vwap_down"]
+        elif side == "short":
+            conflicting_context = normalized["htf_trend_up"] or normalized["htf_vwap_up"]
+
+        late_invalid = False
+        if side == "long":
+            late_invalid = not normalized["htf_not_late_long"]
+        elif side == "short":
+            late_invalid = not normalized["htf_not_late_short"]
+
+        if not vwap_bias_valid:
+            hard_blockers.append("no_vwap_bias")
+
+        if not normalized["htf_not_choppy"] or normalized["blocker"] == "chop_failed":
+            hard_blockers.append("chop")
+
+        if late_invalid or normalized["blocker"] == "late_failed":
+            hard_blockers.append("late")
+
+        if conflicting_context:
+            hard_blockers.append("conflicting_context")
+
+        if not structure_valid or normalized["blocker"] == "structure_failed":
+            hard_blockers.append("poor_structure")
+
+        if normalized["blocker"]:
+            secondary_reasons.append(f"pine_blocker:{normalized['blocker']}")
+
+        if normalized["reason_flags"]:
+            secondary_reasons.extend([f"reason_flag:{flag}" for flag in normalized["reason_flags"]])
+
+        if normalized["distance_from_vwap_atr"] is not None:
+            if normalized["distance_from_vwap_atr"] >= 1.5:
+                soft_blockers.append("extended_from_vwap")
+            if normalized["distance_from_vwap_atr"] >= 2.0 and "late" not in hard_blockers:
+                hard_blockers.append("late_extension_proxy")
+
+        if normalized["body_strength"] is not None and normalized["body_strength"] < 0.60:
+            soft_blockers.append("weak_body_strength")
+
+        if normalized["htf_ema_spread_atr"] is not None and normalized["htf_ema_spread_atr"] < 0.20:
+            soft_blockers.append("low_ema_spread")
+
+        if not setup_valid:
+            soft_blockers.append("no_setup")
+
+        if not trigger_valid:
+            soft_blockers.append("weak_or_missing_trigger")
+
+        if hard_blockers:
+            det_classification = "REJECT"
+            primary_reason = hard_blockers[0]
+        else:
+            strong_alignment = False
+            if side == "long":
+                strong_alignment = (
+                    normalized["htf_trend_up"]
+                    and normalized["htf_vwap_up"]
+                    and structure_valid
+                    and setup_valid
+                    and trigger_valid
+                    and normalized["htf_not_choppy"]
+                    and normalized["htf_not_late_long"]
+                )
+            elif side == "short":
+                strong_alignment = (
+                    normalized["htf_trend_down"]
+                    and normalized["htf_vwap_down"]
+                    and structure_valid
+                    and setup_valid
+                    and trigger_valid
+                    and normalized["htf_not_choppy"]
+                    and normalized["htf_not_late_short"]
+                )
+
+            base_a_quality = (
+                vwap_bias_valid
+                and structure_valid
+                and setup_valid
+                and trigger_valid
+            )
+
+            if strong_alignment and not soft_blockers and normalized["body_strength"] is not None and normalized["body_strength"] >= 0.85:
+                det_classification = "EXECUTE_A_PLUS"
+                primary_reason = "strong_aligned_context"
+            elif base_a_quality and len(soft_blockers) <= 1:
+                det_classification = "EXECUTE_A"
+                primary_reason = "valid_setup_and_trigger"
+            else:
+                det_classification = "SHADOW"
+                if soft_blockers:
+                    primary_reason = soft_blockers[0]
+                else:
+                    primary_reason = "borderline_context"
+
+        return {
+            "session_valid": session_valid,
+            "vwap_bias_valid": vwap_bias_valid,
+            "structure_valid": structure_valid,
+            "setup_valid": setup_valid,
+            "trigger_valid": trigger_valid,
+            "hard_blockers": list(dict.fromkeys(hard_blockers)),
+            "soft_blockers": list(dict.fromkeys(soft_blockers)),
+            "primary_reason": primary_reason,
+            "secondary_reasons": list(dict.fromkeys(secondary_reasons)),
+            "det_classification": det_classification,
+        }
+
+    def build_classification_result(self, normalized, assessment):
+        return {
+            "det_classification": assessment["det_classification"],
+            "execution_permission": False,
+            "primary_reason": assessment["primary_reason"],
+            "secondary_reasons": assessment["secondary_reasons"],
+            "hard_blockers": assessment["hard_blockers"],
+            "soft_blockers": assessment["soft_blockers"],
+            "pine_blocker": normalized["blocker"],
+            "bot_primary_reason": assessment["primary_reason"],
+        }
+
+    def log_det_result(self, normalized, assessment, classification_result):
+        assessment_summary = {
+            "payload_format": normalized["payload_format"],
+            "signal_id": normalized["signal_id"],
+            "symbol": normalized["symbol"],
+            "side": normalized["side"],
+            "session_valid": assessment["session_valid"],
+            "vwap_bias_valid": assessment["vwap_bias_valid"],
+            "structure_valid": assessment["structure_valid"],
+            "setup_valid": assessment["setup_valid"],
+            "trigger_valid": assessment["trigger_valid"],
+            "hard_blockers": assessment["hard_blockers"],
+            "soft_blockers": assessment["soft_blockers"],
+        }
+
+        logger.info(f"DET ASSESSMENT | {json.dumps(assessment_summary, sort_keys=True)}")
+        logger.info(f"DET CLASSIFICATION RESULT | {json.dumps(classification_result, sort_keys=True)}")
+        logger.info(
+            "DET REASON COMPARE | "
+            f"pine_blocker={classification_result['pine_blocker']} "
+            f"bot_primary_reason={classification_result['bot_primary_reason']}"
+        )
+
+    def evaluate_det_execution_gate(self, classification_result):
+        det_classification = classification_result["det_classification"]
+        stage = BOT_STAGE
+        
+        gate_eligible = det_classification in ("EXECUTE_A_PLUS", "EXECUTE_A")
+        gate_enabled = False
+        gate_branch = "det_execution_gate"
+        queue_allowed = False
+        
+        reason = (
+            "DET execution gate models future eligibility semantics; "
+            f"classification is {det_classification} (eligible={gate_eligible}); "
+            "gate is not yet enabled in this patch"
+        )
+        
+        return {
+            "gate_branch": gate_branch,
+            "gate_enabled": gate_enabled,
+            "gate_eligible": gate_eligible,
+            "queue_allowed": queue_allowed,
+            "det_classification": det_classification,
+            "stage": stage,
+            "reason": reason,
+        }
 
     # ==========================================================
     # IB CONNECTION
@@ -1132,12 +1523,23 @@ class ScalpingBot:
             logger.error(f"INVALID PAYLOAD TYPE: {type(data)}")
             return "invalid_payload_type"
 
-        if self.is_diagnostic_payload(data):
-            self.log_diagnostic_signal(data)
-            return "diagnostic_logged"
-
         normalized = self.normalize_signal(data)
         self.log_normalized_signal(normalized)
+
+        if normalized["payload_format"] == "diagnostic":
+            self.log_diagnostic_signal(data)
+            assessment = self.assess_det_signal(normalized)
+            classification_result = self.build_classification_result(normalized, assessment)
+            self.log_det_result(normalized, assessment, classification_result)
+            logger.info(
+                "QUEUE DECISION | "
+                f"path=classification_only "
+                f"payload_format={normalized['payload_format']} "
+                f"queued=false "
+                f"det_classification={classification_result['det_classification']} "
+                f"execution_permission={classification_result['execution_permission']}"
+            )
+            return "diagnostic_classified_no_execution"
 
         if not normalized["symbol"] or not normalized["side"]:
             logger.error(
@@ -1146,6 +1548,35 @@ class ScalpingBot:
                 f"payload_format={normalized['payload_format']}"
             )
             return "invalid_signal_payload"
+
+        if normalized["payload_format"] == "enriched_candidate":
+            assessment = self.assess_det_signal(normalized)
+            classification_result = self.build_classification_result(normalized, assessment)
+            self.log_det_result(normalized, assessment, classification_result)
+            
+            gate_result = self.evaluate_det_execution_gate(classification_result)
+            logger.info(
+                "DET EXECUTION GATE DECISION | "
+                f"gate_branch={gate_result['gate_branch']} "
+                f"det_classification={gate_result['det_classification']} "
+                f"gate_enabled={gate_result['gate_enabled']} "
+                f"gate_eligible={gate_result['gate_eligible']} "
+                f"queue_allowed={gate_result['queue_allowed']} "
+                f"reason={gate_result['reason']}"
+            )
+            
+            logger.info(
+                "QUEUE DECISION | "
+                f"path=future_det_gated_execution "
+                f"payload_format={normalized['payload_format']} "
+                f"signal_id={normalized['signal_id']} "
+                f"symbol={normalized['symbol']} "
+                f"side={normalized['side']} "
+                f"det_classification={classification_result['det_classification']} "
+                f"queued=false "
+                f"gate_reason={gate_result['reason']}"
+            )
+            return "enriched_candidate_modeled_for_det_gated_execution"
 
         if not normalized["execution_ready"]:
             logger.info(
@@ -1157,6 +1588,33 @@ class ScalpingBot:
                 f"missing_execution_field=entry_price"
             )
             return "candidate_logged_no_execution"
+
+        policy = self.evaluate_stage_execution_policy(normalized)
+        if not policy["allow_queue"]:
+            logger.info(
+                "QUEUE DECISION | "
+                f"path={policy['policy_branch']} "
+                f"payload_format={normalized['payload_format']} "
+                f"signal_id={normalized['signal_id']} "
+                f"symbol={normalized['symbol']} "
+                f"side={normalized['side']} "
+                f"stage={policy['stage']} "
+                f"queued=false "
+                f"reason={policy['reason']}"
+            )
+            return "execution_denied_by_stage_policy"
+
+        logger.info(
+            "QUEUE DECISION | "
+            f"path={policy['policy_branch']} "
+            f"payload_format={normalized['payload_format']} "
+            f"signal_id={normalized['signal_id']} "
+            f"symbol={normalized['symbol']} "
+            f"side={normalized['side']} "
+            f"stage={policy['stage']} "
+            f"queued=true "
+            f"reason={policy['reason']}"
+        )
 
         symbol = normalized["symbol"]
         side = normalized["side"]
@@ -1200,6 +1658,12 @@ class ScalpingBot:
         )
 
         self.execution_queue.put(job)
+        logger.info(
+            "QUEUE DECISION | "
+            f"path=legacy_execution "
+            f"payload_format={normalized['payload_format']} "
+            f"queued=true"
+        )
         return "queued"
 
     # ==========================================================
