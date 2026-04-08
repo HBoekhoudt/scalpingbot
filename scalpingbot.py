@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P049 | STAGE: TEST
+# IKBR SCALPING BOT | VERSION v1.6.0 P051 | STAGE: TEST
 # ==========================================================
 
 import logging
@@ -20,7 +20,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P049"
+BOT_PATCH = "P051"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -148,6 +148,18 @@ class ScalpingBot:
         price = decimal.Decimal(str(price))
         return float((price / tick).quantize(0) * tick)
 
+    def get_preferred_reference_price(self, normalized):
+        """Get the preferred analytical reference price from normalized signal.
+        Prefers entry_reference_price when available, then price, then entry_price.
+        """
+        ref = normalized.get("entry_reference_price")
+        if ref is not None:
+            return ref
+        ref = normalized.get("price")
+        if ref is not None:
+            return ref
+        return normalized.get("entry_price")
+
     def apply_spread(self, symbol, side, price):
         spread = SPREADS.get(symbol, 0)
 
@@ -214,9 +226,10 @@ class ScalpingBot:
     def derive_candidate_executable_entry(self, symbol, side, normalized):
         """Derive the planned executable entry candidate including spread adjustment.
         This is used for entry-band validation to make the check non-trivial.
+        Prefers entry_reference_price from Pine when available, otherwise falls back to price.
         """
-        # Start from Pine reference price
-        reference_price = normalized["price"]
+        # Prefer entry_reference_price from Pine (bot-side analytical reference)
+        reference_price = self.get_preferred_reference_price(normalized)
         if reference_price is None:
             return None
         
@@ -231,6 +244,7 @@ class ScalpingBot:
     def validate_entry_band(self, symbol, execution_grade, reference_price, candidate_entry):
         """Validate candidate entry is within allowed band from reference price.
         Both actual_drift and allowed_limit now use consistent price-distance units.
+        Uses preferred_reference_price logic: entry_reference_price > price.
         Returns (is_valid, actual_drift, allowed_limit).
         """
         if reference_price is None or candidate_entry is None:
@@ -246,17 +260,56 @@ class ScalpingBot:
 
         return (is_valid, actual_drift, allowed_limit)
 
-    def derive_det_stop_price(self, symbol, entry_price, side, execution_grade=None):
+    def derive_det_stop_price(self, symbol, entry_price, side, execution_grade=None, normalized_signal=None):
         """Derive stop price from final executable entry price.
-        Uses instrument-aware fallback stop distance.
-        This helper is ready for later structure-anchor integration.
-        """
-        stop_dist = self.get_fallback_stop_distance(symbol, execution_grade)
+        Optionally uses structure anchors from Pine when available.
+        Falls back to instrument-aware stop distance if anchors unavailable.
         
+        For long: prefers lowest valid anchor below entry from {structure_anchor_low, trigger_bar_low}
+        For short: prefers highest valid anchor above entry from {structure_anchor_high, trigger_bar_high}
+        """
+        fallback_stop_dist = self.get_fallback_stop_distance(symbol, execution_grade)
+        
+        # Try to use structure anchors if normalized_signal provided
+        if normalized_signal is not None:
+            if side == "long":
+                # For long, prefer the lowest valid downside anchor below entry
+                structure_anchor_low = normalized_signal.get("structure_anchor_low")
+                trigger_bar_low = normalized_signal.get("trigger_bar_low")
+                
+                candidates = []
+                if structure_anchor_low is not None and structure_anchor_low < entry_price:
+                    candidates.append(structure_anchor_low)
+                if trigger_bar_low is not None and trigger_bar_low < entry_price:
+                    candidates.append(trigger_bar_low)
+                
+                if candidates:
+                    anchor_stop = min(candidates)
+                    risk_dist = entry_price - anchor_stop
+                    if risk_dist > 0:
+                        return anchor_stop
+            elif side == "short":
+                # For short, prefer the highest valid upside anchor above entry
+                structure_anchor_high = normalized_signal.get("structure_anchor_high")
+                trigger_bar_high = normalized_signal.get("trigger_bar_high")
+                
+                candidates = []
+                if structure_anchor_high is not None and structure_anchor_high > entry_price:
+                    candidates.append(structure_anchor_high)
+                if trigger_bar_high is not None and trigger_bar_high > entry_price:
+                    candidates.append(trigger_bar_high)
+                
+                if candidates:
+                    anchor_stop = max(candidates)
+                    risk_dist = anchor_stop - entry_price
+                    if risk_dist > 0:
+                        return anchor_stop
+        
+        # Fallback to instrument-aware distance if no valid anchors
         if side == "long":
-            return entry_price - stop_dist
+            return entry_price - fallback_stop_dist
         else:
-            return entry_price + stop_dist
+            return entry_price + fallback_stop_dist
 
     def derive_target_from_r(self, entry_price, stop_price, side):
         """Derive target from entry and stop (2R target).
@@ -1053,6 +1106,11 @@ class ScalpingBot:
             "structure_valid",
             "setup_valid",
             "trigger_valid",
+            "entry_reference_price",
+            "trigger_bar_high",
+            "trigger_bar_low",
+            "structure_anchor_low",
+            "structure_anchor_high",
             "htf_trend_up",
             "htf_trend_down",
             "htf_vwap_up",
@@ -1150,12 +1208,17 @@ class ScalpingBot:
             "vwap_bias_valid": self._safe_bool(payload.get("vwap_bias_valid"), default=False),
             "body_strength_valid": self._safe_bool(payload.get("body_strength_valid"), default=False),
             "structure_valid": self._safe_bool(payload.get("structure_valid"), default=False),
-            "setup_valid": self._safe_bool(payload.get("setup_valid"), default=False),
-            "trigger_valid": self._safe_bool(payload.get("trigger_valid"), default=False),
+            "setup_valid": payload.get("setup_valid"),
+            "trigger_valid": payload.get("trigger_valid"),
             "execution_candidate_valid": self._safe_bool(payload.get("execution_candidate_valid"), default=False),
             "pine_pass_count": self._safe_int(payload.get("pine_pass_count"), default=None),
             "pine_fail_count": self._safe_int(payload.get("pine_fail_count"), default=None),
             "pine_detector_score": self._safe_int(payload.get("pine_detector_score"), default=None),
+            "entry_reference_price": self._safe_float(payload.get("entry_reference_price"), default=None),
+            "trigger_bar_high": self._safe_float(payload.get("trigger_bar_high"), default=None),
+            "trigger_bar_low": self._safe_float(payload.get("trigger_bar_low"), default=None),
+            "structure_anchor_low": self._safe_float(payload.get("structure_anchor_low"), default=None),
+            "structure_anchor_high": self._safe_float(payload.get("structure_anchor_high"), default=None),
             "reason_flags": self._normalize_reason_flags(payload.get("reason_flags")),
             "session_name": self._safe_str(payload.get("session_name"), default="unknown"),
             "minutes_from_open": self._safe_int(payload.get("minutes_from_open"), default=None),
@@ -1220,10 +1283,18 @@ class ScalpingBot:
             "side": normalized["side"],
             "entry_price": normalized["entry_price"],
             "price": normalized["price"],
+            "entry_reference_price": normalized["entry_reference_price"],
+            "trigger_bar_high": normalized["trigger_bar_high"],
+            "trigger_bar_low": normalized["trigger_bar_low"],
+            "structure_anchor_low": normalized["structure_anchor_low"],
+            "structure_anchor_high": normalized["structure_anchor_high"],
             "blocker": normalized["blocker"],
             "grade": normalized["grade"],
             "candidate_grade": normalized["candidate_grade"],
             "tv_score": normalized["tv_score"],
+            "body_strength_value": normalized["body_strength_value"],
+            "setup_valid": normalized["setup_valid"],
+            "trigger_valid": normalized["trigger_valid"],
             "session_name": normalized["session_name"],
             "bias_5m": normalized["bias_5m"],
             "reason_flags": normalized["reason_flags"],
@@ -1332,16 +1403,19 @@ class ScalpingBot:
             elif side == "short":
                 structure_valid = normalized["htf_structure_short"] and not normalized["htf_structure_long"]
 
-        setup_valid = normalized.get("setup_valid", False)
-        if not setup_valid:
+        # P050: Use Pine setup_valid directly as primary signal
+        setup_valid = normalized.get("setup_valid")
+        if setup_valid is None:
             # Fallback to old calculation
             if side == "long":
                 setup_valid = normalized["htf_setup_long"]
             elif side == "short":
                 setup_valid = normalized["htf_setup_short"]
+        # If Pine provided False, keep False; no override
 
-        trigger_valid = normalized.get("trigger_valid", False)
-        if not trigger_valid:
+        # P050: Use Pine trigger_valid directly as primary signal
+        trigger_valid = normalized.get("trigger_valid")
+        if trigger_valid is None:
             # Fallback to old trigger logic
             trigger_valid = (
                 normalized["reacceleration_1m_ok"]
@@ -1354,6 +1428,7 @@ class ScalpingBot:
             )
             if normalized["event"] == "blocked_snapshot":
                 trigger_valid = False
+        # If Pine provided False, keep False; no override
 
         conflicting_context = False
         if side == "long":
@@ -1410,7 +1485,11 @@ class ScalpingBot:
             if distance_from_vwap_atr >= 2.0 and "late" not in hard_blockers:
                 hard_blockers.append("late_extension_proxy")
 
-        body_strength_value = normalized.get("body_strength_value", normalized.get("body_strength"))
+        # P050: Use Pine body_strength_value directly when available
+        body_strength_value = normalized.get("body_strength_value")
+        if body_strength_value is None:
+            body_strength_value = normalized.get("body_strength")
+        
         body_strength_valid = normalized.get("body_strength_valid", None)
         if body_strength_valid is not None:
             if not body_strength_valid:
@@ -1976,12 +2055,13 @@ class ScalpingBot:
 
     def build_det_execution_job(self, normalized, classification_result):
         """Build execution job with DET planning details.
+        P050: Includes new enriched fields for structure-aware stop derivation.
         P049: Moved stop/target derivation to place_bracket_order() after final executable entry.
         This job now carries planning info only; final R is computed at execution time.
         """
         entry = self.derive_entry_price_from_candidate(normalized)
         execution_grade = classification_result["execution_grade"]
-        reference_price = normalized["price"]  # Pine's reference price
+        reference_price = self.get_preferred_reference_price(normalized)
         symbol = normalized["symbol"]
         side = normalized["side"]
 
@@ -2007,7 +2087,7 @@ class ScalpingBot:
 
     def derive_entry_price_from_candidate(self, normalized):
         if normalized["payload_format"] == "enriched_candidate":
-            price_ref = normalized["price"]
+            price_ref = self.get_preferred_reference_price(normalized)
             if price_ref is None:
                 return None
             if normalized["symbol"]:
@@ -2100,7 +2180,7 @@ class ScalpingBot:
             side = normalized["side"]
             entry = entry_for_job
             execution_grade = classification_result["execution_grade"]
-            reference_price = normalized["price"]
+            reference_price = self.get_preferred_reference_price(normalized)
 
             # P049: Derive candidate executable entry WITH spread for non-trivial band validation
             candidate_executable_entry = self.derive_candidate_executable_entry(
@@ -2337,9 +2417,11 @@ class ScalpingBot:
 
         contract = self.get_contract(symbol)
 
-        # P049: Derive stop from FINAL executable entry (after spread/rounding)
+        # P050: Derive stop from FINAL executable entry (after spread/rounding)
+        # Optionally uses structure anchors from normalized_signal for enriched stop derivation
         execution_grade = job.get("grade", "A")
-        stop = self.derive_det_stop_price(symbol, entry, side, execution_grade)
+        normalized_signal = job.get("normalized_signal")
+        stop = self.derive_det_stop_price(symbol, entry, side, execution_grade, normalized_signal)
         stop = self.round_to_tick(symbol, stop)
 
         # P049: Derive 2R target from final entry and stop
@@ -2361,6 +2443,11 @@ class ScalpingBot:
             f"grade={job.get('grade', '')} "
             f"det_classification={job.get('det_classification', '')} "
             f"reference_price={job.get('reference_price', 'N/A')} "
+            f"entry_reference_price={job.get('normalized_signal', {}).get('entry_reference_price', 'N/A')} "
+            f"trigger_bar_high={job.get('normalized_signal', {}).get('trigger_bar_high', 'N/A')} "
+            f"trigger_bar_low={job.get('normalized_signal', {}).get('trigger_bar_low', 'N/A')} "
+            f"structure_anchor_low={job.get('normalized_signal', {}).get('structure_anchor_low', 'N/A')} "
+            f"structure_anchor_high={job.get('normalized_signal', {}).get('structure_anchor_high', 'N/A')} "
             f"final_entry={entry} "
             f"final_stop={stop} "
             f"final_target={target} "
