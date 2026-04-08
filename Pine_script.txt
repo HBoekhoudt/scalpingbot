@@ -1,5 +1,5 @@
 //@version=6
-indicator("DET A / A+ Classifier v6", shorttitle="DET A/A+", overlay=true, max_labels_count=500)
+indicator("DET_Enriched_Data_submitter", shorttitle="DET EDS v10", overlay=true, max_labels_count=500)
 
 // ==========================================================
 // DET A / A+ CLASSIFIER
@@ -66,6 +66,111 @@ f_round(float x) =>
 f_label(bool _cond, float _y, string _txt, _style, color _color, color _txtColor) =>
     if _cond and showLabels
         label.new(bar_index, _y, _txt, style=_style, color=_color, textcolor=_txtColor, size=size.small)
+
+f_append_reason(string current, bool failed, string reason) =>
+    failed ? (str.length(current) > 0 ? current + "|" + reason : reason) : current
+
+f_primary_reason(string reasonsPipe) =>
+    if str.length(reasonsPipe) == 0
+        ""
+    else
+        reasons = str.split(reasonsPipe, "|")
+        array.size(reasons) > 0 ? array.get(reasons, 0) : ""
+
+f_reason_count(string reasonsPipe) =>
+    if str.length(reasonsPipe) == 0
+        0
+    else
+        reasons = str.split(reasonsPipe, "|")
+        array.size(reasons)
+
+f_reason_pipe_to_json_array(string reasonsPipe) =>
+    if str.length(reasonsPipe) == 0
+        "[]"
+    else
+        reasons = str.split(reasonsPipe, "|")
+        result = "["
+        for i = 0 to array.size(reasons) - 1
+            result += (i > 0 ? "," : "") + '"' + array.get(reasons, i) + '"'
+        result + "]"
+
+f_grade_from_state(string detectorState, bool plusFire, bool baseFire) =>
+    detectorState == "execution_candidate" ? (plusFire ? "A+" : baseFire ? "A" : "unknown") : detectorState == "borderline_candidate" ? "borderline" : detectorState == "blocked_candidate" ? "blocked" : "unknown"
+
+f_common_json() =>
+    '{"schema_version":"v7","secret":"FDAX_bot_secure_2026","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","bar_time_unix_ms":' + str.tostring(time) + ''
+
+f_build_payload(
+    string detectorState,
+    string side,
+    string blocker,
+    string blockerReasonsPipe,
+    float bodyStrengthValue,
+    float bodyStrengthThresholdValue,
+    float distanceValue,
+    float distanceThresholdValue,
+    float emaSpreadValue,
+    float emaSpreadThresholdValue,
+    bool notChoppyFlag,
+    bool lateFilterFlag,
+    bool movedAwayFlag,
+    bool structureFlag,
+    bool setupFlag,
+    bool triggerFlag,
+    bool sessionValid,
+    bool vwapBiasValid,
+    bool bodyStrengthValid,
+    bool executionCandidateValid,
+    float entryReferencePrice,
+    float triggerBarHigh,
+    float triggerBarLow,
+    float structureAnchorLow,
+    float structureAnchorHigh,
+    int pinePassCount,
+    int pineFailCount,
+    int pineDetectorScore,
+    string candidateGrade
+) =>
+    primaryBlocker = f_primary_reason(blockerReasonsPipe)
+    blockerCount = f_reason_count(blockerReasonsPipe)
+    blockerReasonsJson = f_reason_pipe_to_json_array(blockerReasonsPipe)
+    f_common_json() +
+         ',"mode":"candidate"' +
+         ',"event":"feature_snapshot"' +
+         ',"side":"' + side + '"' +
+         ',"candidate_side":"' + side + '"' +
+         ',"entry_reference_price":' + str.tostring(entryReferencePrice) +
+         ',"trigger_bar_high":' + str.tostring(triggerBarHigh) +
+         ',"trigger_bar_low":' + str.tostring(triggerBarLow) +
+         ',"structure_anchor_low":' + str.tostring(structureAnchorLow) +
+         ',"structure_anchor_high":' + str.tostring(structureAnchorHigh) +
+         ',"price":' + str.tostring(close) +
+         ',"blocker":"' + blocker + '"' +
+         ',"blocker_reasons":' + blockerReasonsJson +
+         ',"primary_blocker":"' + primaryBlocker + '"' +
+         ',"blocker_count":' + str.tostring(blockerCount) +
+         ',"body_strength_value":' + str.tostring(bodyStrengthValue) +
+         ',"body_strength_threshold":' + str.tostring(bodyStrengthThresholdValue) +
+         ',"distance_from_vwap_atr_value":' + str.tostring(distanceValue) +
+         ',"distance_from_vwap_atr_threshold":' + str.tostring(distanceThresholdValue) +
+         ',"ema_spread_atr_value":' + str.tostring(emaSpreadValue) +
+         ',"ema_spread_atr_threshold":' + str.tostring(emaSpreadThresholdValue) +
+         ',"not_choppy_flag":' + str.tostring(notChoppyFlag) +
+         ',"late_filter_flag":' + str.tostring(lateFilterFlag) +
+         ',"moved_away_flag":' + str.tostring(movedAwayFlag) +
+         ',"structure_flag":' + str.tostring(structureFlag) +
+         ',"setup_flag":' + str.tostring(setupFlag) +
+         ',"trigger_flag":' + str.tostring(triggerFlag) +
+         ',"session_valid":' + str.tostring(sessionValid) +
+         ',"vwap_bias_valid":' + str.tostring(vwapBiasValid) +
+         ',"body_strength_valid":' + str.tostring(bodyStrengthValid) +
+         ',"structure_valid":' + str.tostring(structureFlag) +
+         ',"setup_valid":' + str.tostring(setupFlag) +
+         ',"trigger_valid":' + str.tostring(triggerFlag) +
+         ',"pine_pass_count":' + str.tostring(pinePassCount) +
+         ',"pine_fail_count":' + str.tostring(pineFailCount) +
+         ',"pine_detector_score":' + str.tostring(pineDetectorScore) +
+         ',"candidate_grade":"' + candidateGrade + '"}'
 
 // ----------------------
 // Base series (1m execution layer)
@@ -293,6 +398,9 @@ var int armedStartBarIndex = na
 var int armedHtfTime = na
 var bool armedFired = false
 var bool armedPlusCandidate = false
+var bool borderlineAlerted = false
+var bool setupCandidateAlertedLong = false
+var bool setupCandidateAlertedShort = false
 
 newHtfBar = ta.change(htfTime) != 0
 
@@ -319,6 +427,9 @@ if armedActive and (armedExpired or armedInvalidLong or armedInvalidShort)
     armedHtfTime := na
     armedFired := false
     armedPlusCandidate := false
+    borderlineAlerted := false
+    setupCandidateAlertedLong := false
+    setupCandidateAlertedShort := false
 
 if newHtfBar
     if not armedActive
@@ -329,6 +440,8 @@ if newHtfBar
             armedHtfTime := int(htfTime)
             armedFired := false
             armedPlusCandidate := htfPlusCandidateLong
+            borderlineAlerted := false
+            setupCandidateAlertedLong := false
         else if htfSetupShort and not htfSetupLong
             armedActive := true
             armedDir := -1
@@ -336,6 +449,8 @@ if newHtfBar
             armedHtfTime := int(htfTime)
             armedFired := false
             armedPlusCandidate := htfPlusCandidateShort
+            borderlineAlerted := false
+            setupCandidateAlertedShort := false
     else
         if armedDir == 1 and htfSetupShort
             armedActive := true
@@ -344,6 +459,8 @@ if newHtfBar
             armedHtfTime := int(htfTime)
             armedFired := false
             armedPlusCandidate := htfPlusCandidateShort
+            borderlineAlerted := false
+            setupCandidateAlertedShort := false
         else if armedDir == -1 and htfSetupLong
             armedActive := true
             armedDir := 1
@@ -351,6 +468,8 @@ if newHtfBar
             armedHtfTime := int(htfTime)
             armedFired := false
             armedPlusCandidate := htfPlusCandidateLong
+            borderlineAlerted := false
+            setupCandidateAlertedLong := false
 
 // ----------------------
 // 1m confirmation layer
@@ -412,6 +531,419 @@ isShort = finalClass < 0
 classAbs = math.abs(finalClass)
 
 // ----------------------
+// Derived detector observability states
+// ----------------------
+longSessionValid = sessionOk
+shortSessionValid = sessionOk
+
+longVwapBiasValid = htfVwapUp and htfVwapNotFlat
+shortVwapBiasValid = htfVwapDown and htfVwapNotFlat
+
+longNotChoppyValid = htfNotChoppy
+shortNotChoppyValid = htfNotChoppy
+
+longLateValid = htfNotLateLong
+shortLateValid = htfNotLateShort
+
+longMovedAwayValid = htfMovedAwayFromVWAPLong
+shortMovedAwayValid = htfMovedAwayFromVWAPShort
+
+longStructureValid = htfStructureLong
+shortStructureValid = htfStructureShort
+
+longSetupValid = htfSetupLong
+shortSetupValid = htfSetupShort
+
+longTriggerValid = longTriggerBase
+shortTriggerValid = shortTriggerBase
+
+longBodyStrengthValid = bodyStrength >= bodyStrengthThreshold
+shortBodyStrengthValid = bodyStrength >= bodyStrengthThreshold
+
+longPlusQualityValid = armedPlusCandidate and plusLongScore >= 3 and bodyStrength >= 0.70
+shortPlusQualityValid = armedPlusCandidate and plusShortScore >= 3 and bodyStrength >= 0.70
+
+longExecutionCandidateValid = aLongFire or aPlusLongFire
+shortExecutionCandidateValid = aShortFire or aPlusShortFire
+
+blockedLong = newHtfBar and enableLongs and htfContextLong and not htfSetupLong and not htfSetupShort
+blockedShort = newHtfBar and enableShorts and htfContextShort and not htfSetupShort and not htfSetupLong
+blockedEvent = blockedLong or blockedShort
+
+borderlineLong = armedActive and armedDir == 1 and not armedFired and not longTriggerBase
+borderlineShort = armedActive and armedDir == -1 and not armedFired and not shortTriggerBase
+borderlineEvent = (borderlineLong or borderlineShort) and not blockedEvent and not (aLongFire or aPlusLongFire or aShortFire or aPlusShortFire)
+
+setupCandidateLong = newHtfBar and enableLongs and htfSetupLong and not htfSetupShort and not setupCandidateAlertedLong
+setupCandidateShort = newHtfBar and enableShorts and htfSetupShort and not htfSetupLong and not setupCandidateAlertedShort
+
+// ----------------------
+// Derived reasons and scores
+// ----------------------
+executionLongReasons = ""
+executionLongReasons := f_append_reason(executionLongReasons, not longSessionValid, "session_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longVwapBiasValid, "vwap_bias_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longNotChoppyValid, "chop_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longLateValid, "late_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longMovedAwayValid, "moved_away_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longStructureValid, "structure_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longSetupValid, "setup_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longBodyStrengthValid, "body_strength_failed")
+executionLongReasons := f_append_reason(executionLongReasons, not longTriggerValid, "trigger_missing")
+executionLongReasons := f_append_reason(executionLongReasons, aPlusLongFire and not longPlusQualityValid, "plus_quality_failed")
+
+executionShortReasons = ""
+executionShortReasons := f_append_reason(executionShortReasons, not shortSessionValid, "session_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortVwapBiasValid, "vwap_bias_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortNotChoppyValid, "chop_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortLateValid, "late_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortMovedAwayValid, "moved_away_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortStructureValid, "structure_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortSetupValid, "setup_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortBodyStrengthValid, "body_strength_failed")
+executionShortReasons := f_append_reason(executionShortReasons, not shortTriggerValid, "trigger_missing")
+executionShortReasons := f_append_reason(executionShortReasons, aPlusShortFire and not shortPlusQualityValid, "plus_quality_failed")
+
+blockedLongReasons = ""
+blockedLongReasons := f_append_reason(blockedLongReasons, not longSessionValid, "session_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longVwapBiasValid, "vwap_bias_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longNotChoppyValid, "chop_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longLateValid, "late_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longMovedAwayValid, "moved_away_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longStructureValid, "structure_failed")
+blockedLongReasons := f_append_reason(blockedLongReasons, not longSetupValid, "setup_failed")
+
+blockedShortReasons = ""
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortSessionValid, "session_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortVwapBiasValid, "vwap_bias_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortNotChoppyValid, "chop_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortLateValid, "late_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortMovedAwayValid, "moved_away_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortStructureValid, "structure_failed")
+blockedShortReasons := f_append_reason(blockedShortReasons, not shortSetupValid, "setup_failed")
+
+borderlineLongReasons = ""
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longSessionValid, "session_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longVwapBiasValid, "vwap_bias_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longNotChoppyValid, "chop_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longLateValid, "late_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longMovedAwayValid, "moved_away_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longStructureValid, "structure_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longSetupValid, "setup_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longBodyStrengthValid, "body_strength_failed")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, not longTriggerValid, "trigger_missing")
+borderlineLongReasons := f_append_reason(borderlineLongReasons, armedPlusCandidate and not longPlusQualityValid, "plus_quality_failed")
+
+borderlineShortReasons = ""
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortSessionValid, "session_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortVwapBiasValid, "vwap_bias_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortNotChoppyValid, "chop_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortLateValid, "late_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortMovedAwayValid, "moved_away_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortStructureValid, "structure_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortSetupValid, "setup_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortBodyStrengthValid, "body_strength_failed")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, not shortTriggerValid, "trigger_missing")
+borderlineShortReasons := f_append_reason(borderlineShortReasons, armedPlusCandidate and not shortPlusQualityValid, "plus_quality_failed")
+
+executionLongPassCount = f_bool_to_int(longSessionValid) + f_bool_to_int(longVwapBiasValid) + f_bool_to_int(longNotChoppyValid) + f_bool_to_int(longLateValid) + f_bool_to_int(longMovedAwayValid) + f_bool_to_int(longStructureValid) + f_bool_to_int(longSetupValid) + f_bool_to_int(longBodyStrengthValid) + f_bool_to_int(longTriggerValid)
+executionShortPassCount = f_bool_to_int(shortSessionValid) + f_bool_to_int(shortVwapBiasValid) + f_bool_to_int(shortNotChoppyValid) + f_bool_to_int(shortLateValid) + f_bool_to_int(shortMovedAwayValid) + f_bool_to_int(shortStructureValid) + f_bool_to_int(shortSetupValid) + f_bool_to_int(shortBodyStrengthValid) + f_bool_to_int(shortTriggerValid)
+
+blockedLongPassCount = f_bool_to_int(longSessionValid) + f_bool_to_int(longVwapBiasValid) + f_bool_to_int(longNotChoppyValid) + f_bool_to_int(longLateValid) + f_bool_to_int(longMovedAwayValid) + f_bool_to_int(longStructureValid) + f_bool_to_int(longSetupValid)
+blockedShortPassCount = f_bool_to_int(shortSessionValid) + f_bool_to_int(shortVwapBiasValid) + f_bool_to_int(shortNotChoppyValid) + f_bool_to_int(shortLateValid) + f_bool_to_int(shortMovedAwayValid) + f_bool_to_int(shortStructureValid) + f_bool_to_int(shortSetupValid)
+
+borderlineLongPassCount = f_bool_to_int(longSessionValid) + f_bool_to_int(longVwapBiasValid) + f_bool_to_int(longNotChoppyValid) + f_bool_to_int(longLateValid) + f_bool_to_int(longMovedAwayValid) + f_bool_to_int(longStructureValid) + f_bool_to_int(longSetupValid) + f_bool_to_int(longBodyStrengthValid) + f_bool_to_int(longTriggerValid)
+borderlineShortPassCount = f_bool_to_int(shortSessionValid) + f_bool_to_int(shortVwapBiasValid) + f_bool_to_int(shortNotChoppyValid) + f_bool_to_int(shortLateValid) + f_bool_to_int(shortMovedAwayValid) + f_bool_to_int(shortStructureValid) + f_bool_to_int(shortSetupValid) + f_bool_to_int(shortBodyStrengthValid) + f_bool_to_int(shortTriggerValid)
+
+executionLongFailCount = 9 - executionLongPassCount
+executionShortFailCount = 9 - executionShortPassCount
+blockedLongFailCount = 7 - blockedLongPassCount
+blockedShortFailCount = 7 - blockedShortPassCount
+borderlineLongFailCount = 9 - borderlineLongPassCount
+borderlineShortFailCount = 9 - borderlineShortPassCount
+
+executionLongScore = executionLongPassCount
+executionShortScore = executionShortPassCount
+blockedLongScore = blockedLongPassCount
+blockedShortScore = blockedShortPassCount
+borderlineLongScore = borderlineLongPassCount
+borderlineShortScore = borderlineShortPassCount
+
+executionLongBlocker = f_primary_reason(executionLongReasons)
+executionShortBlocker = f_primary_reason(executionShortReasons)
+blockedLongBlocker = f_primary_reason(blockedLongReasons)
+blockedShortBlocker = f_primary_reason(blockedShortReasons)
+borderlineLongBlocker = f_primary_reason(borderlineLongReasons)
+borderlineShortBlocker = f_primary_reason(borderlineShortReasons)
+
+triggerBarHigh = high
+triggerBarLow = low
+structureAnchorLow = math.min(math.min(low, low[1]), low[2])
+structureAnchorHigh = math.max(math.max(high, high[1]), high[2])
+entryReferencePriceLong = high
+entryReferencePriceShort = low
+entryReferencePriceDefault = close
+
+// ----------------------
+// JSON payloads for observability
+// ----------------------
+executionLongJson = f_build_payload(
+    "execution_candidate",
+    "long",
+    executionLongBlocker,
+    executionLongReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateLong,
+    movedAwayFromVWAPLong,
+    htfStructureLong,
+    htfSetupLong,
+    longTriggerBase,
+    sessionOk,
+    longVwapBiasValid,
+    longBodyStrengthValid,
+    longExecutionCandidateValid,
+    entryReferencePriceLong,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    executionLongPassCount,
+    executionLongFailCount,
+    executionLongScore,
+    f_grade_from_state("execution_candidate", aPlusLongFire, aLongFire)
+)
+
+executionShortJson = f_build_payload(
+    "execution_candidate",
+    "short",
+    executionShortBlocker,
+    executionShortReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateShort,
+    movedAwayFromVWAPShort,
+    htfStructureShort,
+    htfSetupShort,
+    shortTriggerBase,
+    sessionOk,
+    shortVwapBiasValid,
+    shortBodyStrengthValid,
+    shortExecutionCandidateValid,
+    entryReferencePriceShort,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    executionShortPassCount,
+    executionShortFailCount,
+    executionShortScore,
+    f_grade_from_state("execution_candidate", aPlusShortFire, aShortFire)
+)
+
+blockedLongJson = f_build_payload(
+    "blocked_candidate",
+    "long",
+    blockedLongBlocker,
+    blockedLongReasons,
+    htfBodyStrength,
+    0.60,
+    htfDistanceFromVWAPAtr,
+    lateEntryATRMult,
+    htfEmaSpreadAtr,
+    chopThreshold,
+    htfNotChoppy,
+    htfNotLateLong,
+    htfMovedAwayFromVWAPLong,
+    htfStructureLong,
+    htfSetupLong,
+    false,
+    sessionOk,
+    longVwapBiasValid,
+    htfBodyStrength >= 0.60,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    blockedLongPassCount,
+    blockedLongFailCount,
+    blockedLongScore,
+    f_grade_from_state("blocked_candidate", false, false)
+)
+
+blockedShortJson = f_build_payload(
+    "blocked_candidate",
+    "short",
+    blockedShortBlocker,
+    blockedShortReasons,
+    htfBodyStrength,
+    0.60,
+    htfDistanceFromVWAPAtr,
+    lateEntryATRMult,
+    htfEmaSpreadAtr,
+    chopThreshold,
+    htfNotChoppy,
+    htfNotLateShort,
+    htfMovedAwayFromVWAPShort,
+    htfStructureShort,
+    htfSetupShort,
+    false,
+    sessionOk,
+    shortVwapBiasValid,
+    htfBodyStrength >= 0.60,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    blockedShortPassCount,
+    blockedShortFailCount,
+    blockedShortScore,
+    f_grade_from_state("blocked_candidate", false, false)
+)
+
+borderlineLongJson = f_build_payload(
+    "borderline_candidate",
+    "long",
+    borderlineLongBlocker,
+    borderlineLongReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateLong,
+    movedAwayFromVWAPLong,
+    htfStructureLong,
+    htfSetupLong,
+    longTriggerBase,
+    sessionOk,
+    longVwapBiasValid,
+    longBodyStrengthValid,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    borderlineLongPassCount,
+    borderlineLongFailCount,
+    borderlineLongScore,
+    f_grade_from_state("borderline_candidate", false, false)
+)
+
+borderlineShortJson = f_build_payload(
+    "borderline_candidate",
+    "short",
+    borderlineShortBlocker,
+    borderlineShortReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateShort,
+    movedAwayFromVWAPShort,
+    htfStructureShort,
+    htfSetupShort,
+    shortTriggerBase,
+    sessionOk,
+    shortVwapBiasValid,
+    shortBodyStrengthValid,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    borderlineShortPassCount,
+    borderlineShortFailCount,
+    borderlineShortScore,
+    f_grade_from_state("borderline_candidate", false, false)
+)
+
+setupCandidateLongJson = f_build_payload(
+    "setup_candidate",
+    "long",
+    executionLongBlocker,
+    executionLongReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateLong,
+    movedAwayFromVWAPLong,
+    htfStructureLong,
+    htfSetupLong,
+    longTriggerBase,
+    sessionOk,
+    longVwapBiasValid,
+    longBodyStrengthValid,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    executionLongPassCount,
+    executionLongFailCount,
+    executionLongScore,
+    f_grade_from_state("setup_candidate", false, false)
+)
+
+setupCandidateShortJson = f_build_payload(
+    "setup_candidate",
+    "short",
+    executionShortBlocker,
+    executionShortReasons,
+    bodyStrength,
+    bodyStrengthThreshold,
+    distanceFromVWAPAtr,
+    lateEntryATRMult,
+    emaSpreadAtr,
+    chopThreshold,
+    notChoppy,
+    notLateShort,
+    movedAwayFromVWAPShort,
+    htfStructureShort,
+    htfSetupShort,
+    shortTriggerBase,
+    sessionOk,
+    shortVwapBiasValid,
+    shortBodyStrengthValid,
+    false,
+    entryReferencePriceDefault,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    executionShortPassCount,
+    executionShortFailCount,
+    executionShortScore,
+    f_grade_from_state("setup_candidate", false, false)
+)
+
+// ----------------------
 // Visuals
 // ----------------------
 plot(plotVWAP ? vwap : na, "VWAP", color=color.orange, linewidth=2)
@@ -445,11 +977,39 @@ alertcondition(aLongFire, title="DET A Long", message="DET A Long")
 alertcondition(aPlusLongFire, title="DET A+ Long", message="DET A+ Long")
 alertcondition(aShortFire, title="DET A Short", message="DET A Short")
 alertcondition(aPlusShortFire, title="DET A+ Short", message="DET A+ Short")
+alertcondition(blockedEvent, title="Blocked Candidate", message="Blocked Candidate")
+alertcondition(borderlineEvent, title="Borderline Candidate", message="Borderline Candidate")
+
+if barstate.isconfirmed
+    if aPlusLongFire
+        alert(executionLongJson, alert.freq_once_per_bar_close)
+    else if aLongFire
+        alert(executionLongJson, alert.freq_once_per_bar_close)
+    else if aPlusShortFire
+        alert(executionShortJson, alert.freq_once_per_bar_close)
+    else if aShortFire
+        alert(executionShortJson, alert.freq_once_per_bar_close)
+    else if setupCandidateLong
+        setupCandidateAlertedLong := true
+        alert(setupCandidateLongJson, alert.freq_once_per_bar_close)
+    else if setupCandidateShort
+        setupCandidateAlertedShort := true
+        alert(setupCandidateShortJson, alert.freq_once_per_bar_close)
+    else if blockedLong
+        alert(blockedLongJson, alert.freq_once_per_bar_close)
+    else if blockedShort
+        alert(blockedShortJson, alert.freq_once_per_bar_close)
+    else if borderlineLong and not borderlineAlerted
+        alert(borderlineLongJson, alert.freq_once_per_bar_close)
+        borderlineAlerted := true
+    else if borderlineShort and not borderlineAlerted
+        alert(borderlineShortJson, alert.freq_once_per_bar_close)
+        borderlineAlerted := true
 
 // ----------------------
 // Debug table
 // ----------------------
-var table t = table.new(position.top_right, 2, 32, border_width=1)
+var table t = table.new(position.top_right, 2, 36, border_width=1)
 
 if barstate.islast and showDebugTable
     table.cell(t, 0, 0, "Metric", text_color=color.white, bgcolor=color.black)
@@ -458,6 +1018,12 @@ if barstate.islast and showDebugTable
     sideTxt = finalClass > 0 ? (classAbs == 3 ? "A+ LONG" : "A LONG") : finalClass < 0 ? (classAbs == 3 ? "A+ SHORT" : "A SHORT") : "NO FIRE"
     armedTxt = armedActive ? (armedDir == 1 ? "ARMED LONG" : armedDir == -1 ? "ARMED SHORT" : "ARMED") : "IDLE"
     htfTxt = htfSetupLong ? "5m LONG SETUP" : htfSetupShort ? "5m SHORT SETUP" : htfContextLong ? "5m LONG CTX" : htfContextShort ? "5m SHORT CTX" : "NO 5m EDGE"
+    currentObsState = aLongFire or aPlusLongFire or aShortFire or aPlusShortFire ? "execution_candidate" : blockedEvent ? "blocked_candidate" : borderlineEvent ? "borderline_candidate" : "idle"
+    currentObsSide = aLongFire or aPlusLongFire ? "long" : aShortFire or aPlusShortFire ? "short" : blockedLong ? "long" : blockedShort ? "short" : borderlineLong ? "long" : borderlineShort ? "short" : "unknown"
+
+    currentPassCount = aLongFire or aPlusLongFire ? executionLongPassCount : aShortFire or aPlusShortFire ? executionShortPassCount : blockedLong ? blockedLongPassCount : blockedShort ? blockedShortPassCount : borderlineLong ? borderlineLongPassCount : borderlineShort ? borderlineShortPassCount : 0
+    currentFailCount = aLongFire or aPlusLongFire ? executionLongFailCount : aShortFire or aPlusShortFire ? executionShortFailCount : blockedLong ? blockedLongFailCount : blockedShort ? blockedShortFailCount : borderlineLong ? borderlineLongFailCount : borderlineShort ? borderlineShortFailCount : 0
+    currentPrimaryBlocker = aLongFire or aPlusLongFire ? executionLongBlocker : aShortFire or aPlusShortFire ? executionShortBlocker : blockedLong ? blockedLongBlocker : blockedShort ? blockedShortBlocker : borderlineLong ? borderlineLongBlocker : borderlineShort ? borderlineShortBlocker : ""
 
     table.cell(t, 0, 1, "Class")
     table.cell(t, 1, 1, sideTxt)
@@ -468,86 +1034,98 @@ if barstate.islast and showDebugTable
     table.cell(t, 0, 3, "5m state")
     table.cell(t, 1, 3, htfTxt)
 
-    table.cell(t, 0, 4, "5m plus candidate")
-    table.cell(t, 1, 4, str.tostring(armedPlusCandidate))
+    table.cell(t, 0, 4, "Detector state")
+    table.cell(t, 1, 4, currentObsState)
 
-    table.cell(t, 0, 5, "1m timeframe ok")
-    table.cell(t, 1, 5, str.tostring(executionTimeframeOk))
+    table.cell(t, 0, 5, "Detector side")
+    table.cell(t, 1, 5, currentObsSide)
 
-    table.cell(t, 0, 6, "5m VWAP slope")
-    table.cell(t, 1, 6, str.tostring(f_round(htfVwapSlope)))
+    table.cell(t, 0, 6, "Primary blocker")
+    table.cell(t, 1, 6, str.length(currentPrimaryBlocker) > 0 ? currentPrimaryBlocker : "none")
 
-    table.cell(t, 0, 7, "5m EMA spread / ATR")
-    table.cell(t, 1, 7, str.tostring(f_round(htfEmaSpreadAtr)))
+    table.cell(t, 0, 7, "Pass count")
+    table.cell(t, 1, 7, str.tostring(currentPassCount))
 
-    table.cell(t, 0, 8, "1m Dist from VWAP / ATR")
-    table.cell(t, 1, 8, str.tostring(f_round(distanceFromVWAPAtr)))
+    table.cell(t, 0, 8, "Fail count")
+    table.cell(t, 1, 8, str.tostring(currentFailCount))
 
-    table.cell(t, 0, 9, "1m body strength")
-    table.cell(t, 1, 9, str.tostring(f_round(bodyStrength)))
+    table.cell(t, 0, 9, "5m plus candidate")
+    table.cell(t, 1, 9, str.tostring(armedPlusCandidate))
 
-    table.cell(t, 0, 10, "1m S1 score")
-    table.cell(t, 1, 10, isLong ? str.tostring(s1LongScore) : isShort ? str.tostring(s1ShortScore) : str.tostring(math.max(s1LongScore, s1ShortScore)))
+    table.cell(t, 0, 10, "1m timeframe ok")
+    table.cell(t, 1, 10, str.tostring(executionTimeframeOk))
 
-    table.cell(t, 0, 11, "1m Plus score")
-    table.cell(t, 1, 11, isLong ? str.tostring(plusLongScore) : isShort ? str.tostring(plusShortScore) : str.tostring(math.max(plusLongScore, plusShortScore)))
+    table.cell(t, 0, 11, "5m VWAP slope")
+    table.cell(t, 1, 11, str.tostring(f_round(htfVwapSlope)))
 
-    table.cell(t, 0, 12, "RR proxy")
-    table.cell(t, 1, 12, str.tostring(f_round(rr)))
+    table.cell(t, 0, 12, "5m EMA spread / ATR")
+    table.cell(t, 1, 12, str.tostring(f_round(htfEmaSpreadAtr)))
 
-    table.cell(t, 0, 13, "Armed age bars")
-    table.cell(t, 1, 13, armedActive and not na(armedStartBarIndex) ? str.tostring(bar_index - armedStartBarIndex) : "-")
+    table.cell(t, 0, 13, "1m Dist from VWAP / ATR")
+    table.cell(t, 1, 13, str.tostring(f_round(distanceFromVWAPAtr)))
 
-    table.cell(t, 0, 14, "5m trend up")
-    table.cell(t, 1, 14, str.tostring(htfTrendUp))
+    table.cell(t, 0, 14, "1m body strength")
+    table.cell(t, 1, 14, str.tostring(f_round(bodyStrength)))
 
-    table.cell(t, 0, 15, "5m trend down")
-    table.cell(t, 1, 15, str.tostring(htfTrendDown))
+    table.cell(t, 0, 15, "1m S1 score")
+    table.cell(t, 1, 15, isLong ? str.tostring(s1LongScore) : isShort ? str.tostring(s1ShortScore) : str.tostring(math.max(s1LongScore, s1ShortScore)))
 
-    table.cell(t, 0, 16, "5m vwap up")
-    table.cell(t, 1, 16, str.tostring(htfVwapUp))
+    table.cell(t, 0, 16, "1m Plus score")
+    table.cell(t, 1, 16, isLong ? str.tostring(plusLongScore) : isShort ? str.tostring(plusShortScore) : str.tostring(math.max(plusLongScore, plusShortScore)))
 
-    table.cell(t, 0, 17, "5m vwap down")
-    table.cell(t, 1, 17, str.tostring(htfVwapDown))
+    table.cell(t, 0, 17, "RR proxy")
+    table.cell(t, 1, 17, str.tostring(f_round(rr)))
 
-    table.cell(t, 0, 18, "5m vwap not flat")
-    table.cell(t, 1, 18, str.tostring(htfVwapNotFlat))
+    table.cell(t, 0, 18, "Armed age bars")
+    table.cell(t, 1, 18, armedActive and not na(armedStartBarIndex) ? str.tostring(bar_index - armedStartBarIndex) : "-")
 
-    table.cell(t, 0, 19, "5m not choppy")
-    table.cell(t, 1, 19, str.tostring(htfNotChoppy))
+    table.cell(t, 0, 19, "5m trend up")
+    table.cell(t, 1, 19, str.tostring(htfTrendUp))
 
-    table.cell(t, 0, 20, "5m not late long")
-    table.cell(t, 1, 20, str.tostring(htfNotLateLong))
+    table.cell(t, 0, 20, "5m trend down")
+    table.cell(t, 1, 20, str.tostring(htfTrendDown))
 
-    table.cell(t, 0, 21, "5m not late short")
-    table.cell(t, 1, 21, str.tostring(htfNotLateShort))
+    table.cell(t, 0, 21, "5m vwap up")
+    table.cell(t, 1, 21, str.tostring(htfVwapUp))
 
-    table.cell(t, 0, 22, "5m moved away long")
-    table.cell(t, 1, 22, str.tostring(htfMovedAwayFromVWAPLong))
+    table.cell(t, 0, 22, "5m vwap down")
+    table.cell(t, 1, 22, str.tostring(htfVwapDown))
 
-    table.cell(t, 0, 23, "5m moved away short")
-    table.cell(t, 1, 23, str.tostring(htfMovedAwayFromVWAPShort)
+    table.cell(t, 0, 23, "5m vwap not flat")
+    table.cell(t, 1, 23, str.tostring(htfVwapNotFlat))
 
-  table.cell(t, 0, 24, "5m structure long")
-table.cell(t, 1, 24, str.tostring(htfStructureLong))
+    table.cell(t, 0, 24, "5m not choppy")
+    table.cell(t, 1, 24, str.tostring(htfNotChoppy))
 
-table.cell(t, 0, 25, "5m structure short")
-table.cell(t, 1, 25, str.tostring(htfStructureShort))
+    table.cell(t, 0, 25, "5m not late long")
+    table.cell(t, 1, 25, str.tostring(htfNotLateLong))
 
-    table.cell(t, 0, 26, "5m sweep long")
-    table.cell(t, 1, 26, str.tostring(htfSweepRejectionLong))
+    table.cell(t, 0, 26, "5m not late short")
+    table.cell(t, 1, 26, str.tostring(htfNotLateShort))
 
-    table.cell(t, 0, 27, "5m sweep short")
-    table.cell(t, 1, 27, str.tostring(htfSweepRejectionShort))
+    table.cell(t, 0, 27, "5m moved away long")
+    table.cell(t, 1, 27, str.tostring(htfMovedAwayFromVWAPLong))
 
-    table.cell(t, 0, 28, "5m ctx long")
-    table.cell(t, 1, 28, str.tostring(htfContextLong))
+    table.cell(t, 0, 28, "5m moved away short")
+    table.cell(t, 1, 28, str.tostring(htfMovedAwayFromVWAPShort))
 
-    table.cell(t, 0, 29, "5m ctx short")
-    table.cell(t, 1, 29, str.tostring(htfContextShort))
+    table.cell(t, 0, 29, "5m structure long")
+    table.cell(t, 1, 29, str.tostring(htfStructureLong))
 
-    table.cell(t, 0, 30, "5m setup long")
-    table.cell(t, 1, 30, str.tostring(htfSetupLong))
+    table.cell(t, 0, 30, "5m structure short")
+    table.cell(t, 1, 30, str.tostring(htfStructureShort))
 
-    table.cell(t, 0, 31, "5m setup short")
-    table.cell(t, 1, 31, str.tostring(htfSetupShort))
+    table.cell(t, 0, 31, "5m sweep long")
+    table.cell(t, 1, 31, str.tostring(htfSweepRejectionLong))
+
+    table.cell(t, 0, 32, "5m sweep short")
+    table.cell(t, 1, 32, str.tostring(htfSweepRejectionShort))
+
+    table.cell(t, 0, 33, "5m ctx long")
+    table.cell(t, 1, 33, str.tostring(htfContextLong))
+
+    table.cell(t, 0, 34, "5m ctx short")
+    table.cell(t, 1, 34, str.tostring(htfContextShort))
+
+    table.cell(t, 0, 35, "5m setups")
+    table.cell(t, 1, 35, "L=" + str.tostring(htfSetupLong) + " / S=" + str.tostring(htfSetupShort))

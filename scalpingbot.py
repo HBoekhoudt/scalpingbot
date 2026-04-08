@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT — P039
+# IKBR SCALPING BOT | VERSION v1.6.0 P049 | STAGE: TEST
 # ==========================================================
 
 import logging
@@ -20,7 +20,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P260407039"
+BOT_PATCH = "P049"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -44,6 +44,23 @@ TICK_SIZES = {
     "M6E": 0.00005,
 }
 
+BRACKET_CONFIRM_STATUSES = {
+    "PendingSubmit",
+    "ApiPending",
+    "PreSubmitted",
+    "Submitted",
+    "Filled",
+}
+
+ACTIVE_TRADE_STATES = {
+    "SUBMITTING",
+    "ENTRY_WORKING",
+    "ENTRY_FILLED",
+    "EXIT_WORKING",
+    "TP_FILLED",
+    "SL_FILLED",
+}
+
 # ==========================================================
 # BOT
 # ==========================================================
@@ -64,9 +81,33 @@ class ScalpingBot:
 
         self.trade_state = "IDLE"
 
-        self.connection_lock = threading.Lock()
+        self.connection_lock = threading.RLock()
         self.order_id_lock = threading.Lock()
+        self.execution_lock = threading.Lock()
+        self.trade_analysis_lock = threading.Lock()
+
         self.next_order_id = None
+
+        # Session health state
+        self.session_socket_connected = False
+        self.session_initialized = False
+        self.session_healthy = False
+        self.session_reconnect_count = 0
+        self.last_reconnect_time = None
+        self.events_attached = False
+        self.session_recovery_in_progress = False
+
+        # Event handler refs for safe detach/reattach
+        self.ib_event_handlers = {
+            "exec": None,
+            "open_order": None,
+            "order_status": None,
+            "commission": None,
+            "error": None,
+        }
+
+        # Execution safety
+        self.active_execution_trade_id = None
 
         self.last_signal = None
         self.last_signal_time = 0
@@ -74,7 +115,6 @@ class ScalpingBot:
         self.last_diagnostic = None
         self.last_diagnostic_time = 0
 
-        self.trade_analysis_lock = threading.Lock()
         self.trade_analysis = {}
         self.order_to_trade = {}
         self.completed_trade_ids = set()
@@ -118,6 +158,117 @@ class ScalpingBot:
 
         logger.info(f"SPREAD | {symbol} {side} → {price}")
         return price
+
+    # ==========================================================
+    # DET EXECUTION HELPERS (P049)
+    # ==========================================================
+
+    def get_grade_risk_percent(self, execution_grade):
+        """Return intended risk percent for execution grade."""
+        if execution_grade == "A+":
+            return 0.005  # 0.5%
+        elif execution_grade == "A":
+            return 0.003  # 0.3%
+        else:
+            return 0.0
+
+    def get_fallback_stop_distance(self, symbol, execution_grade=None):
+        """Return instrument-aware fallback stop distance in price units (not ticks).
+        Used as temporary pragmatic model; ready for later structure-anchor integration.
+        """
+        if symbol == "M6E":
+            # Forex: 0.00020 price distance (2 pips)
+            return 0.00020
+        elif symbol == "MES":
+            # Micro E-mini S&P 500: 2.00 price distance (8 ticks, 1 tick = 0.25)
+            return 2.00
+        elif symbol == "MNQ":
+            # Micro E-mini Nasdaq: 2.00 price distance (8 ticks, 1 tick = 0.25)
+            return 2.00
+        elif symbol == "FDXM":
+            # Euro DAX: 2.00 price distance (4 ticks, 1 tick = 0.5)
+            return 2.00
+        else:
+            # Default fallback
+            return 2.00
+
+    def get_entry_band_limit(self, symbol, execution_grade):
+        """Return max entry drift in price distance units for grade and symbol.
+        All values return consistent price-distance units (not mixed ticks/pips).
+        """
+        if symbol == "M6E":
+            # Forex: pips converted to price distance (0.0001 = 1 pip)
+            return 0.00020 if execution_grade == "A+" else 0.00040  # 2 vs 4 pips
+        elif symbol == "MES":
+            # MES: 1 tick = 0.25, convert to price distance
+            return 1.00 if execution_grade == "A+" else 2.00  # 4 vs 8 ticks
+        elif symbol == "MNQ":
+            # MNQ: 1 tick = 0.25, convert to price distance
+            return 2.00 if execution_grade == "A+" else 3.00  # 8 vs 12 ticks
+        elif symbol == "FDXM":
+            # FDXM: 1 tick = 0.5, convert to price distance
+            return 1.00 if execution_grade == "A+" else 2.00  # 2 vs 4 ticks
+        else:
+            return 2.00  # Default fallback
+
+    def derive_candidate_executable_entry(self, symbol, side, normalized):
+        """Derive the planned executable entry candidate including spread adjustment.
+        This is used for entry-band validation to make the check non-trivial.
+        """
+        # Start from Pine reference price
+        reference_price = normalized["price"]
+        if reference_price is None:
+            return None
+        
+        # Apply the same spread logic bot will use for execution
+        spread_adjusted = self.apply_spread(symbol, side, reference_price)
+        
+        # Round to tick as bot will do
+        executable_candidate = self.round_to_tick(symbol, spread_adjusted)
+        
+        return executable_candidate
+
+    def validate_entry_band(self, symbol, execution_grade, reference_price, candidate_entry):
+        """Validate candidate entry is within allowed band from reference price.
+        Both actual_drift and allowed_limit now use consistent price-distance units.
+        Returns (is_valid, actual_drift, allowed_limit).
+        """
+        if reference_price is None or candidate_entry is None:
+            return (False, None, None)
+
+        # Calculate actual drift in price distance
+        actual_drift = abs(candidate_entry - reference_price)
+        
+        # Get allowed limit in same price-distance units
+        allowed_limit = self.get_entry_band_limit(symbol, execution_grade)
+        
+        is_valid = actual_drift <= allowed_limit
+
+        return (is_valid, actual_drift, allowed_limit)
+
+    def derive_det_stop_price(self, symbol, entry_price, side, execution_grade=None):
+        """Derive stop price from final executable entry price.
+        Uses instrument-aware fallback stop distance.
+        This helper is ready for later structure-anchor integration.
+        """
+        stop_dist = self.get_fallback_stop_distance(symbol, execution_grade)
+        
+        if side == "long":
+            return entry_price - stop_dist
+        else:
+            return entry_price + stop_dist
+
+    def derive_target_from_r(self, entry_price, stop_price, side):
+        """Derive target from entry and stop (2R target).
+        1R = abs(entry - stop)
+        target = entry ± 2R
+        """
+        r_distance = abs(entry_price - stop_price)
+        
+        if side == "long":
+            return entry_price + (2 * r_distance)
+        else:
+            return entry_price - (2 * r_distance)
 
     # ==========================================================
     # TIME / ANALYSIS HELPERS
@@ -306,6 +457,7 @@ class ScalpingBot:
             "symbol": job["symbol"],
             "side": job["side"],
             "grade": job.get("grade", ""),
+            "det_classification": job.get("det_classification", ""),
             "signal_time": signal_time,
             "enqueue_time": enqueue_time,
             "execution_start_time": execution_start_time,
@@ -380,9 +532,12 @@ class ScalpingBot:
             self.order_to_trade[sl_id] = trade_id
             self.aggregate_stats["total_trades"] += 1
 
+            self.active_execution_trade_id = trade_id
+
             self.append_trade_event(
                 trade_id,
                 f"REGISTERED symbol={record['symbol']} side={record['side']} "
+                f"grade={record['grade']} det_classification={record['det_classification']} "
                 f"entry={record['entry_price']} stop={record['stop_price']} target={record['target_price']}"
             )
 
@@ -448,6 +603,15 @@ class ScalpingBot:
         if message not in record["anomalies"]:
             record["anomalies"].append(message)
             self.append_trade_event(trade_id, f"ANOMALY {message}")
+
+    def has_active_trade_locked(self):
+        with self.trade_analysis_lock:
+            for record in self.trade_analysis.values():
+                if record["summary_logged"]:
+                    continue
+                if record["state"] in ACTIVE_TRADE_STATES:
+                    return True, record["trade_id"], record["symbol"], record["state"]
+            return False, None, None, None
 
     def update_trade_from_status(self, trade):
         try:
@@ -535,6 +699,9 @@ class ScalpingBot:
             record["summary_logged"] = True
             self.completed_trade_ids.add(trade_id)
 
+            if self.active_execution_trade_id == trade_id:
+                self.active_execution_trade_id = None
+
             duration_to_fill = self.seconds_between(record["execution_start_time"], record["entry_fill_time"])
             duration_in_trade = self.seconds_between(record["entry_fill_time"], record["exit_fill_time"])
             execution_metrics = self.calculate_execution_quality_metrics(record)
@@ -545,6 +712,7 @@ class ScalpingBot:
                 f"symbol={record['symbol']} "
                 f"side={record['side']} "
                 f"grade={record['grade']} "
+                f"det_classification={record['det_classification']} "
                 f"parent_order_id={record['parent_order_id']} "
                 f"signal_price={record['entry_signal_price']} "
                 f"spread_adjusted_entry={record['entry_spread_adjusted']} "
@@ -849,15 +1017,42 @@ class ScalpingBot:
             "schema_version",
             "signal_id",
             "timestamp_utc",
+            "bar_time_unix_ms",
             "candidate_side",
             "strategy_family",
             "tv_score",
             "tv_candidate_grade",
+            "candidate_grade",
             "reason_flags",
-            "bias_5m",
             "mode",
             "event",
+            "detector_state",
+            "execution_candidate_valid",
+            "price",
             "blocker",
+            "primary_blocker",
+            "blocker_count",
+            "pine_pass_count",
+            "pine_fail_count",
+            "pine_detector_score",
+            "body_strength_value",
+            "body_strength_threshold",
+            "distance_from_vwap_atr_value",
+            "distance_from_vwap_atr_threshold",
+            "ema_spread_atr_value",
+            "ema_spread_atr_threshold",
+            "not_choppy_flag",
+            "late_filter_flag",
+            "moved_away_flag",
+            "structure_flag",
+            "setup_flag",
+            "trigger_flag",
+            "session_valid",
+            "vwap_bias_valid",
+            "body_strength_valid",
+            "structure_valid",
+            "setup_valid",
+            "trigger_valid",
             "htf_trend_up",
             "htf_trend_down",
             "htf_vwap_up",
@@ -900,7 +1095,9 @@ class ScalpingBot:
         )
 
         grade = self._safe_str(payload.get("grade"), default="")
-        candidate_grade = self._safe_str(payload.get("tv_candidate_grade"), default="")
+        candidate_grade = self._safe_str(payload.get("candidate_grade"), default="")
+        if not candidate_grade:
+            candidate_grade = self._safe_str(payload.get("tv_candidate_grade"), default="")
         if not candidate_grade:
             candidate_grade = grade
 
@@ -916,6 +1113,7 @@ class ScalpingBot:
             "signal_id": self._safe_str(payload.get("signal_id"), default=""),
             "timestamp_utc": timestamp_utc,
             "time": timestamp_utc,
+            "bar_time_unix_ms": payload.get("bar_time_unix_ms"),
             "symbol": symbol,
             "normalized_symbol": symbol,
             "timeframe": self._safe_str(payload.get("timeframe"), default=""),
@@ -923,15 +1121,41 @@ class ScalpingBot:
             "strategy_family": self._safe_str(payload.get("strategy_family"), default="unknown"),
             "mode": self._safe_str(payload.get("mode"), default="").lower(),
             "event": self._safe_str(payload.get("event"), default="").lower(),
+            "detector_state": self._safe_str(payload.get("detector_state"), default="").lower(),
+            "candidate_side": self._safe_str(payload.get("candidate_side"), default="").lower(),
             "side": side,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "price": self._safe_float(payload.get("price"), default=entry_price),
             "blocker": self._safe_str(payload.get("blocker"), default=""),
+            "primary_blocker": self._safe_str(payload.get("primary_blocker"), default=""),
+            "blocker_count": self._safe_int(payload.get("blocker_count"), default=None),
             "grade": grade,
             "candidate_grade": candidate_grade,
             "tv_score": self._safe_float(payload.get("tv_score"), default=None),
+            "body_strength_value": self._safe_float(payload.get("body_strength_value"), default=None),
+            "body_strength_threshold": self._safe_float(payload.get("body_strength_threshold"), default=None),
+            "distance_from_vwap_atr_value": self._safe_float(payload.get("distance_from_vwap_atr_value"), default=None),
+            "distance_from_vwap_atr_threshold": self._safe_float(payload.get("distance_from_vwap_atr_threshold"), default=None),
+            "ema_spread_atr_value": self._safe_float(payload.get("ema_spread_atr_value"), default=None),
+            "ema_spread_atr_threshold": self._safe_float(payload.get("ema_spread_atr_threshold"), default=None),
+            "not_choppy_flag": self._safe_bool(payload.get("not_choppy_flag"), default=False),
+            "late_filter_flag": self._safe_bool(payload.get("late_filter_flag"), default=False),
+            "moved_away_flag": self._safe_bool(payload.get("moved_away_flag"), default=False),
+            "structure_flag": self._safe_bool(payload.get("structure_flag"), default=False),
+            "setup_flag": self._safe_bool(payload.get("setup_flag"), default=False),
+            "trigger_flag": self._safe_bool(payload.get("trigger_flag"), default=False),
+            "session_valid": self._safe_bool(payload.get("session_valid"), default=False),
+            "vwap_bias_valid": self._safe_bool(payload.get("vwap_bias_valid"), default=False),
+            "body_strength_valid": self._safe_bool(payload.get("body_strength_valid"), default=False),
+            "structure_valid": self._safe_bool(payload.get("structure_valid"), default=False),
+            "setup_valid": self._safe_bool(payload.get("setup_valid"), default=False),
+            "trigger_valid": self._safe_bool(payload.get("trigger_valid"), default=False),
+            "execution_candidate_valid": self._safe_bool(payload.get("execution_candidate_valid"), default=False),
+            "pine_pass_count": self._safe_int(payload.get("pine_pass_count"), default=None),
+            "pine_fail_count": self._safe_int(payload.get("pine_fail_count"), default=None),
+            "pine_detector_score": self._safe_int(payload.get("pine_detector_score"), default=None),
             "reason_flags": self._normalize_reason_flags(payload.get("reason_flags")),
             "session_name": self._safe_str(payload.get("session_name"), default="unknown"),
             "minutes_from_open": self._safe_int(payload.get("minutes_from_open"), default=None),
@@ -974,6 +1198,7 @@ class ScalpingBot:
             "body_strength": self._safe_float(payload.get("body_strength"), default=None),
         }
 
+        normalized["candidate_side"] = normalized["candidate_side"] or normalized["side"]
         normalized["execution_ready"] = (
             payload_format == "legacy_execution" and
             bool(normalized["symbol"]) and
@@ -1052,27 +1277,26 @@ class ScalpingBot:
         allow_queue = False
 
         if payload_format == "enriched_candidate":
-            policy_branch = "future_det_gated_execution"
-            allow_queue = False
-            policy_reason = (
-                "DET-gated execution is the intended target architecture; "
-                "enriched candidates are explicitly modeled for this path but execution is not enabled yet in this patch"
-            )
-        elif payload_format == "legacy_execution":
             if stage == "TEST":
-                policy_branch = "temporary_legacy_execution_compatibility"
+                policy_branch = "future_det_gated_execution_test_enabled"
                 allow_queue = True
                 policy_reason = (
-                    "TEST stage allows the temporary legacy execution compatibility path "
-                    "for manual legacy execution testing"
+                    "DET-gated execution is enabled for TEST only; "
+                    "enriched candidates may execute if DET gate permits"
                 )
             else:
-                policy_branch = "legacy_execution_restricted"
+                policy_branch = "future_det_gated_execution_restricted"
                 allow_queue = False
                 policy_reason = (
-                    "legacy execution payloads are restricted to TEST stage only; "
-                    "PAPER/LIVE deny queueing for temporary legacy execution"
+                    "DET-gated execution remains disabled for PAPER/LIVE in this patch"
                 )
+        elif payload_format == "legacy_execution":
+            policy_branch = "legacy_execution_deprecated"
+            allow_queue = False
+            policy_reason = (
+                "legacy execution payloads are deprecated and denied for queueing; "
+                "enriched candidate input must be used instead"
+            )
         else:
             policy_branch = "classification_only"
 
@@ -1089,38 +1313,47 @@ class ScalpingBot:
         soft_blockers = []
         secondary_reasons = []
 
-        session_valid = True
+        # Use new Pine fields as primary, with old as fallback
+        session_valid = normalized.get("session_valid", True)
 
-        vwap_bias_valid = False
-        if side == "long":
-            vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_up"] and not normalized["htf_vwap_down"]
-        elif side == "short":
-            vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_down"] and not normalized["htf_vwap_up"]
+        vwap_bias_valid = normalized.get("vwap_bias_valid", False)
+        if not vwap_bias_valid:
+            # Fallback to old calculation
+            if side == "long":
+                vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_up"] and not normalized["htf_vwap_down"]
+            elif side == "short":
+                vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_down"] and not normalized["htf_vwap_up"]
 
-        structure_valid = False
-        if side == "long":
-            structure_valid = normalized["htf_structure_long"] and not normalized["htf_structure_short"]
-        elif side == "short":
-            structure_valid = normalized["htf_structure_short"] and not normalized["htf_structure_long"]
+        structure_valid = normalized.get("structure_valid", False)
+        if not structure_valid:
+            # Fallback to old calculation
+            if side == "long":
+                structure_valid = normalized["htf_structure_long"] and not normalized["htf_structure_short"]
+            elif side == "short":
+                structure_valid = normalized["htf_structure_short"] and not normalized["htf_structure_long"]
 
-        setup_valid = False
-        if side == "long":
-            setup_valid = normalized["htf_setup_long"]
-        elif side == "short":
-            setup_valid = normalized["htf_setup_short"]
+        setup_valid = normalized.get("setup_valid", False)
+        if not setup_valid:
+            # Fallback to old calculation
+            if side == "long":
+                setup_valid = normalized["htf_setup_long"]
+            elif side == "short":
+                setup_valid = normalized["htf_setup_short"]
 
-        trigger_valid = (
-            normalized["reacceleration_1m_ok"]
-            or normalized["structure_1m_ok"]
-            or normalized["rejection_detected"]
-            or (
-                normalized["body_strength"] is not None
-                and normalized["body_strength"] >= 0.70
+        trigger_valid = normalized.get("trigger_valid", False)
+        if not trigger_valid:
+            # Fallback to old trigger logic
+            trigger_valid = (
+                normalized["reacceleration_1m_ok"]
+                or normalized["structure_1m_ok"]
+                or normalized["rejection_detected"]
+                or (
+                    normalized["body_strength"] is not None
+                    and normalized["body_strength"] >= 0.70
+                )
             )
-        )
-
-        if normalized["event"] == "blocked_snapshot":
-            trigger_valid = False
+            if normalized["event"] == "blocked_snapshot":
+                trigger_valid = False
 
         conflicting_context = False
         if side == "long":
@@ -1129,15 +1362,30 @@ class ScalpingBot:
             conflicting_context = normalized["htf_trend_up"] or normalized["htf_vwap_up"]
 
         late_invalid = False
-        if side == "long":
-            late_invalid = not normalized["htf_not_late_long"]
-        elif side == "short":
-            late_invalid = not normalized["htf_not_late_short"]
+        late_filter_flag = normalized.get("late_filter_flag", None)
+        if late_filter_flag is not None:
+            late_invalid = not late_filter_flag
+        else:
+            # Fallback to old
+            if side == "long":
+                late_invalid = not normalized["htf_not_late_long"]
+            elif side == "short":
+                late_invalid = not normalized["htf_not_late_short"]
+
+        not_choppy_flag = normalized.get("not_choppy_flag", None)
+        chop_failed = False
+        if not_choppy_flag is not None:
+            chop_failed = not not_choppy_flag
+        else:
+            chop_failed = not normalized["htf_not_choppy"]
+
+        if normalized["blocker"] == "chop_failed":
+            chop_failed = True
 
         if not vwap_bias_valid:
             hard_blockers.append("no_vwap_bias")
 
-        if not normalized["htf_not_choppy"] or normalized["blocker"] == "chop_failed":
+        if chop_failed:
             hard_blockers.append("chop")
 
         if late_invalid or normalized["blocker"] == "late_failed":
@@ -1155,16 +1403,23 @@ class ScalpingBot:
         if normalized["reason_flags"]:
             secondary_reasons.extend([f"reason_flag:{flag}" for flag in normalized["reason_flags"]])
 
-        if normalized["distance_from_vwap_atr"] is not None:
-            if normalized["distance_from_vwap_atr"] >= 1.5:
+        distance_from_vwap_atr = normalized.get("distance_from_vwap_atr_value", normalized.get("distance_from_vwap_atr"))
+        if distance_from_vwap_atr is not None:
+            if distance_from_vwap_atr >= 1.5:
                 soft_blockers.append("extended_from_vwap")
-            if normalized["distance_from_vwap_atr"] >= 2.0 and "late" not in hard_blockers:
+            if distance_from_vwap_atr >= 2.0 and "late" not in hard_blockers:
                 hard_blockers.append("late_extension_proxy")
 
-        if normalized["body_strength"] is not None and normalized["body_strength"] < 0.60:
+        body_strength_value = normalized.get("body_strength_value", normalized.get("body_strength"))
+        body_strength_valid = normalized.get("body_strength_valid", None)
+        if body_strength_valid is not None:
+            if not body_strength_valid:
+                soft_blockers.append("weak_body_strength")
+        elif body_strength_value is not None and body_strength_value < 0.60:
             soft_blockers.append("weak_body_strength")
 
-        if normalized["htf_ema_spread_atr"] is not None and normalized["htf_ema_spread_atr"] < 0.20:
+        ema_spread_atr = normalized.get("ema_spread_atr_value", normalized.get("htf_ema_spread_atr"))
+        if ema_spread_atr is not None and ema_spread_atr < 0.20:
             soft_blockers.append("low_ema_spread")
 
         if not setup_valid:
@@ -1172,6 +1427,10 @@ class ScalpingBot:
 
         if not trigger_valid:
             soft_blockers.append("weak_or_missing_trigger")
+
+        # P049: Enforce session_valid as hard blocker if explicitly false
+        if not session_valid:
+            hard_blockers.append("session_invalid")
 
         if hard_blockers:
             det_classification = "REJECT"
@@ -1185,8 +1444,8 @@ class ScalpingBot:
                     and structure_valid
                     and setup_valid
                     and trigger_valid
-                    and normalized["htf_not_choppy"]
-                    and normalized["htf_not_late_long"]
+                    and (not_choppy_flag if not_choppy_flag is not None else normalized["htf_not_choppy"])
+                    and (late_filter_flag if late_filter_flag is not None else normalized["htf_not_late_long"])
                 )
             elif side == "short":
                 strong_alignment = (
@@ -1195,8 +1454,8 @@ class ScalpingBot:
                     and structure_valid
                     and setup_valid
                     and trigger_valid
-                    and normalized["htf_not_choppy"]
-                    and normalized["htf_not_late_short"]
+                    and (not_choppy_flag if not_choppy_flag is not None else normalized["htf_not_choppy"])
+                    and (late_filter_flag if late_filter_flag is not None else normalized["htf_not_late_short"])
                 )
 
             base_a_quality = (
@@ -1206,7 +1465,7 @@ class ScalpingBot:
                 and trigger_valid
             )
 
-            if strong_alignment and not soft_blockers and normalized["body_strength"] is not None and normalized["body_strength"] >= 0.85:
+            if strong_alignment and not soft_blockers and body_strength_value is not None and body_strength_value >= 0.85:
                 det_classification = "EXECUTE_A_PLUS"
                 primary_reason = "strong_aligned_context"
             elif base_a_quality and len(soft_blockers) <= 1:
@@ -1233,9 +1492,19 @@ class ScalpingBot:
         }
 
     def build_classification_result(self, normalized, assessment):
+        det_classification = assessment["det_classification"]
+        execution_permission = det_classification in ("EXECUTE_A", "EXECUTE_A_PLUS")
+        execution_grade = ""
+
+        if det_classification == "EXECUTE_A_PLUS":
+            execution_grade = "A+"
+        elif det_classification == "EXECUTE_A":
+            execution_grade = "A"
+
         return {
-            "det_classification": assessment["det_classification"],
-            "execution_permission": False,
+            "det_classification": det_classification,
+            "execution_permission": execution_permission,
+            "execution_grade": execution_grade,
             "primary_reason": assessment["primary_reason"],
             "secondary_reasons": assessment["secondary_reasons"],
             "hard_blockers": assessment["hard_blockers"],
@@ -1270,18 +1539,18 @@ class ScalpingBot:
     def evaluate_det_execution_gate(self, classification_result):
         det_classification = classification_result["det_classification"]
         stage = BOT_STAGE
-        
+
         gate_eligible = det_classification in ("EXECUTE_A_PLUS", "EXECUTE_A")
-        gate_enabled = False
+        gate_enabled = stage == "TEST"
         gate_branch = "det_execution_gate"
-        queue_allowed = False
-        
+        queue_allowed = gate_enabled and gate_eligible
+
         reason = (
-            "DET execution gate models future eligibility semantics; "
-            f"classification is {det_classification} (eligible={gate_eligible}); "
-            "gate is not yet enabled in this patch"
+            "DET execution gate evaluated; "
+            f"classification={det_classification} eligible={gate_eligible} "
+            f"enabled={gate_enabled} stage={stage}"
         )
-        
+
         return {
             "gate_branch": gate_branch,
             "gate_enabled": gate_enabled,
@@ -1293,91 +1562,82 @@ class ScalpingBot:
         }
 
     # ==========================================================
-    # IB CONNECTION
+    # IB CONNECTION & SESSION HEALTH
     # ==========================================================
 
-    def connect_ib(self):
+    def update_session_health(self):
+        try:
+            socket_connected = self.ib.isConnected()
+            initialization_complete = (
+                socket_connected and
+                self.next_order_id is not None and
+                self.is_baseline_contract_cache_ready() and
+                self.events_attached
+            )
 
-        if self.ib.isConnected():
-            return
+            self.session_socket_connected = socket_connected
+            self.session_initialized = initialization_complete
+            self.session_healthy = socket_connected and initialization_complete
+        except Exception:
+            self.session_socket_connected = False
+            self.session_initialized = False
+            self.session_healthy = False
 
-        with self.connection_lock:
+    def log_session_health(self, label):
+        logger.info(
+            f"SESSION HEALTH | {label} | "
+            f"socket_connected={self.session_socket_connected} "
+            f"initialized={self.session_initialized} "
+            f"healthy={self.session_healthy} "
+            f"reconnect_count={self.session_reconnect_count} "
+            f"order_id={self.next_order_id} "
+            f"contract_cache_size={len(self.contract_cache)} "
+            f"events_attached={self.events_attached}"
+        )
 
-            if self.ib.isConnected():
-                return
-
-            logger.info("Connecting to IBKR...")
-
-            self.ib.connect(self.IB_HOST, self.IB_PORT, clientId=self.IB_CLIENT_ID)
-
-            if not self.ib.isConnected():
-                raise RuntimeError("IBKR connection failed")
-
-            with self.order_id_lock:
-                if self.next_order_id is None:
-                    self.next_order_id = self.ib.client.getReqId()
-
-            logger.info("IBKR connected")
-
-            self.attach_ib_events()
-            self.qualify_contracts()
-
-    def allocate_bracket_order_ids(self):
-
+    def ensure_order_id_initialized(self):
         with self.order_id_lock:
             if self.next_order_id is None:
                 self.next_order_id = self.ib.client.getReqId()
+                logger.info(f"ORDER ID INITIALIZED | next_order_id={self.next_order_id}")
+            else:
+                logger.info(f"ORDER ID AVAILABLE | next_order_id={self.next_order_id}")
 
-            parent_id = self.next_order_id
-            tp_id = parent_id + 1
-            sl_id = parent_id + 2
-            self.next_order_id += 3
-
-        return parent_id, tp_id, sl_id
-
-    def log_trade_snapshot(self, label, trade):
-
+    def detach_ib_events(self):
         try:
-            order = trade.order
-            status = trade.orderStatus
-
-            logger.info(
-                f"{label} → "
-                f"orderId={getattr(order, 'orderId', None)} "
-                f"parentId={getattr(order, 'parentId', None)} "
-                f"action={getattr(order, 'action', None)} "
-                f"orderType={getattr(order, 'orderType', None)} "
-                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
-                f"auxPrice={getattr(order, 'auxPrice', None)} "
-                f"transmit={getattr(order, 'transmit', None)} "
-                f"status={getattr(status, 'status', None)} "
-                f"filled={getattr(status, 'filled', None)} "
-                f"remaining={getattr(status, 'remaining', None)} "
-                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
-                f"whyHeld={getattr(status, 'whyHeld', None)} "
-                f"permId={getattr(status, 'permId', None)}"
-            )
-
-            if getattr(trade, "advancedError", None):
-                logger.error(f"{label} ADVANCED ERROR → {trade.advancedError}")
-
-            if getattr(trade, "log", None):
-                for entry in trade.log:
-                    logger.info(
-                        f"{label} TRADE LOG → "
-                        f"time={getattr(entry, 'time', None)} "
-                        f"status={getattr(entry, 'status', None)} "
-                        f"message={getattr(entry, 'message', None)} "
-                        f"errorCode={getattr(entry, 'errorCode', None)}"
-                    )
-
+            if self.ib_event_handlers["exec"] is not None:
+                self.ib.execDetailsEvent -= self.ib_event_handlers["exec"]
+            if self.ib_event_handlers["open_order"] is not None:
+                self.ib.openOrderEvent -= self.ib_event_handlers["open_order"]
+            if self.ib_event_handlers["order_status"] is not None:
+                self.ib.orderStatusEvent -= self.ib_event_handlers["order_status"]
+            if self.ib_event_handlers["commission"] is not None:
+                self.ib.commissionReportEvent -= self.ib_event_handlers["commission"]
+            if self.ib_event_handlers["error"] is not None:
+                self.ib.errorEvent -= self.ib_event_handlers["error"]
         except Exception:
-            logger.exception(f"{label} SNAPSHOT FAILED")
+            logger.exception("EVENT HANDLER DETACH FAILED")
+        finally:
+            self.ib_event_handlers = {
+                "exec": None,
+                "open_order": None,
+                "order_status": None,
+                "commission": None,
+                "error": None,
+            }
+            self.events_attached = False
+            logger.info("EVENT HANDLERS DETACHED / RESET")
 
-    def attach_ib_events(self):
+    def attach_ib_events(self, force_reset=False):
+        if force_reset:
+            logger.info("EVENT HANDLER FORCE RESET REQUESTED")
+            self.detach_ib_events()
 
-        if hasattr(self.ib, "_events_attached"):
+        if self.events_attached:
+            logger.info("EVENT HANDLERS ALREADY ATTACHED (SKIPPED)")
             return
+
+        logger.info("ATTACHING NEW EVENT HANDLERS")
 
         def on_exec(trade, fill):
             logger.info(f"FILL: {fill}")
@@ -1446,28 +1706,249 @@ class ScalpingBot:
         self.ib.commissionReportEvent += on_commission_report
         self.ib.errorEvent += on_error
 
-        self.ib._events_attached = True
+        self.ib_event_handlers["exec"] = on_exec
+        self.ib_event_handlers["open_order"] = on_open_order
+        self.ib_event_handlers["order_status"] = on_order_status
+        self.ib_event_handlers["commission"] = on_commission_report
+        self.ib_event_handlers["error"] = on_error
+
+        self.events_attached = True
+        logger.info("EVENT HANDLERS ATTACHED SUCCESSFULLY")
+
+    def qualify_contracts(self):
+        logger.info("QUALIFY CONTRACTS")
+
+        for sym in ["MNQ", "MES", "M6E", "FDXM"]:
+            try:
+                base = self.build_base_contract(sym)
+                details = self.ib.reqContractDetails(base)
+
+                detail = self.select_front_month_detail(details)
+                contract = detail.contract
+
+                self.contract_cache[sym] = contract
+                self.contract_min_ticks[sym] = float(getattr(detail, "minTick", TICK_SIZES[sym]))
+
+                logger.info(f"{sym} → {contract.lastTradeDateOrContractMonth}")
+            except Exception:
+                logger.exception(f"FAILED {sym}")
+
+    def ensure_contract_cache_initialized(self):
+        if self.is_baseline_contract_cache_ready():
+            logger.info(f"CONTRACT CACHE BASELINE READY | size={len(self.contract_cache)}")
+            return
+
+        logger.info("CONTRACT CACHE MISSING BASELINE | qualifying contracts")
+        self.qualify_contracts()
+
+    def is_baseline_contract_cache_ready(self):
+        required = {"MNQ", "MES", "M6E", "FDXM"}
+        missing = required - set(self.contract_cache.keys())
+        if missing:
+            return False
+        return True
+
+    def force_session_recovery(self, reason_label):
+        logger.warning(f"FORCED SESSION RECOVERY (SOCKET ALIVE BUT SESSION UNHEALTHY) | reason={reason_label}")
+        self.log_session_health(f"FORCED_RECOVERY_START_{reason_label}")
+
+        with self.connection_lock:
+            if self.session_recovery_in_progress:
+                logger.warning(
+                    "FORCED RECOVERY SKIPPED | already in progress | "
+                    f"reason={reason_label} | socket_connected={self.ib.isConnected()} | "
+                    f"session_healthy={self.session_healthy} session_initialized={self.session_initialized}"
+                )
+                return
+
+            self.session_recovery_in_progress = True
+            try:
+                if self.ib.isConnected():
+                    self.attach_ib_events(force_reset=True)
+                    self.ensure_order_id_initialized()
+                    self.ensure_contract_cache_initialized()
+                    self.update_session_health()
+
+                    postfailure = []
+                    if not self.ib.isConnected():
+                        postfailure.append("socket_disconnected")
+                    if self.next_order_id is None:
+                        postfailure.append("missing_next_order_id")
+                    if not self.events_attached:
+                        postfailure.append("events_not_attached")
+                    if not self.is_baseline_contract_cache_ready():
+                        postfailure.append("baseline_contract_cache_incomplete")
+
+                    if postfailure:
+                        logger.error(
+                            "FORCED RECOVERY FAILED POSTCONDITIONS | "
+                            f"reason={reason_label} failures={','.join(postfailure)}"
+                        )
+                        self.update_session_health()
+                        self.log_session_health(f"FORCED_RECOVERY_INCOMPLETE_{reason_label}")
+                        return
+
+                    self.update_session_health()
+                    self.log_session_health(f"FORCED_RECOVERY_COMPLETE_{reason_label}")
+                else:
+                    logger.warning("FORCED SESSION RECOVERY SKIPPED | socket not connected")
+            finally:
+                self.session_recovery_in_progress = False
+
+    def connect_ib(self):
+        self.update_session_health()
+
+        if self.session_healthy:
+            self.log_session_health("CONNECT SKIPPED (SESSION_HEALTHY)")
+            return
+
+        with self.connection_lock:
+            self.update_session_health()
+
+            if self.session_healthy:
+                self.log_session_health("CONNECT SKIPPED (SESSION_HEALTHY_RECHECK)")
+                return
+
+            socket_connected = self.ib.isConnected()
+
+            if not socket_connected:
+                logger.info("CONNECTING TO IBKR")
+                self.log_session_health("CONNECT START (SOCKET_CONNECT_REQUIRED)")
+
+                try:
+                    self.ib.connect(self.IB_HOST, self.IB_PORT, clientId=self.IB_CLIENT_ID)
+                except Exception:
+                    logger.exception("CONNECTION FAILED")
+                    self.update_session_health()
+                    self.log_session_health("CONNECT FAILED")
+                    raise
+
+                if not self.ib.isConnected():
+                    logger.error("CONNECTION CHECK FAILED")
+                    self.update_session_health()
+                    self.log_session_health("CONNECT CHECK FAILED")
+                    raise RuntimeError("IBKR connection check failed")
+
+                logger.info("SOCKET CONNECTED")
+            else:
+                logger.info("CONNECT_IB CONTINUING INITIALIZATION ON EXISTING SOCKET")
+                self.log_session_health("CONNECT CONTINUE (SOCKET_ALREADY_CONNECTED_SESSION_NOT_HEALTHY)")
+
+            self.ensure_order_id_initialized()
+
+            if not self.events_attached:
+                logger.info("ENSURING EVENT HANDLERS")
+                self.attach_ib_events()
+            else:
+                logger.info("EVENT HANDLERS FLAG TRUE | preserving current attachment state")
+
+            if not self.is_baseline_contract_cache_ready():
+                logger.info("ENSURING CONTRACT QUALIFICATION")
+                self.qualify_contracts()
+            else:
+                logger.info(f"CONTRACT CACHE BASELINE READY | size={len(self.contract_cache)}")
+
+            self.update_session_health()
+            self.log_session_health("CONNECT COMPLETE")
+
+            if not self.session_healthy:
+                raise RuntimeError("IBKR session initialization incomplete after connect_ib")
+
+            logger.info("IBKR FULLY INITIALIZED")
+
+    def ensure_symbol_contract_ready(self, symbol):
+        if symbol in self.contract_cache:
+            return True
+
+        logger.warning(f"CONTRACT CACHE MISS | symbol={symbol} | attempting re-qualification")
+
+        try:
+            if symbol == "EURUSD":
+                self.contract_cache[symbol] = Forex("EURUSD")
+                logger.info("CONTRACT CACHE RECOVERED | symbol=EURUSD")
+                return True
+
+            base = self.build_base_contract(symbol)
+            details = self.ib.reqContractDetails(base)
+            detail = self.select_front_month_detail(details)
+            contract = detail.contract
+
+            self.contract_cache[symbol] = contract
+            self.contract_min_ticks[symbol] = float(getattr(detail, "minTick", TICK_SIZES[symbol]))
+
+            logger.info(
+                f"CONTRACT CACHE RECOVERED | symbol={symbol} expiry={contract.lastTradeDateOrContractMonth}"
+            )
+            return True
+        except Exception:
+            logger.exception(f"CONTRACT CACHE RECOVERY FAILED | symbol={symbol}")
+            return False
+
+    def allocate_bracket_order_ids(self):
+        with self.order_id_lock:
+            if self.next_order_id is None:
+                self.next_order_id = self.ib.client.getReqId()
+
+            parent_id = self.next_order_id
+            tp_id = parent_id + 1
+            sl_id = parent_id + 2
+            self.next_order_id += 3
+
+        return parent_id, tp_id, sl_id
+
+    def log_trade_snapshot(self, label, trade):
+        try:
+            order = trade.order
+            status = trade.orderStatus
+
+            logger.info(
+                f"{label} → "
+                f"orderId={getattr(order, 'orderId', None)} "
+                f"parentId={getattr(order, 'parentId', None)} "
+                f"action={getattr(order, 'action', None)} "
+                f"orderType={getattr(order, 'orderType', None)} "
+                f"lmtPrice={getattr(order, 'lmtPrice', None)} "
+                f"auxPrice={getattr(order, 'auxPrice', None)} "
+                f"transmit={getattr(order, 'transmit', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)} "
+                f"avgFillPrice={getattr(status, 'avgFillPrice', None)} "
+                f"whyHeld={getattr(status, 'whyHeld', None)} "
+                f"permId={getattr(status, 'permId', None)}"
+            )
+
+            if getattr(trade, "advancedError", None):
+                logger.error(f"{label} ADVANCED ERROR → {trade.advancedError}")
+
+            if getattr(trade, "log", None):
+                for entry in trade.log:
+                    logger.info(
+                        f"{label} TRADE LOG → "
+                        f"time={getattr(entry, 'time', None)} "
+                        f"status={getattr(entry, 'status', None)} "
+                        f"message={getattr(entry, 'message', None)} "
+                        f"errorCode={getattr(entry, 'errorCode', None)}"
+                    )
+
+        except Exception:
+            logger.exception(f"{label} SNAPSHOT FAILED")
 
     # ==========================================================
     # CONTRACTS
     # ==========================================================
 
     def build_base_contract(self, symbol):
-
         if symbol in ("MNQ", "MES", "M6E"):
             return Future(symbol=symbol, exchange="CME", currency="USD")
-
         elif symbol == "FDXM":
             return Future(symbol="FDXM", exchange="EUREX", currency="EUR", tradingClass="FDXM")
-
         elif symbol == "EURUSD":
             return Forex("EURUSD")
-
         else:
             raise ValueError(f"Unsupported symbol: {symbol}")
 
     def select_front_month_detail(self, details):
-
         sorted_details = sorted(
             details,
             key=lambda d: d.contract.lastTradeDateOrContractMonth
@@ -1480,29 +1961,7 @@ class ScalpingBot:
 
         raise RuntimeError("No valid contract")
 
-    def qualify_contracts(self):
-
-        logger.info("QUALIFY CONTRACTS")
-
-        for sym in ["MNQ", "MES", "M6E", "FDXM"]:
-
-            try:
-                base = self.build_base_contract(sym)
-                details = self.ib.reqContractDetails(base)
-
-                detail = self.select_front_month_detail(details)
-                contract = detail.contract
-
-                self.contract_cache[sym] = contract
-                self.contract_min_ticks[sym] = float(getattr(detail, "minTick", TICK_SIZES[sym]))
-
-                logger.info(f"{sym} → {contract.lastTradeDateOrContractMonth}")
-
-            except Exception:
-                logger.exception(f"FAILED {sym}")
-
     def get_contract(self, symbol):
-
         if symbol in self.contract_cache:
             return self.contract_cache[symbol]
 
@@ -1515,8 +1974,49 @@ class ScalpingBot:
     # SIGNAL HANDLING
     # ==========================================================
 
-    def handle_webhook_signal(self, data):
+    def build_det_execution_job(self, normalized, classification_result):
+        """Build execution job with DET planning details.
+        P049: Moved stop/target derivation to place_bracket_order() after final executable entry.
+        This job now carries planning info only; final R is computed at execution time.
+        """
+        entry = self.derive_entry_price_from_candidate(normalized)
+        execution_grade = classification_result["execution_grade"]
+        reference_price = normalized["price"]  # Pine's reference price
+        symbol = normalized["symbol"]
+        side = normalized["side"]
 
+        # Get intended risk percent for grade
+        intended_risk_percent = self.get_grade_risk_percent(execution_grade)
+
+        return {
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "signal_time": normalized["timestamp_utc"] or normalized["time"],
+            "enqueue_time": self.utc_now_iso(),
+            "grade": execution_grade,
+            "intended_risk_percent": intended_risk_percent,
+            "det_classification": classification_result["det_classification"],
+            "reference_price": reference_price,
+            "normalized_signal": normalized,
+            "raw_payload": normalized["raw_payload"],
+            "payload_format": normalized["payload_format"],
+            "schema_version": normalized["schema_version"],
+            "signal_id": normalized["signal_id"],
+        }
+
+    def derive_entry_price_from_candidate(self, normalized):
+        if normalized["payload_format"] == "enriched_candidate":
+            price_ref = normalized["price"]
+            if price_ref is None:
+                return None
+            if normalized["symbol"]:
+                return self.round_to_tick(normalized["symbol"], price_ref)
+            return price_ref
+
+        return normalized["entry_price"] if normalized["entry_price"] is not None else normalized["price"]
+
+    def handle_webhook_signal(self, data):
         logger.info(f"WEBHOOK RECEIVED: {data}")
 
         if not isinstance(data, dict):
@@ -1549,11 +2049,13 @@ class ScalpingBot:
             )
             return "invalid_signal_payload"
 
+        policy = self.evaluate_stage_execution_policy(normalized)
+
         if normalized["payload_format"] == "enriched_candidate":
             assessment = self.assess_det_signal(normalized)
             classification_result = self.build_classification_result(normalized, assessment)
             self.log_det_result(normalized, assessment, classification_result)
-            
+
             gate_result = self.evaluate_det_execution_gate(classification_result)
             logger.info(
                 "DET EXECUTION GATE DECISION | "
@@ -1564,7 +2066,106 @@ class ScalpingBot:
                 f"queue_allowed={gate_result['queue_allowed']} "
                 f"reason={gate_result['reason']}"
             )
-            
+
+            if not policy["allow_queue"] or not gate_result["queue_allowed"]:
+                logger.info(
+                    "QUEUE DECISION | "
+                    f"path={policy['policy_branch']} "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={normalized['symbol']} "
+                    f"side={normalized['side']} "
+                    f"det_classification={classification_result['det_classification']} "
+                    f"queued=false "
+                    f"reason={gate_result['reason']}"
+                )
+                return "enriched_candidate_classified_no_execution"
+
+            entry_for_job = self.derive_entry_price_from_candidate(normalized)
+            if entry_for_job is None:
+                logger.info(
+                    "QUEUE DECISION | "
+                    f"path=future_det_gated_execution "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={normalized['symbol']} "
+                    f"side={normalized['side']} "
+                    f"det_classification={classification_result['det_classification']} "
+                    f"queued=false "
+                    f"reason=missing_price_reference"
+                )
+                return "enriched_candidate_missing_price"
+
+            symbol = normalized["symbol"]
+            side = normalized["side"]
+            entry = entry_for_job
+            execution_grade = classification_result["execution_grade"]
+            reference_price = normalized["price"]
+
+            # P049: Derive candidate executable entry WITH spread for non-trivial band validation
+            candidate_executable_entry = self.derive_candidate_executable_entry(
+                symbol, side, normalized
+            )
+            if candidate_executable_entry is None:
+                logger.info(
+                    "QUEUE DECISION | "
+                    f"path=candidate_entry_derivation_failed "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={symbol} "
+                    f"side={side} "
+                    f"queued=false"
+                )
+                return "enriched_candidate_entry_derivation_failed"
+
+            # P049: Validate entry is within grade-specific band from reference price
+            # Uses non-trivial executable entry (with spread)
+            band_valid, actual_drift, allowed_limit = self.validate_entry_band(
+                symbol, execution_grade, reference_price, candidate_executable_entry
+            )
+            if not band_valid:
+                logger.info(
+                    "QUEUE DECISION | "
+                    f"path=entry_band_validation_failed "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={symbol} "
+                    f"side={side} "
+                    f"grade={execution_grade} "
+                    f"reference_price={reference_price} "
+                    f"candidate_executable_entry={candidate_executable_entry} "
+                    f"actual_drift={actual_drift} "
+                    f"allowed_limit_price_distance={allowed_limit} "
+                    f"queued=false"
+                )
+                return "enriched_candidate_entry_band_rejected"
+
+            now = time.time()
+            key = f"{symbol}-{side}-{round(entry, 8)}"
+
+            if key == self.last_signal and now - self.last_signal_time < 5:
+                logger.info("Duplicate ignored")
+                return "duplicate_ignored"
+
+            self.last_signal = key
+            self.last_signal_time = now
+
+            job = self.build_det_execution_job(normalized, classification_result)
+
+            logger.info(
+                "QUEUE PUT | "
+                f"symbol={job['symbol']} "
+                f"side={job['side']} "
+                f"entry={job['entry']} "
+                f"reference_price={job['reference_price']} "
+                f"grade={job['grade']} "
+                f"intended_risk_pct={job['intended_risk_percent']*100:.1f}% "
+                f"det_classification={job['det_classification']} "
+                f"payload_format={job['payload_format']} "
+                f"signal_id={job['signal_id']}"
+            )
+
+            self.execution_queue.put(job)
             logger.info(
                 "QUEUE DECISION | "
                 f"path=future_det_gated_execution "
@@ -1573,10 +2174,20 @@ class ScalpingBot:
                 f"symbol={normalized['symbol']} "
                 f"side={normalized['side']} "
                 f"det_classification={classification_result['det_classification']} "
-                f"queued=false "
-                f"gate_reason={gate_result['reason']}"
+                f"queued=true"
             )
-            return "enriched_candidate_modeled_for_det_gated_execution"
+            return "queued"
+
+        if normalized["payload_format"] == "legacy_execution":
+            logger.info(
+                "LEGACY EXECUTION IGNORED | "
+                f"payload_format={normalized['payload_format']} "
+                f"signal_id={normalized['signal_id']} "
+                f"symbol={normalized['symbol']} "
+                f"side={normalized['side']} "
+                "legacy_execution payloads are deprecated and denied for queueing"
+            )
+            return "legacy_execution_denied"
 
         if not normalized["execution_ready"]:
             logger.info(
@@ -1589,7 +2200,6 @@ class ScalpingBot:
             )
             return "candidate_logged_no_execution"
 
-        policy = self.evaluate_stage_execution_policy(normalized)
         if not policy["allow_queue"]:
             logger.info(
                 "QUEUE DECISION | "
@@ -1604,74 +2214,75 @@ class ScalpingBot:
             )
             return "execution_denied_by_stage_policy"
 
-        logger.info(
-            "QUEUE DECISION | "
-            f"path={policy['policy_branch']} "
-            f"payload_format={normalized['payload_format']} "
-            f"signal_id={normalized['signal_id']} "
-            f"symbol={normalized['symbol']} "
-            f"side={normalized['side']} "
-            f"stage={policy['stage']} "
-            f"queued=true "
-            f"reason={policy['reason']}"
-        )
-
-        symbol = normalized["symbol"]
-        side = normalized["side"]
-        entry = normalized["entry_price"]
-        signal_time = normalized["timestamp_utc"] or data.get("time")
-        grade = normalized["grade"] or normalized["candidate_grade"]
-        enqueue_time = self.utc_now_iso()
-
-        now = time.time()
-        key = f"{symbol}-{side}-{round(entry, 8)}"
-
-        if key == self.last_signal and now - self.last_signal_time < 5:
-            logger.info("Duplicate ignored")
-            return "duplicate_ignored"
-
-        self.last_signal = key
-        self.last_signal_time = now
-
-        job = {
-            "symbol": symbol,
-            "side": side,
-            "entry": entry,
-            "signal_time": signal_time,
-            "enqueue_time": enqueue_time,
-            "grade": grade,
-            "normalized_signal": normalized,
-            "raw_payload": data,
-            "payload_format": normalized["payload_format"],
-            "schema_version": normalized["schema_version"],
-            "signal_id": normalized["signal_id"],
-        }
-
-        logger.info(
-            "QUEUE PUT | "
-            f"symbol={job['symbol']} "
-            f"side={job['side']} "
-            f"entry={job['entry']} "
-            f"grade={job['grade']} "
-            f"payload_format={job['payload_format']} "
-            f"signal_id={job['signal_id']}"
-        )
-
-        self.execution_queue.put(job)
-        logger.info(
-            "QUEUE DECISION | "
-            f"path=legacy_execution "
-            f"payload_format={normalized['payload_format']} "
-            f"queued=true"
-        )
-        return "queued"
+        # Legacy execution queueing removed - legacy payloads are denied earlier
 
     # ==========================================================
-    # WORKER
+    # WORKER & EXECUTION PREFLIGHT
     # ==========================================================
+
+    def execution_preflight_check(self, job):
+        symbol = job["symbol"]
+        reasons = []
+
+        self.update_session_health()
+
+        if not self.session_socket_connected:
+            reasons.append("socket_disconnected")
+        if not self.session_initialized:
+            reasons.append("session_not_initialized")
+        if not self.session_healthy:
+            reasons.append("session_not_healthy")
+        if self.next_order_id is None:
+            reasons.append("missing_next_order_id")
+        if not self.events_attached:
+            reasons.append("events_not_attached")
+
+        if reasons:
+            logger.warning(
+                "EXECUTION PREFLIGHT INITIAL FAILURE | "
+                f"symbol={symbol} reasons={','.join(reasons)}"
+            )
+            self.log_session_health("PREFLIGHT_BEFORE_RECOVERY")
+
+            try:
+                if self.ib.isConnected():
+                    self.force_session_recovery("EXECUTION_PREFLIGHT")
+                else:
+                    self.connect_ib()
+            except Exception:
+                logger.exception("PREFLIGHT SESSION RECOVERY FAILED")
+                self.update_session_health()
+
+        self.update_session_health()
+        reasons = []
+
+        if not self.session_socket_connected:
+            reasons.append("socket_disconnected")
+        if not self.session_initialized:
+            reasons.append("session_not_initialized")
+        if not self.session_healthy:
+            reasons.append("session_not_healthy")
+        if self.next_order_id is None:
+            reasons.append("missing_next_order_id")
+        if not self.events_attached:
+            reasons.append("events_not_attached")
+
+        if not self.ensure_symbol_contract_ready(symbol):
+            reasons.append(f"contract_not_ready:{symbol}")
+
+        if reasons:
+            logger.error(
+                "EXECUTION PREFLIGHT DENIED | "
+                f"symbol={symbol} reasons={','.join(reasons)}"
+            )
+            self.log_session_health("PREFLIGHT_DENIED")
+            return False
+
+        logger.info(f"EXECUTION PREFLIGHT OK | symbol={symbol}")
+        self.log_session_health("EXECUTION_PREFLIGHT_OK")
+        return True
 
     def execution_worker(self):
-
         asyncio.set_event_loop(asyncio.new_event_loop())
 
         logger.info("EXECUTION WORKER STARTED")
@@ -1680,30 +2291,44 @@ class ScalpingBot:
         self.connect_ib()
 
         while True:
-
             job = self.execution_queue.get()
-
             logger.info(f"WORKER RECEIVED JOB: {job}")
 
             try:
-                logger.info(f"IB CONNECTED: {self.ib.isConnected()}")
-                logger.info("STARTING ORDER EXECUTION")
+                with self.execution_lock:
+                    has_lock, locked_trade_id, locked_symbol, locked_state = self.has_active_trade_locked()
+                    if has_lock:
+                        logger.warning(
+                            "TRADE LOCK BLOCKED EXECUTION | "
+                            f"locked_trade_id={locked_trade_id} "
+                            f"locked_symbol={locked_symbol} "
+                            f"locked_state={locked_state} "
+                            f"incoming_symbol={job['symbol']}"
+                        )
+                        continue
 
-                self.place_bracket_order(job)
+                    logger.info("PRE-EXECUTION HEALTH CHECK")
+                    if not self.execution_preflight_check(job):
+                        logger.error("EXECUTION PREFLIGHT FAILED | SKIPPING JOB")
+                        continue
 
-                logger.info("ORDER EXECUTION FINISHED")
+                    logger.info(f"IB CONNECTED: {self.ib.isConnected()}")
+                    logger.info("STARTING ORDER EXECUTION")
+
+                    self.place_bracket_order(job)
+
+                    logger.info("ORDER EXECUTION FINISHED")
 
             except Exception:
                 logger.exception("Execution error")
-
-            self.execution_queue.task_done()
+            finally:
+                self.execution_queue.task_done()
 
     # ==========================================================
-    # 🔥 P033 — EXECUTION QUALITY LOGGING
+    # EXECUTION QUALITY LOGGING
     # ==========================================================
 
     def place_bracket_order(self, job):
-
         symbol = job["symbol"]
         side = job["side"]
 
@@ -1712,32 +2337,35 @@ class ScalpingBot:
 
         contract = self.get_contract(symbol)
 
-        if symbol in ("MES", "MNQ"):
-            stop_dist = 2
-            target_dist = 4
-        elif symbol == "M6E":
-            stop_dist = 0.002
-            target_dist = 0.004
-        else:
-            stop_dist = 2
-            target_dist = 4
+        # P049: Derive stop from FINAL executable entry (after spread/rounding)
+        execution_grade = job.get("grade", "A")
+        stop = self.derive_det_stop_price(symbol, entry, side, execution_grade)
+        stop = self.round_to_tick(symbol, stop)
+
+        # P049: Derive 2R target from final entry and stop
+        target = self.derive_target_from_r(entry, stop, side)
+        target = self.round_to_tick(symbol, target)
+
+        # P049: Compute final 1R distance from final executable entry and stop
+        risk_distance_r = abs(entry - stop)
 
         if side == "long":
-            stop = entry - stop_dist
-            target = entry + target_dist
             parent_action = "BUY"
             child_action = "SELL"
         else:
-            stop = entry + stop_dist
-            target = entry - target_dist
             parent_action = "SELL"
             child_action = "BUY"
 
-        stop = self.round_to_tick(symbol, stop)
-        target = self.round_to_tick(symbol, target)
-
         logger.info(
-            f"OFFICIAL BRACKET | {symbol} {side} entry={entry} stop={stop} target={target}"
+            f"OFFICIAL BRACKET | {symbol} {side} "
+            f"grade={job.get('grade', '')} "
+            f"det_classification={job.get('det_classification', '')} "
+            f"reference_price={job.get('reference_price', 'N/A')} "
+            f"final_entry={entry} "
+            f"final_stop={stop} "
+            f"final_target={target} "
+            f"risk_r={risk_distance_r} "
+            f"intended_risk_pct={job.get('intended_risk_percent', 0)*100:.1f}%"
         )
 
         parent_id, tp_id, sl_id = self.allocate_bracket_order_ids()
@@ -1808,20 +2436,49 @@ class ScalpingBot:
         self.log_trade_snapshot("POST WAIT TP", tp_trade)
         self.log_trade_snapshot("POST WAIT SL", sl_trade)
 
-        confirmed_statuses = {"PreSubmitted", "Submitted", "Filled"}
-        submission_deadline = time.time() + 2.0
+        submission_deadline = time.time() + 4.0
         confirmed = False
+
+        parent_logged_transitions = set()
+        tp_logged_transitions = set()
+        sl_logged_transitions = set()
 
         while time.time() < submission_deadline:
             parent_status = getattr(parent_trade.orderStatus, "status", None)
             tp_status = getattr(tp_trade.orderStatus, "status", None)
             sl_status = getattr(sl_trade.orderStatus, "status", None)
 
-            if (
-                parent_status in confirmed_statuses
-                and tp_status in confirmed_statuses
-                and sl_status in confirmed_statuses
-            ):
+            parent_perm = getattr(parent_trade.orderStatus, "permId", 0)
+            tp_perm = getattr(tp_trade.orderStatus, "permId", 0)
+            sl_perm = getattr(sl_trade.orderStatus, "permId", 0)
+
+            # Log first transitions
+            for leg, status, perm, order_id, logged_set in [
+                ("parent", parent_status, parent_perm, parent_id, parent_logged_transitions),
+                ("tp", tp_status, tp_perm, tp_id, tp_logged_transitions),
+                ("sl", sl_status, sl_perm, sl_id, sl_logged_transitions),
+            ]:
+                if status == "PreSubmitted" and "PreSubmitted" not in logged_set:
+                    logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} status=PreSubmitted")
+                    logged_set.add("PreSubmitted")
+                if status == "Submitted" and "Submitted" not in logged_set:
+                    logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} status=Submitted")
+                    logged_set.add("Submitted")
+                if status == "Filled" and "Filled" not in logged_set:
+                    logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} status=Filled")
+                    logged_set.add("Filled")
+                if status in ("Cancelled", "Inactive", "ApiCancelled") and "cancelled" not in logged_set:
+                    logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} status={status}")
+                    logged_set.add("cancelled")
+                if perm != 0 and "permId_assigned" not in logged_set:
+                    logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} permId={perm} assigned")
+                    logged_set.add("permId_assigned")
+
+            parent_ok = parent_status != "PendingSubmit" or parent_perm != 0
+            tp_ok = tp_status != "PendingSubmit" or tp_perm != 0
+            sl_ok = sl_status != "PendingSubmit" or sl_perm != 0
+
+            if parent_ok and tp_ok and sl_ok:
                 confirmed = True
                 break
 
@@ -1830,6 +2487,14 @@ class ScalpingBot:
         self.log_trade_snapshot("POST CONFIRM PARENT", parent_trade)
         self.log_trade_snapshot("POST CONFIRM TP", tp_trade)
         self.log_trade_snapshot("POST CONFIRM SL", sl_trade)
+
+        logger.info(
+            f"BRACKET CONFIRMATION ASSESSMENT | confirmed={confirmed} | "
+            f"parent: orderId={parent_id} status={parent_status} permId={parent_perm} | "
+            f"tp: orderId={tp_id} status={tp_status} permId={tp_perm} | "
+            f"sl: orderId={sl_id} status={sl_status} permId={sl_perm} | "
+            f"reason={'all legs confirmed (status != PendingSubmit or permId != 0)' if confirmed else 'confirmation timeout or legs stuck in PendingSubmit with permId=0'}"
+        )
 
         open_trades = self.ib.openTrades()
 
@@ -1847,6 +2512,8 @@ class ScalpingBot:
 
         if not confirmed:
             self.append_anomaly(trade_id, "SUBMISSION_CONFIRMATION_TIMEOUT")
+            self.trade_analysis[trade_id]["state"] = "INCOMPLETE"
+            self.finalize_trade_if_complete(trade_id)
             logger.error(
                 f"BRACKET NOT CONFIRMED | trade_id={trade_id} "
                 f"parent_order_id={parent_id} tp_order_id={tp_id} sl_order_id={sl_id}"
@@ -1854,24 +2521,42 @@ class ScalpingBot:
             return
 
         self.append_trade_event(trade_id, "BRACKET SUBMITTED")
-        logger.info("BRACKET SUBMITTED (P034 SUBMISSION CONFIRMATION GUARD)")
+        logger.info("BRACKET SUBMITTED")
 
     # ==========================================================
     # WATCHDOG
     # ==========================================================
 
     def ib_watchdog(self):
-
         asyncio.set_event_loop(asyncio.new_event_loop())
 
         while True:
+            try:
+                self.update_session_health()
 
-            if not self.ib.isConnected():
-                logger.warning("Reconnecting...")
-                try:
-                    self.connect_ib()
-                except Exception:
-                    logger.exception("Reconnect failed")
+                if not self.ib.isConnected():
+                    self.session_reconnect_count += 1
+                    self.last_reconnect_time = datetime.now(timezone.utc)
+                    logger.warning(
+                        f"RECONNECT ATTEMPT #{self.session_reconnect_count} | "
+                        f"socket_connected=false"
+                    )
+                    self.log_session_health(f"RECONNECT_ATTEMPT_{self.session_reconnect_count}")
+
+                    try:
+                        self.connect_ib()
+                        logger.info(f"RECONNECT SUCCESS #{self.session_reconnect_count}")
+                        self.log_session_health(f"RECONNECT_SUCCESS_{self.session_reconnect_count}")
+                    except Exception:
+                        logger.exception(f"RECONNECT FAILED #{self.session_reconnect_count}")
+                        self.log_session_health(f"RECONNECT_FAILED_{self.session_reconnect_count}")
+                else:
+                    if not self.session_healthy:
+                        logger.warning("FORCED SESSION RECOVERY (SOCKET ALIVE BUT SESSION UNHEALTHY)")
+                        self.log_session_health("WATCHDOG_UNHEALTHY_BEFORE_RECOVERY")
+                        self.force_session_recovery("WATCHDOG_SOCKET_ALIVE_SESSION_UNHEALTHY")
+            except Exception:
+                logger.exception("WATCHDOG ERROR")
 
             time.sleep(10)
 
@@ -1894,7 +2579,6 @@ def health():
 
 @app.post("/webhook/tradingview")
 async def webhook_handler(request: Request):
-
     raw_body = await request.body()
     raw_text = raw_body.decode("utf-8", errors="replace")
     logger.info(f"WEBHOOK RAW BODY: {raw_text}")
