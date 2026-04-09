@@ -1,11 +1,12 @@
 //@version=6
-indicator("DET_Enriched_Data_submitter", shorttitle="DET EDS v10", overlay=true, max_labels_count=500)
+indicator("DET_Enriched_Data_submitter", shorttitle="DET EDS v12", overlay=true, max_labels_count=500)
 
 // ==========================================================
 // DET A / A+ CLASSIFIER
 // 2-STAGE MTF MODEL
 // 5m context/setup armed -> 1m trigger confirmed -> fire once
 // Pine Script v6
+//
 // ==========================================================
 
 // ----------------------
@@ -129,7 +130,10 @@ f_build_payload(
     int pinePassCount,
     int pineFailCount,
     int pineDetectorScore,
-    string candidateGrade
+    string candidateGrade,
+    bool aboveVwap,
+    float trendStrength5mValue,
+    int minutesFromOpenValue
 ) =>
     primaryBlocker = f_primary_reason(blockerReasonsPipe)
     blockerCount = f_reason_count(blockerReasonsPipe)
@@ -145,8 +149,29 @@ f_build_payload(
          ',"structure_anchor_low":' + str.tostring(structureAnchorLow) +
          ',"structure_anchor_high":' + str.tostring(structureAnchorHigh) +
          ',"price":' + str.tostring(close) +
+         ',"session_name":"' + sessionName + '"' +
+         ',"above_vwap":' + str.tostring(aboveVwap) +
+         ',"vwap_slope_1m":' + str.tostring(vwapSlope) +
+         ',"vwap_slope_5m":' + str.tostring(htfVwapSlope) +
+         ',"trend_strength_5m":' + str.tostring(trendStrength5mValue) +
+         ',"minutes_from_open":' + str.tostring(minutesFromOpenValue) +
+         ',"htf_trend_up":' + str.tostring(htfTrendUp) +
+         ',"htf_trend_down":' + str.tostring(htfTrendDown) +
+         ',"htf_vwap_up":' + str.tostring(htfVwapUp) +
+         ',"htf_vwap_down":' + str.tostring(htfVwapDown) +
+         ',"htf_vwap_not_flat":' + str.tostring(htfVwapNotFlat) +
+         ',"htf_not_choppy":' + str.tostring(htfNotChoppy) +
+         ',"htf_not_late_long":' + str.tostring(htfNotLateLong) +
+         ',"htf_not_late_short":' + str.tostring(htfNotLateShort) +
+         ',"htf_moved_away_long":' + str.tostring(htfMovedAwayFromVWAPLong) +
+         ',"htf_moved_away_short":' + str.tostring(htfMovedAwayFromVWAPShort) +
+         ',"htf_structure_long":' + str.tostring(htfStructureLong) +
+         ',"htf_structure_short":' + str.tostring(htfStructureShort) +
+         ',"htf_setup_long":' + str.tostring(htfSetupLong) +
+         ',"htf_setup_short":' + str.tostring(htfSetupShort) +
          ',"blocker":"' + blocker + '"' +
          ',"blocker_reasons":' + blockerReasonsJson +
+         ',"reason_flags":' + blockerReasonsJson +
          ',"primary_blocker":"' + primaryBlocker + '"' +
          ',"blocker_count":' + str.tostring(blockerCount) +
          ',"body_strength_value":' + str.tostring(bodyStrengthValue) +
@@ -181,7 +206,15 @@ emaFast = ta.ema(close, fastEmaLen)
 emaSlow = ta.ema(close, slowEmaLen)
 
 sessionOk = not useSessionFilter or not na(time(timeframe.period, sessionInput))
+sessionConfiguredNow = not na(time(timeframe.period, sessionInput))
 executionTimeframeOk = timeframe.isminutes and timeframe.multiplier == 1
+
+sessionStartHour = int(str.tonumber(str.substring(sessionInput, 0, 2)))
+sessionStartMinute = int(str.tonumber(str.substring(sessionInput, 2, 4)))
+currentHour = hour(time)
+currentMinute = minute(time)
+minutesFromOpen = sessionConfiguredNow ? ((currentHour * 60 + currentMinute) - (sessionStartHour * 60 + sessionStartMinute)) : -1
+sessionName = sessionConfiguredNow ? "in_session" : "out_of_session"
 
 barRange = high - low
 barBody = math.abs(close - open)
@@ -328,6 +361,7 @@ htfVwapDown = htfVwapSlope < 0
 htfVwapNotFlat = math.abs(htfVwapSlope) > (htfAtr * 0.02)
 
 htfEmaSpreadAtr = f_safe_div(math.abs(htfEmaFast - htfEmaSlow), htfAtr)
+trendStrength5m = htfAtr != 0 ? (htfEmaFast - htfEmaSlow) / htfAtr : 0.0
 htfNotChoppy = htfEmaSpreadAtr > chopThreshold
 
 htfDistanceFromVWAPAtr = f_safe_div(math.abs(htfClose - htfVwap), htfAtr)
@@ -716,7 +750,10 @@ executionLongJson = f_build_payload(
     executionLongPassCount,
     executionLongFailCount,
     executionLongScore,
-    f_grade_from_state("execution_candidate", aPlusLongFire, aLongFire)
+    f_grade_from_state("execution_candidate", aPlusLongFire, aLongFire),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 executionShortJson = f_build_payload(
@@ -748,7 +785,10 @@ executionShortJson = f_build_payload(
     executionShortPassCount,
     executionShortFailCount,
     executionShortScore,
-    f_grade_from_state("execution_candidate", aPlusShortFire, aShortFire)
+    f_grade_from_state("execution_candidate", aPlusShortFire, aShortFire),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 blockedLongJson = f_build_payload(
@@ -780,7 +820,10 @@ blockedLongJson = f_build_payload(
     blockedLongPassCount,
     blockedLongFailCount,
     blockedLongScore,
-    f_grade_from_state("blocked_candidate", false, false)
+    f_grade_from_state("blocked_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 blockedShortJson = f_build_payload(
@@ -812,7 +855,10 @@ blockedShortJson = f_build_payload(
     blockedShortPassCount,
     blockedShortFailCount,
     blockedShortScore,
-    f_grade_from_state("blocked_candidate", false, false)
+    f_grade_from_state("blocked_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 borderlineLongJson = f_build_payload(
@@ -844,7 +890,10 @@ borderlineLongJson = f_build_payload(
     borderlineLongPassCount,
     borderlineLongFailCount,
     borderlineLongScore,
-    f_grade_from_state("borderline_candidate", false, false)
+    f_grade_from_state("borderline_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 borderlineShortJson = f_build_payload(
@@ -876,7 +925,10 @@ borderlineShortJson = f_build_payload(
     borderlineShortPassCount,
     borderlineShortFailCount,
     borderlineShortScore,
-    f_grade_from_state("borderline_candidate", false, false)
+    f_grade_from_state("borderline_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 setupCandidateLongJson = f_build_payload(
@@ -908,7 +960,10 @@ setupCandidateLongJson = f_build_payload(
     executionLongPassCount,
     executionLongFailCount,
     executionLongScore,
-    f_grade_from_state("setup_candidate", false, false)
+    f_grade_from_state("setup_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 setupCandidateShortJson = f_build_payload(
@@ -940,7 +995,10 @@ setupCandidateShortJson = f_build_payload(
     executionShortPassCount,
     executionShortFailCount,
     executionShortScore,
-    f_grade_from_state("setup_candidate", false, false)
+    f_grade_from_state("setup_candidate", false, false),
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
 )
 
 // ----------------------

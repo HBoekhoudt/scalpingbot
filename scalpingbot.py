@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P051 | STAGE: TEST
+# IKBR SCALPING BOT | VERSION v1.6.0 P060 | STAGE: TEST
 # ==========================================================
 
 import logging
@@ -20,7 +20,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P051"
+BOT_PATCH = "P060"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -956,64 +956,41 @@ class ScalpingBot:
         return symbol
 
     def _infer_side_from_context(self, payload):
-        event = self._safe_str(payload.get("event"), default="").lower()
-
-        if event in {"ctx_long_on", "setup_long_on"}:
-            return "long"
-        if event in {"ctx_short_on", "setup_short_on"}:
-            return "short"
+        for field in ("candidate_side", "side", "direction"):
+            explicit_side = self._safe_str(payload.get(field), default="").lower()
+            if explicit_side in {"long", "buy", "bull", "up"}:
+                return "long"
+            if explicit_side in {"short", "sell", "bear", "down"}:
+                return "short"
 
         long_score = 0
         short_score = 0
 
-        if self._safe_bool(payload.get("htf_setup_long"), default=False):
-            long_score += 4
-        if self._safe_bool(payload.get("htf_setup_short"), default=False):
-            short_score += 4
-
-        if self._safe_bool(payload.get("htf_structure_long"), default=False):
-            long_score += 3
-        if self._safe_bool(payload.get("htf_structure_short"), default=False):
-            short_score += 3
-
-        if self._safe_bool(payload.get("htf_trend_up"), default=False):
-            long_score += 2
-        if self._safe_bool(payload.get("htf_trend_down"), default=False):
-            short_score += 2
-
-        if self._safe_bool(payload.get("htf_vwap_up"), default=False):
-            long_score += 2
-        if self._safe_bool(payload.get("htf_vwap_down"), default=False):
-            short_score += 2
-
-        if self._safe_bool(payload.get("htf_moved_away_long"), default=False):
-            long_score += 1
-        if self._safe_bool(payload.get("htf_moved_away_short"), default=False):
-            short_score += 1
-
-        bias_5m = self._safe_str(payload.get("bias_5m"), default="").lower()
-        if bias_5m in {"long", "bull", "up"}:
-            long_score += 1
-        elif bias_5m in {"short", "bear", "down"}:
-            short_score += 1
-
-        candidate_side = self._safe_str(payload.get("candidate_side"), default="").lower()
-        if candidate_side in {"long", "buy", "bull", "up"}:
-            long_score += 5
-        elif candidate_side in {"short", "sell", "bear", "down"}:
-            short_score += 5
-
         sweep_side = self._safe_str(payload.get("sweep_side"), default="").lower()
         if sweep_side == "down":
-            long_score += 1
+            long_score += 2
         elif sweep_side == "up":
-            short_score += 1
+            short_score += 2
 
-        blocker = self._safe_str(payload.get("blocker"), default="").lower()
-        if blocker == "late_failed":
-            if self._safe_bool(payload.get("htf_not_late_long"), default=True) is False and self._safe_bool(payload.get("htf_not_late_short"), default=True):
+        if "above_vwap" in payload:
+            above_vwap = self._safe_bool(payload.get("above_vwap"), default=None)
+            if above_vwap is True:
                 long_score += 1
-            elif self._safe_bool(payload.get("htf_not_late_short"), default=True) is False and self._safe_bool(payload.get("htf_not_late_long"), default=True):
+            elif above_vwap is False:
+                short_score += 1
+
+        vwap_slope_1m = payload.get("vwap_slope_1m")
+        if isinstance(vwap_slope_1m, (int, float)):
+            if vwap_slope_1m > 0:
+                long_score += 1
+            elif vwap_slope_1m < 0:
+                short_score += 1
+
+        vwap_slope_5m = payload.get("vwap_slope_5m")
+        if isinstance(vwap_slope_5m, (int, float)):
+            if vwap_slope_5m > 0:
+                long_score += 1
+            elif vwap_slope_5m < 0:
                 short_score += 1
 
         if long_score > short_score:
@@ -1138,6 +1115,10 @@ class ScalpingBot:
 
         symbol = self._normalize_symbol(payload.get("symbol"))
         side = self._normalize_side(payload)
+        raw_session_name = payload.get("session_name")
+        session_name = None if raw_session_name is None else str(raw_session_name).strip()
+        if session_name == "":
+            session_name = None
 
         entry_price = self._safe_float(
             payload.get("entry_price", payload.get("entry")),
@@ -1208,8 +1189,8 @@ class ScalpingBot:
             "vwap_bias_valid": self._safe_bool(payload.get("vwap_bias_valid"), default=False),
             "body_strength_valid": self._safe_bool(payload.get("body_strength_valid"), default=False),
             "structure_valid": self._safe_bool(payload.get("structure_valid"), default=False),
-            "setup_valid": payload.get("setup_valid"),
-            "trigger_valid": payload.get("trigger_valid"),
+            "setup_valid": self._safe_bool(payload.get("setup_valid"), default=None),
+            "trigger_valid": self._safe_bool(payload.get("trigger_valid"), default=None),
             "execution_candidate_valid": self._safe_bool(payload.get("execution_candidate_valid"), default=False),
             "pine_pass_count": self._safe_int(payload.get("pine_pass_count"), default=None),
             "pine_fail_count": self._safe_int(payload.get("pine_fail_count"), default=None),
@@ -1220,14 +1201,14 @@ class ScalpingBot:
             "structure_anchor_low": self._safe_float(payload.get("structure_anchor_low"), default=None),
             "structure_anchor_high": self._safe_float(payload.get("structure_anchor_high"), default=None),
             "reason_flags": self._normalize_reason_flags(payload.get("reason_flags")),
-            "session_name": self._safe_str(payload.get("session_name"), default="unknown"),
+            "session_name": session_name,
             "minutes_from_open": self._safe_int(payload.get("minutes_from_open"), default=None),
             "vwap_price": self._safe_float(payload.get("vwap_price"), default=None),
             "vwap_distance_points": self._safe_float(payload.get("vwap_distance_points"), default=None),
             "vwap_distance_atr": self._safe_float(payload.get("vwap_distance_atr"), default=None),
             "vwap_slope_1m": self._safe_float(payload.get("vwap_slope_1m"), default=None),
             "vwap_slope_5m": self._safe_float(payload.get("vwap_slope_5m"), default=None),
-            "above_vwap": self._safe_bool(payload.get("above_vwap"), default=False),
+            "above_vwap": self._safe_bool(payload.get("above_vwap"), default=None),
             "bias_5m": self._safe_str(payload.get("bias_5m"), default="unknown"),
             "trend_strength_5m": self._safe_float(payload.get("trend_strength_5m"), default=None),
             "range_state_5m": self._safe_str(payload.get("range_state_5m"), default="unknown"),
@@ -1242,23 +1223,103 @@ class ScalpingBot:
             "rr_estimate": self._safe_float(payload.get("rr_estimate"), default=None),
             "spread_estimate_ticks": self._safe_float(payload.get("spread_estimate_ticks"), default=None),
             "execution_quality_hint": self._safe_str(payload.get("execution_quality_hint"), default="unknown"),
-            "htf_trend_up": self._safe_bool(payload.get("htf_trend_up"), default=False),
-            "htf_trend_down": self._safe_bool(payload.get("htf_trend_down"), default=False),
-            "htf_vwap_up": self._safe_bool(payload.get("htf_vwap_up"), default=False),
-            "htf_vwap_down": self._safe_bool(payload.get("htf_vwap_down"), default=False),
-            "htf_vwap_not_flat": self._safe_bool(payload.get("htf_vwap_not_flat"), default=False),
-            "htf_not_choppy": self._safe_bool(payload.get("htf_not_choppy"), default=True),
-            "htf_not_late_long": self._safe_bool(payload.get("htf_not_late_long"), default=True),
-            "htf_not_late_short": self._safe_bool(payload.get("htf_not_late_short"), default=True),
-            "htf_moved_away_long": self._safe_bool(payload.get("htf_moved_away_long"), default=False),
-            "htf_moved_away_short": self._safe_bool(payload.get("htf_moved_away_short"), default=False),
-            "htf_structure_long": self._safe_bool(payload.get("htf_structure_long"), default=False),
-            "htf_structure_short": self._safe_bool(payload.get("htf_structure_short"), default=False),
-            "htf_setup_long": self._safe_bool(payload.get("htf_setup_long"), default=False),
-            "htf_setup_short": self._safe_bool(payload.get("htf_setup_short"), default=False),
+            "htf_trend_up": self._safe_bool(payload.get("htf_trend_up"), default=None),
+            "htf_trend_down": self._safe_bool(payload.get("htf_trend_down"), default=None),
+            "htf_vwap_up": self._safe_bool(payload.get("htf_vwap_up"), default=None),
+            "htf_vwap_down": self._safe_bool(payload.get("htf_vwap_down"), default=None),
+            "htf_vwap_not_flat": self._safe_bool(payload.get("htf_vwap_not_flat"), default=None),
+            "htf_not_choppy": self._safe_bool(payload.get("htf_not_choppy"), default=None),
+            "htf_not_late_long": self._safe_bool(payload.get("htf_not_late_long"), default=None),
+            "htf_not_late_short": self._safe_bool(payload.get("htf_not_late_short"), default=None),
+            "htf_moved_away_long": self._safe_bool(payload.get("htf_moved_away_long"), default=None),
+            "htf_moved_away_short": self._safe_bool(payload.get("htf_moved_away_short"), default=None),
+            "htf_structure_long": self._safe_bool(payload.get("htf_structure_long"), default=None),
+            "htf_structure_short": self._safe_bool(payload.get("htf_structure_short"), default=None),
+            "htf_setup_long": self._safe_bool(payload.get("htf_setup_long"), default=None),
+            "htf_setup_short": self._safe_bool(payload.get("htf_setup_short"), default=None),
             "distance_from_vwap_atr": self._safe_float(payload.get("distance_from_vwap_atr"), default=None),
             "htf_ema_spread_atr": self._safe_float(payload.get("htf_ema_spread_atr"), default=None),
             "body_strength": self._safe_float(payload.get("body_strength"), default=None),
+        }
+
+        normalized["bot_observations"] = {
+            "symbol": normalized["symbol"],
+            "side": normalized["side"],
+            "entry_price": normalized["entry_price"],
+            "price": normalized["price"],
+            "entry_reference_price": normalized["entry_reference_price"],
+            "trigger_bar_high": normalized["trigger_bar_high"],
+            "trigger_bar_low": normalized["trigger_bar_low"],
+            "structure_anchor_low": normalized["structure_anchor_low"],
+            "structure_anchor_high": normalized["structure_anchor_high"],
+            "above_vwap": normalized["above_vwap"],
+            "vwap_price": normalized["vwap_price"],
+            "vwap_distance_points": normalized["vwap_distance_points"],
+            "vwap_distance_atr": normalized["vwap_distance_atr"],
+            "distance_from_vwap_atr_value": normalized["distance_from_vwap_atr_value"],
+            "distance_from_vwap_atr": normalized["distance_from_vwap_atr"],
+            "vwap_slope_1m": normalized["vwap_slope_1m"],
+            "vwap_slope_5m": normalized["vwap_slope_5m"],
+            "trend_strength_5m": normalized["trend_strength_5m"],
+            "overlap_ratio_5m": normalized["overlap_ratio_5m"],
+            "range_state_5m": normalized["range_state_5m"],
+            "body_strength_value": normalized["body_strength_value"],
+            "body_strength": normalized["body_strength"],
+            "ema_spread_atr_value": normalized["ema_spread_atr_value"],
+            "htf_ema_spread_atr": normalized["htf_ema_spread_atr"],
+            "pullback_depth_1m": normalized["pullback_depth_1m"],
+            "rejection_detected": normalized["rejection_detected"],
+            "rejection_wick_ratio": normalized["rejection_wick_ratio"],
+            "sweep_detected": normalized["sweep_detected"],
+            "sweep_side": normalized["sweep_side"],
+            "spread_estimate_ticks": normalized["spread_estimate_ticks"],
+            "rr_estimate": normalized["rr_estimate"],
+            "session_name": normalized["session_name"],
+            "minutes_from_open": normalized["minutes_from_open"],
+            "timestamp_utc": normalized["timestamp_utc"],
+            "bar_time_unix_ms": normalized["bar_time_unix_ms"],
+        }
+
+        normalized["weak_transition_hints"] = {
+            "bias_5m": normalized["bias_5m"],
+            "htf_trend_up": normalized["htf_trend_up"],
+            "htf_trend_down": normalized["htf_trend_down"],
+            "htf_vwap_up": normalized["htf_vwap_up"],
+            "htf_vwap_down": normalized["htf_vwap_down"],
+            "htf_vwap_not_flat": normalized["htf_vwap_not_flat"],
+            "structure_1m_ok": normalized["structure_1m_ok"],
+            "reacceleration_1m_ok": normalized["reacceleration_1m_ok"],
+            "htf_structure_long": normalized["htf_structure_long"],
+            "htf_structure_short": normalized["htf_structure_short"],
+            "htf_setup_long": normalized["htf_setup_long"],
+            "htf_setup_short": normalized["htf_setup_short"],
+        }
+
+        normalized["pine_semantic_non_authority"] = {
+            "session_valid": normalized["session_valid"],
+            "not_choppy_flag": normalized["not_choppy_flag"],
+            "late_filter_flag": normalized["late_filter_flag"],
+            "moved_away_flag": normalized["moved_away_flag"],
+            "structure_flag": normalized["structure_flag"],
+            "setup_flag": normalized["setup_flag"],
+            "trigger_flag": normalized["trigger_flag"],
+            "vwap_bias_valid": normalized["vwap_bias_valid"],
+            "body_strength_valid": normalized["body_strength_valid"],
+            "structure_valid": normalized["structure_valid"],
+            "setup_valid": normalized["setup_valid"],
+            "trigger_valid": normalized["trigger_valid"],
+            "execution_candidate_valid": normalized["execution_candidate_valid"],
+            "blocker": normalized["blocker"],
+            "primary_blocker": normalized["primary_blocker"],
+            "blocker_count": normalized["blocker_count"],
+            "pine_pass_count": normalized["pine_pass_count"],
+            "pine_fail_count": normalized["pine_fail_count"],
+            "pine_detector_score": normalized["pine_detector_score"],
+            "candidate_grade": normalized["candidate_grade"],
+            "grade": normalized["grade"],
+            "tv_score": normalized["tv_score"],
+            "reason_flags": normalized["reason_flags"],
+            "execution_quality_hint": normalized["execution_quality_hint"],
         }
 
         normalized["candidate_side"] = normalized["candidate_side"] or normalized["side"]
@@ -1296,9 +1357,14 @@ class ScalpingBot:
             "setup_valid": normalized["setup_valid"],
             "trigger_valid": normalized["trigger_valid"],
             "session_name": normalized["session_name"],
+            "minutes_from_open": normalized["minutes_from_open"],
+            "above_vwap": normalized["above_vwap"],
+            "vwap_slope_1m": normalized["vwap_slope_1m"],
+            "vwap_slope_5m": normalized["vwap_slope_5m"],
             "bias_5m": normalized["bias_5m"],
             "reason_flags": normalized["reason_flags"],
             "execution_ready": normalized["execution_ready"],
+            "trend_strength_5m": normalized["trend_strength_5m"],
             "htf_trend_up": normalized["htf_trend_up"],
             "htf_trend_down": normalized["htf_trend_down"],
             "htf_vwap_up": normalized["htf_vwap_up"],
@@ -1317,11 +1383,42 @@ class ScalpingBot:
             "htf_ema_spread_atr": normalized["htf_ema_spread_atr"],
             "body_strength": normalized["body_strength"],
         }
+        summary["bot_observations"] = normalized["bot_observations"]
+        summary["weak_transition_hints"] = normalized["weak_transition_hints"]
+        summary["pine_semantic_non_authority"] = normalized["pine_semantic_non_authority"]
         return summary
 
     def log_normalized_signal(self, normalized):
+        raw_payload = normalized["raw_payload"]
+        field_presence = {
+            field: {
+                "present": field in raw_payload,
+                "value": normalized.get(field),
+            }
+            for field in (
+                "session_name",
+                "minutes_from_open",
+                "above_vwap",
+                "vwap_slope_1m",
+                "vwap_slope_5m",
+                "htf_trend_up",
+                "htf_trend_down",
+                "htf_vwap_up",
+                "htf_vwap_down",
+                "htf_vwap_not_flat",
+                "htf_structure_long",
+                "htf_structure_short",
+                "htf_setup_long",
+                "htf_setup_short",
+            )
+        }
+
         logger.info(f"RAW PAYLOAD RECEIVED | {json.dumps(normalized['raw_payload'], sort_keys=True)}")
+        logger.info(f"PINE_OBSERVATIONS | {json.dumps(normalized['bot_observations'], sort_keys=True)}")
+        logger.info(f"PINE_WEAK_TRANSITION_HINTS | {json.dumps(normalized['weak_transition_hints'], sort_keys=True)}")
+        logger.info(f"PINE_SEMANTIC_NON_AUTHORITY | {json.dumps(normalized['pine_semantic_non_authority'], sort_keys=True)}")
         logger.info(f"NORMALIZED SIGNAL | {json.dumps(self.build_normalized_summary(normalized), sort_keys=True)}")
+        logger.info(f"PAYLOAD FIELD PRESENCE | {json.dumps(field_presence, sort_keys=True)}")
         logger.info(
             "PAYLOAD OBSERVABILITY | "
             f"payload_format={normalized['payload_format']} "
@@ -1378,196 +1475,385 @@ class ScalpingBot:
             "reason": policy_reason,
         }
 
+    def assess_det_context(self, normalized):
+        """Bot-side context assessment derived from observations."""
+        obs = normalized["bot_observations"]
+        hints = normalized["weak_transition_hints"]
+        semantic = normalized["pine_semantic_non_authority"]
+        
+        side = obs["side"]
+        
+        # Session state - primary: obs session/timing data
+        minutes_from_open = obs.get("minutes_from_open")
+        session_name = self._safe_str(obs.get("session_name"), default="unknown").lower()
+        session_state = "valid"
+        if session_name in {"closed", "outside", "afterhours", "after-hours", "premarket", "pre-market", "preopen"}:
+            session_state = "invalid"
+        elif minutes_from_open is not None and minutes_from_open < 0:
+            session_state = "invalid"
+        
+        # Bias state - primary: obs above_vwap, vwap slopes, distance, trend strength
+        above_vwap = obs.get("above_vwap")
+        vwap_slope_1m = obs.get("vwap_slope_1m")
+        vwap_slope_5m = obs.get("vwap_slope_5m")
+        trend_strength_5m = obs.get("trend_strength_5m")
+        distance_from_vwap_atr = obs.get("distance_from_vwap_atr_value")
+        if distance_from_vwap_atr is None:
+            distance_from_vwap_atr = obs.get("distance_from_vwap_atr")
+
+        long_evidence = 0
+        short_evidence = 0
+
+        if above_vwap is True:
+            long_evidence += 1
+        elif above_vwap is False:
+            short_evidence += 1
+
+        if isinstance(vwap_slope_1m, (int, float)):
+            if vwap_slope_1m > 0:
+                long_evidence += 1
+            elif vwap_slope_1m < 0:
+                short_evidence += 1
+
+        if isinstance(vwap_slope_5m, (int, float)):
+            if vwap_slope_5m > 0:
+                long_evidence += 1
+            elif vwap_slope_5m < 0:
+                short_evidence += 1
+
+        if isinstance(trend_strength_5m, (int, float)):
+            if trend_strength_5m > 0.2:
+                long_evidence += 1
+            elif trend_strength_5m < -0.2:
+                short_evidence += 1
+
+        if distance_from_vwap_atr is not None and distance_from_vwap_atr > 1.75:
+            if above_vwap is True:
+                long_evidence += 1
+            elif above_vwap is False:
+                short_evidence += 1
+
+        if side == "long":
+            if long_evidence >= 3 and short_evidence <= 1:
+                bias_state = "aligned"
+            elif short_evidence >= 2 and short_evidence > long_evidence:
+                bias_state = "conflicting"
+            else:
+                bias_state = "mixed"
+        elif side == "short":
+            if short_evidence >= 3 and long_evidence <= 1:
+                bias_state = "aligned"
+            elif long_evidence >= 2 and long_evidence > short_evidence:
+                bias_state = "conflicting"
+            else:
+                bias_state = "mixed"
+        else:
+            if abs(long_evidence - short_evidence) >= 3:
+                bias_state = "aligned"
+            else:
+                bias_state = "mixed"
+
+        # Weak hints may break ties only when primary evidence is inconclusive
+        if bias_state == "mixed" and long_evidence == short_evidence:
+            bias_5m = hints.get("bias_5m", "").lower()
+            if bias_5m in {"long", "bull", "up"}:
+                bias_state = "mixed"  # Keep mixed, don't override
+            elif bias_5m in {"short", "bear", "down"}:
+                bias_state = "mixed"  # Keep mixed, don't override
+
+        # Chop state - primary: obs overlap_ratio_5m, trend_strength_5m, vwap slopes
+        overlap_ratio_5m = obs.get("overlap_ratio_5m")
+        chop_state = "not_choppy"
+        if overlap_ratio_5m is not None and overlap_ratio_5m > 0.6:
+            chop_state = "choppy"
+        elif isinstance(trend_strength_5m, (int, float)) and abs(trend_strength_5m) < 0.25:
+            if isinstance(vwap_slope_1m, (int, float)) and abs(vwap_slope_1m) < 0.0001:
+                chop_state = "choppy"
+            elif isinstance(vwap_slope_5m, (int, float)) and abs(vwap_slope_5m) < 0.0001:
+                chop_state = "choppy"
+
+        # Late state - primary: obs extension/distance data
+        late_distance = obs.get("distance_from_vwap_atr_value")
+        if late_distance is None:
+            late_distance = obs.get("distance_from_vwap_atr")
+        if late_distance is not None and late_distance >= 1.8:
+            late_state = "late"
+        else:
+            late_state = "not_late"
+
+        # Departure state - primary: obs VWAP relation + extension proxies
+        departure_state = "not_departed"
+        if side == "long" and above_vwap is True:
+            if late_distance is not None and late_distance > 1.2:
+                departure_state = "departed"
+        elif side == "short" and above_vwap is False:
+            if late_distance is not None and late_distance > 1.2:
+                departure_state = "departed"
+
+        # VWAP state - primary: obs above_vwap and related price context
+        if above_vwap is True:
+            vwap_state = "above"
+        elif above_vwap is False:
+            vwap_state = "below"
+        else:
+            vwap_state = "unknown"
+
+        context_state = {
+            "session_state": session_state,
+            "bias_state": bias_state,
+            "chop_state": chop_state,
+            "late_state": late_state,
+            "departure_state": departure_state,
+            "vwap_state": vwap_state,
+        }
+
+        logger.info(f"BOT_CONTEXT_STATE | {json.dumps(context_state, sort_keys=True)}")
+        return context_state
+
+    def assess_det_structure(self, normalized, context_state):
+        """Bot-side structure assessment derived from observations."""
+        obs = normalized["bot_observations"]
+        hints = normalized["weak_transition_hints"]
+        semantic = normalized["pine_semantic_non_authority"]
+        
+        side = obs["side"]
+        
+        structure_anchor_low = obs.get("structure_anchor_low")
+        structure_anchor_high = obs.get("structure_anchor_high")
+        trigger_bar_high = obs.get("trigger_bar_high")
+        trigger_bar_low = obs.get("trigger_bar_low")
+        sweep_detected = obs.get("sweep_detected", False)
+        rejection_detected = obs.get("rejection_detected", False)
+        rejection_wick_ratio = obs.get("rejection_wick_ratio")
+        
+        # Basic anchor quality
+        has_anchors = structure_anchor_low is not None and structure_anchor_high is not None
+        has_trigger_bar = trigger_bar_low is not None and trigger_bar_high is not None
+        
+        # Structure quality - P058: More DET-meaningful assessment
+        structure_quality = "poor"
+        
+        # Strong: Clear structural support with anchor respect and sweep/rejection evidence
+        if has_anchors and has_trigger_bar:
+            anchor_respected = False
+            if side == "long":
+                anchor_respected = trigger_bar_low >= structure_anchor_low
+            elif side == "short":
+                anchor_respected = trigger_bar_high <= structure_anchor_high
+            
+            if anchor_respected and sweep_detected:
+                structure_quality = "strong"
+            elif anchor_respected and rejection_detected and rejection_wick_ratio and rejection_wick_ratio > 0.6:
+                structure_quality = "strong"
+            elif anchor_respected:
+                structure_quality = "moderate"
+            else:
+                structure_quality = "weak"
+        elif has_anchors:
+            # Anchors present but no trigger bar - moderate support
+            structure_quality = "moderate"
+        elif rejection_detected and rejection_wick_ratio and rejection_wick_ratio > 0.5:
+            # No anchors but strong rejection - moderate support
+            structure_quality = "moderate"
+        elif sweep_detected:
+            # Sweep without anchors - weak but some support
+            structure_quality = "weak"
+        
+        structure_state = {
+            "structure_quality": structure_quality,
+            "has_anchors": has_anchors,
+            "has_trigger_bar": has_trigger_bar,
+            "sweep_detected": sweep_detected,
+            "rejection_detected": rejection_detected,
+        }
+        
+        logger.info(f"P058 STRUCTURE ASSESSMENT: {structure_state} (side={side})")
+        return structure_state
+
+    def assess_det_trigger(self, normalized, context_state, structure_state):
+        """Bot-side trigger assessment derived from observations."""
+        obs = normalized["bot_observations"]
+        hints = normalized["weak_transition_hints"]
+        semantic = normalized["pine_semantic_non_authority"]
+        
+        side = obs["side"]
+        
+        body_strength_value = obs.get("body_strength_value")
+        if body_strength_value is None:
+            body_strength_value = obs.get("body_strength")
+        trigger_bar_high = obs.get("trigger_bar_high")
+        trigger_bar_low = obs.get("trigger_bar_low")
+        reacceleration_1m_ok = hints.get("reacceleration_1m_ok", False)
+        structure_1m_ok = hints.get("structure_1m_ok", False)
+        rejection_detected = obs.get("rejection_detected", False)
+        rejection_wick_ratio = obs.get("rejection_wick_ratio")
+        pullback_depth_1m = obs.get("pullback_depth_1m")
+        price = obs.get("price")
+        entry_reference_price = obs.get("entry_reference_price")
+        
+        # Trigger quality
+        trigger_quality = "weak"
+        
+        strong_signals = 0
+        if body_strength_value is not None and body_strength_value >= 0.85:
+            strong_signals += 1
+        if rejection_detected and rejection_wick_ratio is not None and rejection_wick_ratio > 0.7:
+            strong_signals += 1
+        if pullback_depth_1m is not None and pullback_depth_1m < 0.25:
+            strong_signals += 1
+
+        if strong_signals >= 2:
+            trigger_quality = "strong"
+        elif strong_signals == 1:
+            if reacceleration_1m_ok or structure_1m_ok:
+                trigger_quality = "strong"
+            else:
+                trigger_quality = "moderate"
+        elif body_strength_value is not None and body_strength_value >= 0.70:
+            trigger_quality = "moderate"
+
+        # Price relationship
+        price_alignment = "neutral"
+        if price is not None and entry_reference_price is not None:
+            diff = abs(price - entry_reference_price)
+            if diff < 0.001:
+                price_alignment = "tight"
+            elif diff < 0.01:
+                price_alignment = "close"
+
+        trigger_state = {
+            "trigger_quality": trigger_quality,
+            "body_strength_value": body_strength_value,
+            "reacceleration_1m_ok": reacceleration_1m_ok,
+            "structure_1m_ok": structure_1m_ok,
+            "rejection_detected": rejection_detected,
+            "rejection_wick_ratio": rejection_wick_ratio,
+            "pullback_depth_1m": pullback_depth_1m,
+            "price_alignment": price_alignment,
+            "strong_signals": strong_signals,
+        }
+
+        logger.info(f"BOT_TRIGGER_STATE | {json.dumps(trigger_state, sort_keys=True)}")
+        return trigger_state
+
     def assess_det_signal(self, normalized):
-        side = normalized["side"]
+        obs = normalized["bot_observations"]
+        hints = normalized["weak_transition_hints"]
+        semantic = normalized["pine_semantic_non_authority"]
+        
+        side = obs["side"]
         hard_blockers = []
         soft_blockers = []
         secondary_reasons = []
 
-        # Use new Pine fields as primary, with old as fallback
-        session_valid = normalized.get("session_valid", True)
+        # P058: Bot-side DET assessments derived from categorized normalized data
+        context_state = self.assess_det_context(normalized)
+        structure_state = self.assess_det_structure(normalized, context_state)
+        trigger_state = self.assess_det_trigger(normalized, context_state, structure_state)
 
-        vwap_bias_valid = normalized.get("vwap_bias_valid", False)
-        if not vwap_bias_valid:
-            # Fallback to old calculation
-            if side == "long":
-                vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_up"] and not normalized["htf_vwap_down"]
-            elif side == "short":
-                vwap_bias_valid = normalized["htf_vwap_not_flat"] and normalized["htf_vwap_down"] and not normalized["htf_vwap_up"]
+        if context_state["session_state"] == "invalid":
+            hard_blockers.append("session_invalid")
 
-        structure_valid = normalized.get("structure_valid", False)
-        if not structure_valid:
-            # Fallback to old calculation
-            if side == "long":
-                structure_valid = normalized["htf_structure_long"] and not normalized["htf_structure_short"]
-            elif side == "short":
-                structure_valid = normalized["htf_structure_short"] and not normalized["htf_structure_long"]
-
-        # P050: Use Pine setup_valid directly as primary signal
-        setup_valid = normalized.get("setup_valid")
-        if setup_valid is None:
-            # Fallback to old calculation
-            if side == "long":
-                setup_valid = normalized["htf_setup_long"]
-            elif side == "short":
-                setup_valid = normalized["htf_setup_short"]
-        # If Pine provided False, keep False; no override
-
-        # P050: Use Pine trigger_valid directly as primary signal
-        trigger_valid = normalized.get("trigger_valid")
-        if trigger_valid is None:
-            # Fallback to old trigger logic
-            trigger_valid = (
-                normalized["reacceleration_1m_ok"]
-                or normalized["structure_1m_ok"]
-                or normalized["rejection_detected"]
-                or (
-                    normalized["body_strength"] is not None
-                    and normalized["body_strength"] >= 0.70
-                )
-            )
-            if normalized["event"] == "blocked_snapshot":
-                trigger_valid = False
-        # If Pine provided False, keep False; no override
-
-        conflicting_context = False
-        if side == "long":
-            conflicting_context = normalized["htf_trend_down"] or normalized["htf_vwap_down"]
-        elif side == "short":
-            conflicting_context = normalized["htf_trend_up"] or normalized["htf_vwap_up"]
-
-        late_invalid = False
-        late_filter_flag = normalized.get("late_filter_flag", None)
-        if late_filter_flag is not None:
-            late_invalid = not late_filter_flag
-        else:
-            # Fallback to old
-            if side == "long":
-                late_invalid = not normalized["htf_not_late_long"]
-            elif side == "short":
-                late_invalid = not normalized["htf_not_late_short"]
-
-        not_choppy_flag = normalized.get("not_choppy_flag", None)
-        chop_failed = False
-        if not_choppy_flag is not None:
-            chop_failed = not not_choppy_flag
-        else:
-            chop_failed = not normalized["htf_not_choppy"]
-
-        if normalized["blocker"] == "chop_failed":
-            chop_failed = True
-
-        if not vwap_bias_valid:
-            hard_blockers.append("no_vwap_bias")
-
-        if chop_failed:
+        if context_state["chop_state"] == "choppy":
             hard_blockers.append("chop")
 
-        if late_invalid or normalized["blocker"] == "late_failed":
+        if context_state["late_state"] == "late":
             hard_blockers.append("late")
 
-        if conflicting_context:
-            hard_blockers.append("conflicting_context")
+        if context_state["departure_state"] == "departed":
+            soft_blockers.append("moved_away_from_vwap")
 
-        if not structure_valid or normalized["blocker"] == "structure_failed":
+        if context_state["bias_state"] == "conflicting":
+            hard_blockers.append("conflicting_bias")
+
+        if structure_state["structure_quality"] == "poor":
             hard_blockers.append("poor_structure")
 
-        if normalized["blocker"]:
-            secondary_reasons.append(f"pine_blocker:{normalized['blocker']}")
+        if semantic.get("blocker"):
+            secondary_reasons.append(f"pine_blocker:{semantic['blocker']}")
 
-        if normalized["reason_flags"]:
-            secondary_reasons.extend([f"reason_flag:{flag}" for flag in normalized["reason_flags"]])
+        if semantic.get("reason_flags"):
+            secondary_reasons.extend([f"reason_flag:{flag}" for flag in semantic["reason_flags"]])
 
-        distance_from_vwap_atr = normalized.get("distance_from_vwap_atr_value", normalized.get("distance_from_vwap_atr"))
+        distance_from_vwap_atr = obs.get("distance_from_vwap_atr_value")
+        if distance_from_vwap_atr is None:
+            distance_from_vwap_atr = obs.get("distance_from_vwap_atr")
         if distance_from_vwap_atr is not None:
             if distance_from_vwap_atr >= 1.5:
                 soft_blockers.append("extended_from_vwap")
             if distance_from_vwap_atr >= 2.0 and "late" not in hard_blockers:
                 hard_blockers.append("late_extension_proxy")
 
-        # P050: Use Pine body_strength_value directly when available
-        body_strength_value = normalized.get("body_strength_value")
-        if body_strength_value is None:
-            body_strength_value = normalized.get("body_strength")
-        
-        body_strength_valid = normalized.get("body_strength_valid", None)
-        if body_strength_valid is not None:
-            if not body_strength_valid:
-                soft_blockers.append("weak_body_strength")
-        elif body_strength_value is not None and body_strength_value < 0.60:
+        body_strength_value = trigger_state.get("body_strength_value")
+        if body_strength_value is not None and body_strength_value < 0.60:
             soft_blockers.append("weak_body_strength")
 
-        ema_spread_atr = normalized.get("ema_spread_atr_value", normalized.get("htf_ema_spread_atr"))
+        ema_spread_atr = obs.get("ema_spread_atr_value")
+        if ema_spread_atr is None:
+            ema_spread_atr = obs.get("htf_ema_spread_atr")
         if ema_spread_atr is not None and ema_spread_atr < 0.20:
             soft_blockers.append("low_ema_spread")
 
-        if not setup_valid:
-            soft_blockers.append("no_setup")
+        if context_state["bias_state"] == "mixed":
+            soft_blockers.append("mixed_bias")
 
-        if not trigger_valid:
-            soft_blockers.append("weak_or_missing_trigger")
-
-        # P049: Enforce session_valid as hard blocker if explicitly false
-        if not session_valid:
-            hard_blockers.append("session_invalid")
+        if trigger_state["trigger_quality"] == "weak":
+            soft_blockers.append("weak_trigger")
 
         if hard_blockers:
             det_classification = "REJECT"
             primary_reason = hard_blockers[0]
         else:
-            strong_alignment = False
-            if side == "long":
-                strong_alignment = (
-                    normalized["htf_trend_up"]
-                    and normalized["htf_vwap_up"]
-                    and structure_valid
-                    and setup_valid
-                    and trigger_valid
-                    and (not_choppy_flag if not_choppy_flag is not None else normalized["htf_not_choppy"])
-                    and (late_filter_flag if late_filter_flag is not None else normalized["htf_not_late_long"])
-                )
-            elif side == "short":
-                strong_alignment = (
-                    normalized["htf_trend_down"]
-                    and normalized["htf_vwap_down"]
-                    and structure_valid
-                    and setup_valid
-                    and trigger_valid
-                    and (not_choppy_flag if not_choppy_flag is not None else normalized["htf_not_choppy"])
-                    and (late_filter_flag if late_filter_flag is not None else normalized["htf_not_late_short"])
-                )
-
-            base_a_quality = (
-                vwap_bias_valid
-                and structure_valid
-                and setup_valid
-                and trigger_valid
+            a_plus_criteria = (
+                context_state["bias_state"] == "aligned" and
+                context_state["chop_state"] == "not_choppy" and
+                context_state["late_state"] == "not_late" and
+                context_state["departure_state"] == "not_departed" and
+                structure_state["structure_quality"] in ("strong", "moderate") and
+                trigger_state["trigger_quality"] == "strong" and
+                len(soft_blockers) == 0
             )
 
-            if strong_alignment and not soft_blockers and body_strength_value is not None and body_strength_value >= 0.85:
+            a_criteria = (
+                context_state["bias_state"] in ("aligned", "mixed") and
+                structure_state["structure_quality"] != "poor" and
+                trigger_state["trigger_quality"] in ("strong", "moderate") and
+                len(soft_blockers) <= 1
+            )
+
+            if a_plus_criteria:
                 det_classification = "EXECUTE_A_PLUS"
-                primary_reason = "strong_aligned_context"
-            elif base_a_quality and len(soft_blockers) <= 1:
+                primary_reason = "strong_bot_alignment"
+            elif a_criteria:
                 det_classification = "EXECUTE_A"
-                primary_reason = "valid_setup_and_trigger"
+                primary_reason = "good_bot_quality"
             else:
                 det_classification = "SHADOW"
-                if soft_blockers:
-                    primary_reason = soft_blockers[0]
-                else:
-                    primary_reason = "borderline_context"
+                primary_reason = soft_blockers[0] if soft_blockers else "insufficient_bot_quality"
+
+        pine_setup_valid = semantic.get("setup_valid")
+        pine_trigger_valid = semantic.get("trigger_valid")
+        pine_structure_valid = semantic.get("structure_valid")
+        pine_body_strength_valid = semantic.get("body_strength_valid")
+
+        logger.info(f"P058 DET CLASSIFICATION: {det_classification} -> {primary_reason} (hard={hard_blockers}, soft={soft_blockers})")
 
         return {
-            "session_valid": session_valid,
-            "vwap_bias_valid": vwap_bias_valid,
-            "structure_valid": structure_valid,
-            "setup_valid": setup_valid,
-            "trigger_valid": trigger_valid,
+            "session_valid": context_state["session_state"] == "valid",
+            "vwap_bias_valid": context_state["bias_state"] != "conflicting",
+            "structure_valid": structure_state["structure_quality"] != "poor",
+            "pine_setup_valid": pine_setup_valid,
+            "pine_trigger_valid": pine_trigger_valid,
+            "pine_structure_valid": pine_structure_valid,
+            "pine_body_strength_valid": pine_body_strength_valid,
             "hard_blockers": list(dict.fromkeys(hard_blockers)),
             "soft_blockers": list(dict.fromkeys(soft_blockers)),
             "primary_reason": primary_reason,
             "secondary_reasons": list(dict.fromkeys(secondary_reasons)),
             "det_classification": det_classification,
+            "bot_context_state": context_state,
+            "bot_structure_state": structure_state,
+            "bot_trigger_state": trigger_state,
         }
 
     def build_classification_result(self, normalized, assessment):
@@ -1601,8 +1887,10 @@ class ScalpingBot:
             "session_valid": assessment["session_valid"],
             "vwap_bias_valid": assessment["vwap_bias_valid"],
             "structure_valid": assessment["structure_valid"],
-            "setup_valid": assessment["setup_valid"],
-            "trigger_valid": assessment["trigger_valid"],
+            "pine_setup_valid": assessment["pine_setup_valid"],
+            "pine_trigger_valid": assessment["pine_trigger_valid"],
+            "pine_structure_valid": assessment["pine_structure_valid"],
+            "pine_body_strength_valid": assessment["pine_body_strength_valid"],
             "hard_blockers": assessment["hard_blockers"],
             "soft_blockers": assessment["soft_blockers"],
         }
