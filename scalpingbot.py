@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P060 | STAGE: TEST
+# IKBR SCALPING BOT | VERSION v1.6.0 P076 | STAGE: TEST
 # ==========================================================
 
 import logging
@@ -10,6 +10,7 @@ import time
 import decimal
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
 from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
@@ -20,29 +21,119 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P060"
+BOT_PATCH = "P076"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
 
+AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+
 # ==========================================================
 # CONFIG
 # ==========================================================
 
-SPREADS = {
-    "MNQ": 0.25,
-    "MES": 0.25,
-    "FDXM": 0.5,
-    "M6E": 0.00005,
+INSTRUMENT_SPECS = {
+    "MNQ": {
+        "symbol": "MNQ",
+        "broker_type": "future",
+        "exchange": "CME",
+        "currency": "USD",
+        "trading_class": "MNQ",
+        "tick_size": 0.25,
+        "price_decimals": 2,
+        "point_value": 2.0,
+        "tick_value": 0.5,
+        "spread_assumption": 0.25,
+        "fallback_stop_distance": 2.00,
+        "entry_band_a": 3.00,
+        "entry_band_a_plus": 2.00,
+        "min_size": 1,
+        "size_step": 1,
+        "max_size": None,
+        "session_profile": "US_INDEX",
+    },
+    "MES": {
+        "symbol": "MES",
+        "broker_type": "future",
+        "exchange": "CME",
+        "currency": "USD",
+        "trading_class": "MES",
+        "tick_size": 0.25,
+        "price_decimals": 2,
+        "point_value": 5.0,
+        "tick_value": 1.25,
+        "spread_assumption": 0.25,
+        "fallback_stop_distance": 2.00,
+        "entry_band_a": 2.00,
+        "entry_band_a_plus": 1.00,
+        "min_size": 1,
+        "size_step": 1,
+        "max_size": None,
+        "session_profile": "US_INDEX",
+    },
+    "FDXM": {
+        "symbol": "FDXM",
+        "broker_type": "future",
+        "exchange": "EUREX",
+        "currency": "EUR",
+        "trading_class": "FDXM",
+        "tick_size": 0.5,
+        "price_decimals": 1,
+        "point_value": 5.0,
+        "tick_value": 2.5,
+        "spread_assumption": 0.5,
+        "fallback_stop_distance": 2.00,
+        "entry_band_a": 2.00,
+        "entry_band_a_plus": 1.00,
+        "min_size": 1,
+        "size_step": 1,
+        "max_size": None,
+        "session_profile": "EU_INDEX",
+    },
+    "M6E": {
+        "symbol": "M6E",
+        "broker_type": "future",
+        "exchange": "CME",
+        "currency": "USD",
+        "trading_class": "M6E",
+        "tick_size": 0.00005,
+        "price_decimals": 5,
+        "point_value": 12500.0,
+        "tick_value": 6.25,
+        "spread_assumption": 0.00005,
+        "fallback_stop_distance": 0.00020,
+        "entry_band_a": 0.00040,
+        "entry_band_a_plus": 0.00020,
+        "min_size": 1,
+        "size_step": 1,
+        "max_size": None,
+        "session_profile": "FX",
+    },
+    "EURUSD": {
+        "symbol": "EURUSD",
+        "broker_type": "forex",
+        "exchange": "IDEALPRO",
+        "currency": "USD",
+        "trading_class": None,
+        "tick_size": 0.00005,
+        "price_decimals": 5,
+        "point_value": None,
+        "tick_value": None,
+        "spread_assumption": 0.00005,
+        "fallback_stop_distance": 0.00020,
+        "entry_band_a": 0.00040,
+        "entry_band_a_plus": 0.00020,
+        "min_size": None,
+        "size_step": None,
+        "max_size": None,
+        "session_profile": "FX",
+    },
 }
 
-TICK_SIZES = {
-    "MNQ": 0.25,
-    "MES": 0.25,
-    "FDXM": 0.5,
-    "M6E": 0.00005,
-}
+QUALIFIED_FUTURE_SYMBOLS = ("MNQ", "MES", "M6E", "FDXM")
+
+EXECUTION_CAPITAL_BASE = 170000.0
 
 BRACKET_CONFIRM_STATUSES = {
     "PendingSubmit",
@@ -115,16 +206,23 @@ class ScalpingBot:
         self.last_diagnostic = None
         self.last_diagnostic_time = 0
 
+        self.live_daily_stop_day_key = None
+        self.live_daily_stop_active = False
+        self.live_daily_stop_trigger_trade_id = None
+
         self.trade_analysis = {}
         self.order_to_trade = {}
         self.completed_trade_ids = set()
         self.trade_seq = 0
+        self.processed_execution_ids = set()
+        self.processed_commission_ids = set()
         self.aggregate_stats = {
             "total_trades": 0,
             "closed_trades": 0,
             "filled_trades": 0,
             "tp_count": 0,
             "sl_count": 0,
+            "mixed_exit_count": 0,
             "cancelled_count": 0,
             "rejected_count": 0,
             "incomplete_count": 0,
@@ -140,8 +238,22 @@ class ScalpingBot:
     # PRICE LOGIC
     # ==========================================================
 
+    def get_instrument_spec(self, symbol):
+        spec = INSTRUMENT_SPECS.get(symbol)
+        if spec is None:
+            raise ValueError(f"Unsupported symbol: {symbol}")
+        return spec
+
     def get_tick_size(self, symbol):
-        return self.contract_min_ticks.get(symbol, TICK_SIZES[symbol])
+        spec = self.get_instrument_spec(symbol)
+        return self.contract_min_ticks.get(symbol, spec["tick_size"])
+
+    def get_spread_assumption(self, symbol):
+        return self.get_instrument_spec(symbol)["spread_assumption"]
+
+    def get_point_value(self, symbol):
+        spec = self.get_instrument_spec(symbol)
+        return spec["point_value"] if spec["point_value"] is not None else 1.0
 
     def round_to_tick(self, symbol, price):
         tick = decimal.Decimal(str(self.get_tick_size(symbol)))
@@ -161,7 +273,7 @@ class ScalpingBot:
         return normalized.get("entry_price")
 
     def apply_spread(self, symbol, side, price):
-        spread = SPREADS.get(symbol, 0)
+        spread = self.get_spread_assumption(symbol)
 
         if side == "long":
             price += spread
@@ -170,6 +282,33 @@ class ScalpingBot:
 
         logger.info(f"SPREAD | {symbol} {side} → {price}")
         return price
+
+    def derive_executable_entry_plan(self, symbol, side, reference_price):
+        if not symbol or side not in {"long", "short"} or reference_price is None:
+            return None
+
+        spread_adjusted_entry = self.apply_spread(symbol, side, reference_price)
+        final_entry = self.round_to_tick(symbol, spread_adjusted_entry)
+
+        return {
+            "reference_price": reference_price,
+            "spread_adjusted_entry": spread_adjusted_entry,
+            "final_entry": final_entry,
+        }
+
+    def derive_executable_entry_plan_from_normalized(self, normalized):
+        return self.derive_executable_entry_plan(
+            normalized.get("symbol"),
+            normalized.get("side"),
+            self.get_preferred_reference_price(normalized),
+        )
+
+    def derive_executable_entry_plan_from_job(self, job):
+        return self.derive_executable_entry_plan(
+            job.get("symbol"),
+            job.get("side"),
+            job.get("reference_price"),
+        )
 
     # ==========================================================
     # DET EXECUTION HELPERS (P049)
@@ -184,62 +323,241 @@ class ScalpingBot:
         else:
             return 0.0
 
+    def get_size_constraints(self, symbol):
+        spec = self.get_instrument_spec(symbol)
+        return {
+            "min_size": spec["min_size"],
+            "size_step": spec["size_step"],
+            "max_size": spec["max_size"],
+            "broker_type": spec["broker_type"],
+        }
+
+    def calculate_allowed_money_risk(self, execution_grade):
+        intended_risk_percent = self.get_grade_risk_percent(execution_grade)
+        if intended_risk_percent <= 0:
+            return None, intended_risk_percent
+        return EXECUTION_CAPITAL_BASE * intended_risk_percent, intended_risk_percent
+
+    def calculate_stop_distance_points(self, entry_price, stop_price):
+        try:
+            if entry_price is None or stop_price is None:
+                return None
+            stop_distance_points = abs(float(entry_price) - float(stop_price))
+            if stop_distance_points <= 0:
+                return None
+            return stop_distance_points
+        except Exception:
+            return None
+
+    def calculate_raw_position_size(self, symbol, allowed_money_risk, stop_distance_points):
+        spec = self.get_instrument_spec(symbol)
+
+        if spec["broker_type"] != "future":
+            return None, None, "unsupported_instrument_sizing_model"
+
+        point_value = spec["point_value"]
+        if point_value is None or point_value <= 0:
+            return None, point_value, "missing_point_value"
+
+        if allowed_money_risk is None or allowed_money_risk <= 0:
+            return None, point_value, "invalid_allowed_money_risk"
+
+        if stop_distance_points is None or stop_distance_points <= 0:
+            return None, point_value, "invalid_stop_distance"
+
+        risk_per_contract = stop_distance_points * point_value
+        if risk_per_contract <= 0:
+            return None, point_value, "invalid_risk_per_contract"
+
+        raw_size = allowed_money_risk / risk_per_contract
+        if raw_size <= 0:
+            return None, point_value, "non_positive_raw_size"
+
+        return raw_size, point_value, None
+
+    def normalize_position_size(self, symbol, raw_size):
+        constraints = self.get_size_constraints(symbol)
+        min_size = constraints["min_size"]
+        size_step = constraints["size_step"]
+        max_size = constraints["max_size"]
+
+        if raw_size is None or raw_size <= 0:
+            return None
+        if min_size is None or min_size <= 0:
+            return None
+        if size_step is None or size_step <= 0:
+            return None
+
+        raw_decimal = decimal.Decimal(str(raw_size))
+        step_decimal = decimal.Decimal(str(size_step))
+
+        if max_size is not None:
+            raw_decimal = min(raw_decimal, decimal.Decimal(str(max_size)))
+
+        normalized_decimal = (
+            raw_decimal / step_decimal
+        ).to_integral_value(rounding=decimal.ROUND_DOWN) * step_decimal
+
+        if normalized_decimal <= 0:
+            return None
+
+        if normalized_decimal == normalized_decimal.to_integral_value():
+            return int(normalized_decimal)
+        return float(normalized_decimal)
+
+    def validate_position_size(self, symbol, size):
+        constraints = self.get_size_constraints(symbol)
+        min_size = constraints["min_size"]
+        size_step = constraints["size_step"]
+        max_size = constraints["max_size"]
+
+        if size is None:
+            return False, "size_missing"
+        if size <= 0:
+            return False, "size_non_positive"
+        if min_size is None or size < min_size:
+            return False, "size_below_minimum"
+        if max_size is not None and size > max_size:
+            return False, "size_above_maximum"
+        if size_step is None or size_step <= 0:
+            return False, "invalid_size_step"
+
+        size_decimal = decimal.Decimal(str(size))
+        step_decimal = decimal.Decimal(str(size_step))
+        min_decimal = decimal.Decimal(str(min_size))
+        remainder = (size_decimal - min_decimal) % step_decimal
+        if remainder != 0:
+            return False, "size_step_misaligned"
+
+        return True, "size_valid"
+
+    def calculate_execution_position_size(self, symbol, execution_grade, entry_price, stop_price):
+        allowed_money_risk, intended_risk_percent = self.calculate_allowed_money_risk(execution_grade)
+        stop_distance_points = self.calculate_stop_distance_points(entry_price, stop_price)
+
+        raw_size = None
+        normalized_size = None
+        point_value = None
+        risk_per_contract = None
+        validation_reason = None
+
+        if not execution_grade:
+            return {
+                "ok": False,
+                "reason": "missing_execution_grade",
+                "capital_base": EXECUTION_CAPITAL_BASE,
+                "intended_risk_percent": intended_risk_percent,
+                "allowed_money_risk": allowed_money_risk,
+                "stop_distance_points": stop_distance_points,
+                "point_value": point_value,
+                "risk_per_contract": risk_per_contract,
+                "raw_position_size": raw_size,
+                "normalized_position_size": normalized_size,
+                "validation_reason": validation_reason,
+            }
+
+        if intended_risk_percent <= 0:
+            return {
+                "ok": False,
+                "reason": "invalid_intended_risk_percent",
+                "capital_base": EXECUTION_CAPITAL_BASE,
+                "intended_risk_percent": intended_risk_percent,
+                "allowed_money_risk": allowed_money_risk,
+                "stop_distance_points": stop_distance_points,
+                "point_value": point_value,
+                "risk_per_contract": risk_per_contract,
+                "raw_position_size": raw_size,
+                "normalized_position_size": normalized_size,
+                "validation_reason": validation_reason,
+            }
+
+        if stop_distance_points is None:
+            return {
+                "ok": False,
+                "reason": "invalid_stop_distance_points",
+                "capital_base": EXECUTION_CAPITAL_BASE,
+                "intended_risk_percent": intended_risk_percent,
+                "allowed_money_risk": allowed_money_risk,
+                "stop_distance_points": stop_distance_points,
+                "point_value": point_value,
+                "risk_per_contract": risk_per_contract,
+                "raw_position_size": raw_size,
+                "normalized_position_size": normalized_size,
+                "validation_reason": validation_reason,
+            }
+
+        raw_size, point_value, raw_reason = self.calculate_raw_position_size(
+            symbol, allowed_money_risk, stop_distance_points
+        )
+        if raw_reason is not None:
+            return {
+                "ok": False,
+                "reason": raw_reason,
+                "capital_base": EXECUTION_CAPITAL_BASE,
+                "intended_risk_percent": intended_risk_percent,
+                "allowed_money_risk": allowed_money_risk,
+                "stop_distance_points": stop_distance_points,
+                "point_value": point_value,
+                "risk_per_contract": None,
+                "raw_position_size": raw_size,
+                "normalized_position_size": normalized_size,
+                "validation_reason": validation_reason,
+            }
+
+        risk_per_contract = stop_distance_points * point_value
+        normalized_size = self.normalize_position_size(symbol, raw_size)
+        size_valid, validation_reason = self.validate_position_size(symbol, normalized_size)
+
+        if not size_valid:
+            return {
+                "ok": False,
+                "reason": validation_reason,
+                "capital_base": EXECUTION_CAPITAL_BASE,
+                "intended_risk_percent": intended_risk_percent,
+                "allowed_money_risk": allowed_money_risk,
+                "stop_distance_points": stop_distance_points,
+                "point_value": point_value,
+                "risk_per_contract": risk_per_contract,
+                "raw_position_size": raw_size,
+                "normalized_position_size": normalized_size,
+                "validation_reason": validation_reason,
+            }
+
+        return {
+            "ok": True,
+            "reason": "size_valid",
+            "capital_base": EXECUTION_CAPITAL_BASE,
+            "intended_risk_percent": intended_risk_percent,
+            "allowed_money_risk": allowed_money_risk,
+            "stop_distance_points": stop_distance_points,
+            "point_value": point_value,
+            "risk_per_contract": risk_per_contract,
+            "raw_position_size": raw_size,
+            "normalized_position_size": normalized_size,
+            "validation_reason": validation_reason,
+        }
+
     def get_fallback_stop_distance(self, symbol, execution_grade=None):
         """Return instrument-aware fallback stop distance in price units (not ticks).
         Used as temporary pragmatic model; ready for later structure-anchor integration.
         """
-        if symbol == "M6E":
-            # Forex: 0.00020 price distance (2 pips)
-            return 0.00020
-        elif symbol == "MES":
-            # Micro E-mini S&P 500: 2.00 price distance (8 ticks, 1 tick = 0.25)
-            return 2.00
-        elif symbol == "MNQ":
-            # Micro E-mini Nasdaq: 2.00 price distance (8 ticks, 1 tick = 0.25)
-            return 2.00
-        elif symbol == "FDXM":
-            # Euro DAX: 2.00 price distance (4 ticks, 1 tick = 0.5)
-            return 2.00
-        else:
-            # Default fallback
-            return 2.00
+        return self.get_instrument_spec(symbol)["fallback_stop_distance"]
 
     def get_entry_band_limit(self, symbol, execution_grade):
         """Return max entry drift in price distance units for grade and symbol.
         All values return consistent price-distance units (not mixed ticks/pips).
         """
-        if symbol == "M6E":
-            # Forex: pips converted to price distance (0.0001 = 1 pip)
-            return 0.00020 if execution_grade == "A+" else 0.00040  # 2 vs 4 pips
-        elif symbol == "MES":
-            # MES: 1 tick = 0.25, convert to price distance
-            return 1.00 if execution_grade == "A+" else 2.00  # 4 vs 8 ticks
-        elif symbol == "MNQ":
-            # MNQ: 1 tick = 0.25, convert to price distance
-            return 2.00 if execution_grade == "A+" else 3.00  # 8 vs 12 ticks
-        elif symbol == "FDXM":
-            # FDXM: 1 tick = 0.5, convert to price distance
-            return 1.00 if execution_grade == "A+" else 2.00  # 2 vs 4 ticks
-        else:
-            return 2.00  # Default fallback
+        spec = self.get_instrument_spec(symbol)
+        if execution_grade == "A+":
+            return spec["entry_band_a_plus"]
+        return spec["entry_band_a"]
 
     def derive_candidate_executable_entry(self, symbol, side, normalized):
-        """Derive the planned executable entry candidate including spread adjustment.
-        This is used for entry-band validation to make the check non-trivial.
-        Prefers entry_reference_price from Pine when available, otherwise falls back to price.
-        """
-        # Prefer entry_reference_price from Pine (bot-side analytical reference)
-        reference_price = self.get_preferred_reference_price(normalized)
-        if reference_price is None:
+        """Compatibility wrapper for canonical executable entry derivation."""
+        plan = self.derive_executable_entry_plan_from_normalized(normalized)
+        if plan is None:
             return None
-        
-        # Apply the same spread logic bot will use for execution
-        spread_adjusted = self.apply_spread(symbol, side, reference_price)
-        
-        # Round to tick as bot will do
-        executable_candidate = self.round_to_tick(symbol, spread_adjusted)
-        
-        return executable_candidate
+        return plan["final_entry"]
 
     def validate_entry_band(self, symbol, execution_grade, reference_price, candidate_entry):
         """Validate candidate entry is within allowed band from reference price.
@@ -330,6 +648,112 @@ class ScalpingBot:
     def utc_now_iso(self):
         return datetime.now(timezone.utc).isoformat()
 
+    def amsterdam_now(self):
+        return datetime.now(AMSTERDAM_TZ)
+
+    def get_amsterdam_day_key(self, dt_value=None):
+        if dt_value is None:
+            dt_value = self.amsterdam_now()
+        elif isinstance(dt_value, datetime):
+            if dt_value.tzinfo is None:
+                dt_value = dt_value.replace(tzinfo=timezone.utc)
+            dt_value = dt_value.astimezone(AMSTERDAM_TZ)
+        else:
+            dt_value = self.amsterdam_now()
+
+        return dt_value.strftime("%Y-%m-%d")
+
+    def refresh_live_daily_stop_state(self, reason_label, reference_time=None):
+        day_key = self.get_amsterdam_day_key(reference_time)
+
+        if self.live_daily_stop_day_key is None:
+            self.live_daily_stop_day_key = day_key
+            return day_key
+
+        if self.live_daily_stop_day_key != day_key:
+            logger.info(
+                "LIVE DAILY SL STOP RESET | "
+                f"old_day_key={self.live_daily_stop_day_key} "
+                f"new_day_key={day_key} "
+                f"previously_active={self.live_daily_stop_active} "
+                f"trigger_trade_id={self.live_daily_stop_trigger_trade_id} "
+                f"reason={reason_label}"
+            )
+            self.live_daily_stop_day_key = day_key
+            self.live_daily_stop_active = False
+            self.live_daily_stop_trigger_trade_id = None
+
+        return day_key
+
+    def activate_live_daily_sl_stop(self, trade_id, exit_time=None):
+        day_key = self.refresh_live_daily_stop_state("LIVE_SL_TRIGGER", exit_time)
+
+        if not self.live_daily_stop_active:
+            self.live_daily_stop_active = True
+            self.live_daily_stop_trigger_trade_id = trade_id
+            logger.warning(
+                "LIVE DAILY SL STOP ACTIVATED | "
+                f"day_key={day_key} "
+                f"trigger_trade_id={trade_id}"
+            )
+        else:
+            logger.warning(
+                "LIVE DAILY SL STOP ALREADY ACTIVE | "
+                f"day_key={day_key} "
+                f"existing_trigger_trade_id={self.live_daily_stop_trigger_trade_id} "
+                f"incoming_trade_id={trade_id}"
+            )
+
+    def evaluate_live_execution_risk_regime(self, job):
+        stage = BOT_STAGE
+
+        if stage != "LIVE":
+            return {
+                "stage": stage,
+                "risk_branch": "non_live_regime",
+                "execution_allowed": True,
+                "reason": "live_daily_sl_stop_not_applicable",
+            }
+
+        day_key = self.refresh_live_daily_stop_state("LIVE_EXECUTION_GATE")
+
+        if self.live_daily_stop_active:
+            reason = (
+                "LIVE execution denied because a realized SL already activated the daily stop "
+                f"for Amsterdam day {day_key}"
+            )
+            logger.warning(
+                "LIVE DAILY SL STOP DENIAL | "
+                f"day_key={day_key} "
+                f"trigger_trade_id={self.live_daily_stop_trigger_trade_id} "
+                f"incoming_symbol={job['symbol']} "
+                f"reason={reason}"
+            )
+            return {
+                "stage": stage,
+                "risk_branch": "live_daily_sl_stop_active",
+                "execution_allowed": False,
+                "day_key": day_key,
+                "trigger_trade_id": self.live_daily_stop_trigger_trade_id,
+                "reason": reason,
+            }
+
+        logger.info(
+            "LIVE RISK REGIME | "
+            f"stage={stage} "
+            f"day_key={day_key} "
+            "execution_allowed=true "
+            "reason=no_realized_sl_day_stop"
+        )
+        return {
+            "stage": stage,
+            "risk_branch": "live_daily_sl_stop_clear",
+            "execution_allowed": True,
+            "day_key": day_key,
+            "trigger_trade_id": self.live_daily_stop_trigger_trade_id,
+            "reason": "no_realized_sl_day_stop",
+        }
+
     def to_iso(self, value):
         if isinstance(value, datetime):
             if value.tzinfo is None:
@@ -397,22 +821,17 @@ class ScalpingBot:
         logger.info(f"DIAGNOSTIC PAYLOAD | {json.dumps(data, sort_keys=True)}")
 
     def calculate_expected_gross_pnl(self, record):
-        mult_map = {
-            "MES": 5.0,
-            "MNQ": 2.0,
-            "FDXM": 5.0,
-            "M6E": 12500.0,
-        }
-        multiplier = mult_map.get(record["symbol"], 1.0)
+        multiplier = self.get_point_value(record["symbol"])
+        tp_exit_quantity = float(record.get("tp_exit_quantity") or 0.0)
+        sl_exit_quantity = float(record.get("sl_exit_quantity") or 0.0)
 
-        if record["exit_reason"] == "TP":
-            points = abs(record["target_price"] - record["entry_price"])
-        elif record["exit_reason"] == "SL":
-            points = abs(record["stop_price"] - record["entry_price"])
-        else:
-            return 0.0
+        expected_gross_pnl = 0.0
+        if tp_exit_quantity > 0:
+            expected_gross_pnl += abs(record["target_price"] - record["entry_price"]) * multiplier * tp_exit_quantity
+        if sl_exit_quantity > 0:
+            expected_gross_pnl -= abs(record["stop_price"] - record["entry_price"]) * multiplier * sl_exit_quantity
 
-        return round(points * multiplier, 2)
+        return round(expected_gross_pnl, 2)
 
     def calculate_price_slippage(self, record, actual_price, intended_price, leg):
         if actual_price is None or intended_price is None:
@@ -435,6 +854,53 @@ class ScalpingBot:
 
         return None
 
+    def get_execution_identity(self, execution, fill_time=None):
+        exec_id = getattr(execution, "execId", None)
+        if exec_id:
+            return f"execId:{exec_id}"
+
+        return (
+            f"fallback:"
+            f"{getattr(execution, 'orderId', None)}|"
+            f"{getattr(execution, 'side', None)}|"
+            f"{getattr(execution, 'shares', None)}|"
+            f"{getattr(execution, 'price', None)}|"
+            f"{fill_time}"
+        )
+
+    def should_process_execution(self, execution, fill_time=None):
+        execution_identity = self.get_execution_identity(execution, fill_time)
+
+        with self.trade_analysis_lock:
+            if execution_identity in self.processed_execution_ids:
+                return False, execution_identity
+            self.processed_execution_ids.add(execution_identity)
+
+        return True, execution_identity
+
+    def get_commission_identity(self, order_id, report):
+        exec_id = getattr(report, "execId", None)
+        if exec_id:
+            return f"commission_execId:{exec_id}"
+
+        return (
+            f"commission_fallback:"
+            f"{order_id}|"
+            f"{getattr(report, 'commission', None)}|"
+            f"{getattr(report, 'currency', None)}|"
+            f"{getattr(report, 'realizedPNL', None)}"
+        )
+
+    def should_process_commission(self, order_id, report):
+        commission_identity = self.get_commission_identity(order_id, report)
+
+        with self.trade_analysis_lock:
+            if commission_identity in self.processed_commission_ids:
+                return False, commission_identity
+            self.processed_commission_ids.add(commission_identity)
+
+        return True, commission_identity
+
     def calculate_execution_quality_metrics(self, record):
         entry_slippage = self.calculate_price_slippage(
             record,
@@ -450,7 +916,7 @@ class ScalpingBot:
         if record["exit_reason"] == "TP":
             target_slippage = self.calculate_price_slippage(
                 record,
-                record["exit_fill_price"],
+                record.get("tp_exit_fill_price"),
                 record["target_price"],
                 "target"
             )
@@ -458,24 +924,40 @@ class ScalpingBot:
         elif record["exit_reason"] == "SL":
             stop_slippage = self.calculate_price_slippage(
                 record,
-                record["exit_fill_price"],
+                record.get("sl_exit_fill_price"),
                 record["stop_price"],
                 "stop"
             )
             exit_slippage = stop_slippage
+        elif record["exit_reason"] == "MIXED_EXIT":
+            target_slippage = self.calculate_price_slippage(
+                record,
+                record.get("tp_exit_fill_price"),
+                record["target_price"],
+                "target"
+            )
+            stop_slippage = self.calculate_price_slippage(
+                record,
+                record.get("sl_exit_fill_price"),
+                record["stop_price"],
+                "stop"
+            )
+            tp_exit_quantity = float(record.get("tp_exit_quantity") or 0.0)
+            sl_exit_quantity = float(record.get("sl_exit_quantity") or 0.0)
+            total_exit_quantity = tp_exit_quantity + sl_exit_quantity
+            if total_exit_quantity > 0:
+                weighted_exit_slippage = 0.0
+                if target_slippage is not None and tp_exit_quantity > 0:
+                    weighted_exit_slippage += target_slippage * tp_exit_quantity
+                if stop_slippage is not None and sl_exit_quantity > 0:
+                    weighted_exit_slippage += stop_slippage * sl_exit_quantity
+                exit_slippage = round(weighted_exit_slippage / total_exit_quantity, 10)
 
         expected_gross_pnl = self.calculate_expected_gross_pnl(record)
         realized_vs_expected_gross = None
-        realized_vs_expected_net = None
 
         if expected_gross_pnl is not None:
-            if record["exit_reason"] == "SL":
-                realized_vs_expected_gross = round(record["gross_pnl"] + expected_gross_pnl, 2)
-            elif record["exit_reason"] == "TP":
-                realized_vs_expected_gross = round(record["gross_pnl"] - expected_gross_pnl, 2)
-
-        if realized_vs_expected_gross is not None:
-            realized_vs_expected_net = round(record["net_pnl"] - (record["gross_pnl"] - record["commission"]), 2)
+            realized_vs_expected_gross = round(record["gross_pnl"] - expected_gross_pnl, 2)
 
         return {
             "entry_slippage": entry_slippage,
@@ -484,7 +966,6 @@ class ScalpingBot:
             "exit_slippage": exit_slippage,
             "expected_gross_pnl": expected_gross_pnl,
             "realized_vs_expected_gross": realized_vs_expected_gross,
-            "realized_vs_expected_net": realized_vs_expected_net,
         }
 
     def build_trade_record(
@@ -506,6 +987,7 @@ class ScalpingBot:
 
         record = {
             "trade_id": trade_id,
+            "bot_stage": job.get("bot_stage", BOT_STAGE),
             "state": "SUBMITTING",
             "symbol": job["symbol"],
             "side": job["side"],
@@ -535,7 +1017,26 @@ class ScalpingBot:
             "gross_pnl": 0.0,
             "commission": 0.0,
             "net_pnl": 0.0,
-            "position_size": 1.0,
+            "intended_risk_percent": job.get("intended_risk_percent"),
+            "allowed_money_risk": job.get("allowed_money_risk"),
+            "stop_distance_points": job.get("stop_distance_points"),
+            "raw_position_size": job.get("raw_position_size"),
+            "normalized_position_size": job.get("normalized_position_size"),
+            "intended_parent_quantity": float(job.get("normalized_position_size", 0.0) or 0.0),
+            "planned_position_size": job.get("normalized_position_size", 0.0),
+            "position_size": job.get("normalized_position_size", 0.0),
+            "realized_entry_quantity": None,
+            "realized_exit_quantity": None,
+            "cumulative_entry_quantity": 0.0,
+            "cumulative_entry_notional": 0.0,
+            "cumulative_exit_quantity": 0.0,
+            "cumulative_exit_notional": 0.0,
+            "tp_exit_quantity": 0.0,
+            "tp_exit_notional": 0.0,
+            "tp_exit_fill_price": None,
+            "sl_exit_quantity": 0.0,
+            "sl_exit_notional": 0.0,
+            "sl_exit_fill_price": None,
             "anomalies": [],
             "events": [],
             "summary_logged": False,
@@ -633,7 +1134,10 @@ class ScalpingBot:
                 if not record["entry_filled"]:
                     record["state"] = "ENTRY_WORKING"
             elif status == "Filled":
-                record["state"] = "ENTRY_FILLED"
+                if record["entry_filled"]:
+                    record["state"] = "ENTRY_FILLED"
+                else:
+                    record["state"] = "ENTRY_WORKING"
             elif status in ("Cancelled", "ApiCancelled", "Inactive"):
                 if not record["entry_filled"]:
                     record["state"] = "CANCELLED"
@@ -642,9 +1146,19 @@ class ScalpingBot:
             if record["entry_filled"] and status in ("PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"):
                 record["state"] = "EXIT_WORKING"
             elif order_id == record["tp_order_id"] and status == "Filled":
-                record["state"] = "TP_FILLED"
+                if self.is_exit_fully_filled(record) and record.get("exit_reason") == "TP":
+                    record["state"] = "TP_FILLED"
+                elif self.is_exit_fully_filled(record):
+                    record["state"] = "CLOSED"
+                else:
+                    record["state"] = "EXIT_WORKING"
             elif order_id == record["sl_order_id"] and status == "Filled":
-                record["state"] = "SL_FILLED"
+                if self.is_exit_fully_filled(record) and record.get("exit_reason") == "SL":
+                    record["state"] = "SL_FILLED"
+                elif self.is_exit_fully_filled(record):
+                    record["state"] = "CLOSED"
+                else:
+                    record["state"] = "EXIT_WORKING"
 
         if current_state != record["state"]:
             self.append_trade_event(trade_id, f"STATE {current_state} -> {record['state']}")
@@ -657,14 +1171,343 @@ class ScalpingBot:
             record["anomalies"].append(message)
             self.append_trade_event(trade_id, f"ANOMALY {message}")
 
-    def has_active_trade_locked(self):
+    def contract_matches_symbol(self, contract, symbol):
+        if contract is None or not symbol:
+            return False
+
+        values = {
+            getattr(contract, "symbol", None),
+            getattr(contract, "localSymbol", None),
+            getattr(contract, "tradingClass", None),
+        }
+
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).upper()
+            if text == symbol or text.startswith(symbol):
+                return True
+
+        return False
+
+    def get_trade_broker_reality(self, record):
+        order_ids = {
+            record.get("parent_order_id"),
+            record.get("tp_order_id"),
+            record.get("sl_order_id"),
+        }
+        order_ids.discard(None)
+
+        perm_ids = {
+            record.get("parent_perm_id"),
+            record.get("tp_perm_id"),
+            record.get("sl_perm_id"),
+        }
+        perm_ids.discard(None)
+        perm_ids.discard(0)
+
+        open_trade_order_ids = []
+        open_trade_perm_ids = []
+        open_order_ids = []
+        position_sizes = []
+
+        try:
+            open_trades = self.ib.openTrades()
+            positions = self.ib.positions()
+            open_orders = self.ib.openOrders()
+        except Exception as exc:
+            logger.exception(
+                "ACTIVE LOCK BROKER REALITY CHECK FAILED | "
+                f"trade_id={record['trade_id']} symbol={record['symbol']} state={record['state']}"
+            )
+            return {
+                "broker_real": True,
+                "has_open_trade_match": False,
+                "has_open_order_match": False,
+                "has_position_match": False,
+                "matching_open_trade_order_ids": [],
+                "matching_open_trade_perm_ids": [],
+                "matching_open_order_ids": [],
+                "matching_position_sizes": [],
+                "check_failed": True,
+                "failure": str(exc),
+            }
+
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "orderStatus", None)
+            order_id = getattr(order, "orderId", None)
+            perm_id = getattr(status, "permId", None)
+
+            if order_id in order_ids:
+                open_trade_order_ids.append(order_id)
+            if perm_id in perm_ids:
+                open_trade_perm_ids.append(perm_id)
+
+        for order in open_orders:
+            order_id = getattr(order, "orderId", None)
+            perm_id = getattr(order, "permId", None)
+            if order_id in order_ids or perm_id in perm_ids:
+                if order_id is not None:
+                    open_order_ids.append(order_id)
+
+        for position in positions:
+            contract = getattr(position, "contract", None)
+            position_size = getattr(position, "position", 0)
+            if position_size and self.contract_matches_symbol(contract, record["symbol"]):
+                position_sizes.append(position_size)
+
+        has_open_trade_match = bool(open_trade_order_ids or open_trade_perm_ids)
+        has_open_order_match = bool(open_order_ids)
+        has_position_match = bool(position_sizes)
+        broker_real = has_open_trade_match or has_open_order_match or has_position_match
+
+        return {
+            "broker_real": broker_real,
+            "has_open_trade_match": has_open_trade_match,
+            "has_open_order_match": has_open_order_match,
+            "has_position_match": has_position_match,
+            "matching_open_trade_order_ids": sorted(set(open_trade_order_ids)),
+            "matching_open_trade_perm_ids": sorted(set(open_trade_perm_ids)),
+            "matching_open_order_ids": sorted(set(open_order_ids)),
+            "matching_position_sizes": position_sizes,
+            "check_failed": False,
+        }
+
+    def cleanup_stale_active_trade_lock(self, trade_id, broker_reality, reason_label):
         with self.trade_analysis_lock:
-            for record in self.trade_analysis.values():
-                if record["summary_logged"]:
-                    continue
-                if record["state"] in ACTIVE_TRADE_STATES:
-                    return True, record["trade_id"], record["symbol"], record["state"]
-            return False, None, None, None
+            record = self.trade_analysis.get(trade_id)
+            if record is None:
+                return False
+
+            if record["summary_logged"] or record["state"] not in ACTIVE_TRADE_STATES:
+                return False
+
+            previous_state = record["state"]
+            self.append_anomaly(trade_id, "STALE_ACTIVE_LOCK_CLEANED")
+            self.append_trade_event(
+                trade_id,
+                f"STALE ACTIVE LOCK CLEANUP trigger={reason_label} previous_state={previous_state}"
+            )
+            record["state"] = "INCOMPLETE"
+
+            logger.warning(
+                "STALE ACTIVE LOCK CLEANED | "
+                f"trade_id={trade_id} "
+                f"symbol={record['symbol']} "
+                f"previous_state={previous_state} "
+                f"new_state={record['state']} "
+                f"entry_filled={record['entry_filled']} "
+                f"open_trade_match={broker_reality['has_open_trade_match']} "
+                f"open_order_match={broker_reality['has_open_order_match']} "
+                f"position_match={broker_reality['has_position_match']} "
+                f"open_trade_order_ids={broker_reality['matching_open_trade_order_ids']} "
+                f"open_trade_perm_ids={broker_reality['matching_open_trade_perm_ids']} "
+                f"open_order_ids={broker_reality['matching_open_order_ids']} "
+                f"position_sizes={broker_reality['matching_position_sizes']} "
+                f"reason={reason_label}"
+            )
+
+        self.finalize_trade_if_complete(trade_id)
+        return True
+
+    def get_stage_concurrency_policy(self):
+        stage = BOT_STAGE
+
+        if stage == "TEST":
+            policy = {
+                "stage": stage,
+                "mode": "allow_all",
+                "description": "TEST allows parallel execution across all active trades",
+            }
+        elif stage == "PAPER":
+            policy = {
+                "stage": stage,
+                "mode": "per_instrument",
+                "description": "PAPER blocks only same-symbol active trade conflicts",
+            }
+        else:
+            policy = {
+                "stage": stage,
+                "mode": "global_single",
+                "description": "LIVE blocks on any real active trade globally",
+            }
+
+        logger.info(
+            "CONCURRENCY POLICY | "
+            f"stage={policy['stage']} "
+            f"mode={policy['mode']} "
+            f"description={policy['description']}"
+        )
+        return policy
+
+    def get_active_trade_candidates(self, reason_label="UNSPECIFIED"):
+        with self.trade_analysis_lock:
+            active_records = [
+                {
+                    "trade_id": record["trade_id"],
+                    "symbol": record["symbol"],
+                    "state": record["state"],
+                    "entry_filled": record["entry_filled"],
+                    "parent_order_id": record["parent_order_id"],
+                    "tp_order_id": record["tp_order_id"],
+                    "sl_order_id": record["sl_order_id"],
+                    "parent_perm_id": record["parent_perm_id"],
+                    "tp_perm_id": record["tp_perm_id"],
+                    "sl_perm_id": record["sl_perm_id"],
+                }
+                for record in self.trade_analysis.values()
+                if not record["summary_logged"] and record["state"] in ACTIVE_TRADE_STATES
+            ]
+
+        logger.info(
+            "CONCURRENCY CANDIDATES | "
+            f"reason={reason_label} "
+            f"count={len(active_records)}"
+        )
+
+        broker_real_candidates = []
+
+        for record_snapshot in active_records:
+            broker_reality = self.get_trade_broker_reality(record_snapshot)
+
+            logger.info(
+                "ACTIVE LOCK BROKER REALITY CHECK | "
+                f"trade_id={record_snapshot['trade_id']} "
+                f"symbol={record_snapshot['symbol']} "
+                f"state={record_snapshot['state']} "
+                f"entry_filled={record_snapshot['entry_filled']} "
+                f"broker_real={broker_reality['broker_real']} "
+                f"open_trade_match={broker_reality['has_open_trade_match']} "
+                f"open_order_match={broker_reality['has_open_order_match']} "
+                f"position_match={broker_reality['has_position_match']} "
+                f"open_trade_order_ids={broker_reality['matching_open_trade_order_ids']} "
+                f"open_trade_perm_ids={broker_reality['matching_open_trade_perm_ids']} "
+                f"open_order_ids={broker_reality['matching_open_order_ids']} "
+                f"position_sizes={broker_reality['matching_position_sizes']} "
+                f"check_failed={broker_reality['check_failed']} "
+                f"reason={reason_label}"
+            )
+
+            if broker_reality["broker_real"]:
+                logger.warning(
+                    "ACTIVE LOCK PRESERVED | "
+                    f"trade_id={record_snapshot['trade_id']} "
+                    f"symbol={record_snapshot['symbol']} "
+                    f"state={record_snapshot['state']} "
+                    f"reason={reason_label} "
+                    "broker-side activity still exists"
+                )
+                broker_real_candidates.append({
+                    "trade_id": record_snapshot["trade_id"],
+                    "symbol": record_snapshot["symbol"],
+                    "state": record_snapshot["state"],
+                    "entry_filled": record_snapshot["entry_filled"],
+                    "broker_reality": broker_reality,
+                })
+                continue
+
+            logger.warning(
+                "STALE ACTIVE LOCK DETECTED | "
+                f"trade_id={record_snapshot['trade_id']} "
+                f"symbol={record_snapshot['symbol']} "
+                f"state={record_snapshot['state']} "
+                f"reason={reason_label} "
+                "no matching broker-side open trade, open order, or live position"
+            )
+            self.cleanup_stale_active_trade_lock(
+                record_snapshot["trade_id"],
+                broker_reality,
+                reason_label
+            )
+
+        logger.info(
+            "CONCURRENCY CANDIDATES RESULT | "
+            f"reason={reason_label} "
+            f"broker_real_count={len(broker_real_candidates)}"
+        )
+        return broker_real_candidates
+
+    def has_conflicting_active_trade_for_job(self, job):
+        policy = self.get_stage_concurrency_policy()
+        incoming_symbol = job["symbol"]
+        active_candidates = self.get_active_trade_candidates(
+            f"CONCURRENCY_CHECK_{policy['stage']}"
+        )
+
+        if policy["mode"] == "allow_all":
+            logger.info(
+                "CONCURRENCY CHECK | "
+                f"stage={policy['stage']} "
+                f"incoming_symbol={incoming_symbol} "
+                "decision=allow "
+                "reason=test_allows_parallel_execution"
+            )
+            return False, None, policy
+
+        if policy["mode"] == "per_instrument":
+            for candidate in active_candidates:
+                if candidate["symbol"] == incoming_symbol:
+                    logger.warning(
+                        "CONCURRENCY CHECK | "
+                        f"stage={policy['stage']} "
+                        f"incoming_symbol={incoming_symbol} "
+                        f"conflicting_trade_id={candidate['trade_id']} "
+                        f"conflicting_symbol={candidate['symbol']} "
+                        f"conflicting_state={candidate['state']} "
+                        "decision=block "
+                        "reason=same_symbol_active_trade_in_paper"
+                    )
+                    return True, candidate, policy
+
+                logger.info(
+                    "CONCURRENCY CHECK | "
+                    f"stage={policy['stage']} "
+                    f"incoming_symbol={incoming_symbol} "
+                    f"conflicting_trade_id={candidate['trade_id']} "
+                    f"conflicting_symbol={candidate['symbol']} "
+                    f"conflicting_state={candidate['state']} "
+                    "decision=allow "
+                    "reason=different_symbol_in_paper"
+                )
+
+            logger.info(
+                "CONCURRENCY CHECK | "
+                f"stage={policy['stage']} "
+                f"incoming_symbol={incoming_symbol} "
+                "decision=allow "
+                "reason=no_same_symbol_conflict"
+            )
+            return False, None, policy
+
+        for candidate in active_candidates:
+            logger.warning(
+                "CONCURRENCY CHECK | "
+                f"stage={policy['stage']} "
+                f"incoming_symbol={incoming_symbol} "
+                f"conflicting_trade_id={candidate['trade_id']} "
+                f"conflicting_symbol={candidate['symbol']} "
+                f"conflicting_state={candidate['state']} "
+                "decision=block "
+                "reason=live_global_single_active_trade"
+            )
+            return True, candidate, policy
+
+        logger.info(
+            "CONCURRENCY CHECK | "
+            f"stage={policy['stage']} "
+            f"incoming_symbol={incoming_symbol} "
+            "decision=allow "
+            "reason=no_active_trade_conflict"
+        )
+        return False, None, policy
+
+    def has_active_trade_locked(self):
+        active_candidates = self.get_active_trade_candidates("LEGACY_ACTIVE_LOCK_CHECK")
+        if active_candidates:
+            candidate = active_candidates[0]
+            return True, candidate["trade_id"], candidate["symbol"], candidate["state"]
+        return False, None, None, None
 
     def update_trade_from_status(self, trade):
         try:
@@ -695,6 +1538,9 @@ class ScalpingBot:
             ):
                 self.aggregate_stats["cancelled_count"] += 1
                 self.finalize_trade_if_complete(trade_id)
+
+            if state in ("Cancelled", "ApiCancelled", "Inactive") and record["state"] in ACTIVE_TRADE_STATES:
+                self.get_active_trade_candidates("STATUS_CANCEL_CLEANUP")
         except Exception:
             logger.exception("TRADE STATUS ANALYSIS FAILED")
 
@@ -702,17 +1548,86 @@ class ScalpingBot:
         if record["entry_fill_price"] is None or record["exit_fill_price"] is None:
             return 0.0
 
-        mult_map = {
-            "MES": 5.0,
-            "MNQ": 2.0,
-            "FDXM": 5.0,
-            "M6E": 12500.0,
-        }
-        multiplier = mult_map.get(record["symbol"], 1.0)
+        multiplier = self.get_point_value(record["symbol"])
+        entry_fill_price = record["entry_fill_price"]
+        total_gross_pnl = 0.0
 
-        if record["side"] == "long":
-            return round((record["exit_fill_price"] - record["entry_fill_price"]) * multiplier, 2)
-        return round((record["entry_fill_price"] - record["exit_fill_price"]) * multiplier, 2)
+        for exit_price_field, exit_quantity_field in (
+            ("tp_exit_fill_price", "tp_exit_quantity"),
+            ("sl_exit_fill_price", "sl_exit_quantity"),
+        ):
+            exit_fill_price = record.get(exit_price_field)
+            exit_quantity = float(record.get(exit_quantity_field) or 0.0)
+
+            if exit_fill_price is None or exit_quantity <= 0:
+                continue
+
+            if record["side"] == "long":
+                total_gross_pnl += (exit_fill_price - entry_fill_price) * multiplier * exit_quantity
+            else:
+                total_gross_pnl += (entry_fill_price - exit_fill_price) * multiplier * exit_quantity
+
+        return round(total_gross_pnl, 2)
+
+    def normalize_fill_quantity(self, shares):
+        try:
+            if shares is None:
+                return None
+            quantity = abs(float(shares))
+            if quantity <= 0:
+                return None
+            return quantity
+        except Exception:
+            return None
+
+    def accumulate_quantity_and_notional(self, record, quantity_field, notional_field, price_field, quantity, price):
+        if quantity is None or price is None or quantity <= 0:
+            return
+
+        cumulative_quantity = float(record.get(quantity_field) or 0.0) + quantity
+        cumulative_notional = float(record.get(notional_field) or 0.0) + (quantity * price)
+
+        record[quantity_field] = cumulative_quantity
+        record[notional_field] = cumulative_notional
+        record[price_field] = round(cumulative_notional / cumulative_quantity, 10)
+
+    def is_entry_fully_filled(self, record):
+        intended_parent_quantity = float(record.get("intended_parent_quantity") or 0.0)
+        cumulative_entry_quantity = float(record.get("cumulative_entry_quantity") or 0.0)
+        return intended_parent_quantity > 0 and cumulative_entry_quantity >= intended_parent_quantity
+
+    def is_exit_fully_filled(self, record):
+        if not record.get("entry_filled"):
+            return False
+        realized_entry_quantity = float(record.get("realized_entry_quantity") or 0.0)
+        cumulative_exit_quantity = float(record.get("cumulative_exit_quantity") or 0.0)
+        return realized_entry_quantity > 0 and cumulative_exit_quantity >= realized_entry_quantity
+
+    def derive_completed_exit_reason(self, record):
+        tp_exit_quantity = float(record.get("tp_exit_quantity") or 0.0)
+        sl_exit_quantity = float(record.get("sl_exit_quantity") or 0.0)
+
+        if tp_exit_quantity > 0 and sl_exit_quantity > 0:
+            self.append_anomaly(record["trade_id"], "MIXED_EXIT_CHILD_FILLS")
+            return "MIXED_EXIT"
+        if tp_exit_quantity > 0:
+            return "TP"
+        if sl_exit_quantity > 0:
+            return "SL"
+        return None
+
+    def get_effective_trade_quantity(self, record):
+        realized_entry_quantity = record.get("realized_entry_quantity")
+        realized_exit_quantity = record.get("realized_exit_quantity")
+        planned_position_size = float(record.get("planned_position_size") or 0.0)
+
+        if realized_entry_quantity is not None and realized_exit_quantity is not None:
+            return min(realized_entry_quantity, realized_exit_quantity)
+        if realized_entry_quantity is not None:
+            return realized_entry_quantity
+        if realized_exit_quantity is not None:
+            return realized_exit_quantity
+        return planned_position_size
 
     def finalize_trade_if_complete(self, trade_id):
         with self.trade_analysis_lock:
@@ -720,13 +1635,23 @@ class ScalpingBot:
             if record is None:
                 return
             if record["summary_logged"]:
+                logger.info(
+                    "FINALIZE SKIPPED | "
+                    f"trade_id={trade_id} reason=already_finalized "
+                    f"state={record['state']} closed={record['closed']}"
+                )
                 return
 
             ready = False
 
-            if record["entry_filled"] and record["exit_fill_price"] is not None and record["exit_reason"] in ("TP", "SL"):
+            if self.is_exit_fully_filled(record) and record["exit_fill_price"] is not None:
+                record["exit_reason"] = self.derive_completed_exit_reason(record)
+                ready = record["exit_reason"] in ("TP", "SL", "MIXED_EXIT")
+            elif record["entry_filled"] and record["exit_fill_price"] is not None and record["exit_reason"] in ("TP", "SL", "MIXED_EXIT"):
                 ready = True
-            elif not record["entry_filled"] and record["state"] in ("CANCELLED", "REJECTED", "INCOMPLETE"):
+            elif record["state"] == "INCOMPLETE":
+                ready = True
+            elif not record["entry_filled"] and record["state"] in ("CANCELLED", "REJECTED"):
                 ready = True
 
             if not ready:
@@ -745,6 +1670,13 @@ class ScalpingBot:
                     self.aggregate_stats["tp_count"] += 1
                 elif record["exit_reason"] == "SL":
                     self.aggregate_stats["sl_count"] += 1
+                    if record.get("bot_stage") == "LIVE":
+                        self.activate_live_daily_sl_stop(
+                            record["trade_id"],
+                            record["exit_fill_time"]
+                        )
+                elif record["exit_reason"] == "MIXED_EXIT":
+                    self.aggregate_stats["mixed_exit_count"] += 1
             else:
                 if record["state"] == "INCOMPLETE":
                     self.aggregate_stats["incomplete_count"] += 1
@@ -766,6 +1698,14 @@ class ScalpingBot:
                 f"side={record['side']} "
                 f"grade={record['grade']} "
                 f"det_classification={record['det_classification']} "
+                f"planned_position_size={record['planned_position_size']} "
+                f"intended_parent_quantity={record['intended_parent_quantity']} "
+                f"cumulative_entry_quantity={record['cumulative_entry_quantity']} "
+                f"cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                f"realized_entry_quantity={record['realized_entry_quantity']} "
+                f"realized_exit_quantity={record['realized_exit_quantity']} "
+                f"allowed_money_risk={record['allowed_money_risk']} "
+                f"stop_distance_points={record['stop_distance_points']} "
                 f"parent_order_id={record['parent_order_id']} "
                 f"signal_price={record['entry_signal_price']} "
                 f"spread_adjusted_entry={record['entry_spread_adjusted']} "
@@ -800,7 +1740,6 @@ class ScalpingBot:
                 f"exit_slippage={execution_metrics['exit_slippage']} "
                 f"expected_gross_pnl={execution_metrics['expected_gross_pnl']} "
                 f"realized_vs_expected_gross={execution_metrics['realized_vs_expected_gross']} "
-                f"realized_vs_expected_net={execution_metrics['realized_vs_expected_net']} "
                 f"fill_latency_sec={duration_to_fill} "
                 f"time_in_trade_sec={duration_in_trade}"
             )
@@ -812,6 +1751,7 @@ class ScalpingBot:
                 f"filled_trades={self.aggregate_stats['filled_trades']} "
                 f"tp_count={self.aggregate_stats['tp_count']} "
                 f"sl_count={self.aggregate_stats['sl_count']} "
+                f"mixed_exit_count={self.aggregate_stats['mixed_exit_count']} "
                 f"cancelled_count={self.aggregate_stats['cancelled_count']} "
                 f"rejected_count={self.aggregate_stats['rejected_count']} "
                 f"incomplete_count={self.aggregate_stats['incomplete_count']} "
@@ -826,43 +1766,207 @@ class ScalpingBot:
             order_id = getattr(execution, "orderId", None)
             price = getattr(execution, "price", None)
             fill_time = getattr(fill, "time", None)
+            realized_quantity = self.normalize_fill_quantity(getattr(execution, "shares", None))
+            should_process, execution_identity = self.should_process_execution(execution, fill_time)
 
             trade_id, record = self.get_trade_by_order_id(order_id)
             if record is None:
                 return
 
+            if not should_process:
+                self.append_trade_event(
+                    trade_id,
+                    f"DUPLICATE EXECUTION IGNORED execution_identity={execution_identity} orderId={order_id}"
+                )
+                logger.info(
+                    "DUPLICATE EXECUTION IGNORED | "
+                    f"trade_id={trade_id} execution_identity={execution_identity} order_id={order_id}"
+                )
+                return
+
             self.append_trade_event(
                 trade_id,
-                f"FILL orderId={order_id} side={getattr(execution, 'side', None)} "
-                f"shares={getattr(execution, 'shares', None)} price={price}"
+                f"FILL execution_identity={execution_identity} orderId={order_id} "
+                f"side={getattr(execution, 'side', None)} shares={getattr(execution, 'shares', None)} "
+                f"normalized_quantity={realized_quantity} price={price}"
             )
 
             if order_id == record["parent_order_id"]:
-                record["entry_fill_price"] = price
                 record["entry_fill_time"] = fill_time
-                record["entry_filled"] = True
-                record["state"] = "ENTRY_FILLED"
-                self.aggregate_stats["filled_trades"] += 1
+                previously_entry_filled = record["entry_filled"]
+                self.accumulate_quantity_and_notional(
+                    record,
+                    "cumulative_entry_quantity",
+                    "cumulative_entry_notional",
+                    "entry_fill_price",
+                    realized_quantity,
+                    price
+                )
+                if self.is_entry_fully_filled(record):
+                    record["realized_entry_quantity"] = float(record.get("cumulative_entry_quantity") or 0.0)
+                    record["entry_filled"] = True
+                    record["state"] = "ENTRY_FILLED"
+                    if not previously_entry_filled:
+                        self.aggregate_stats["filled_trades"] += 1
+                        self.append_trade_event(
+                            trade_id,
+                            f"ENTRY FULLY FILLED quantity={record['realized_entry_quantity']} "
+                            f"avg_fill={record['entry_fill_price']}"
+                        )
+                        logger.info(
+                            "ENTRY FULLY FILLED | "
+                            f"trade_id={trade_id} quantity={record['realized_entry_quantity']} "
+                            f"intended_parent_quantity={record['intended_parent_quantity']} "
+                            f"entry_fill_price={record['entry_fill_price']}"
+                        )
+                else:
+                    record["state"] = "ENTRY_WORKING"
+                    self.append_trade_event(
+                        trade_id,
+                        f"ENTRY PARTIAL FILL cumulative_quantity={record['cumulative_entry_quantity']} "
+                        f"intended_parent_quantity={record['intended_parent_quantity']} "
+                        f"avg_fill={record['entry_fill_price']}"
+                    )
+                    logger.info(
+                        "ENTRY PARTIAL FILL | "
+                        f"trade_id={trade_id} cumulative_quantity={record['cumulative_entry_quantity']} "
+                        f"intended_parent_quantity={record['intended_parent_quantity']} "
+                        f"entry_fill_price={record['entry_fill_price']}"
+                    )
             elif order_id == record["tp_order_id"]:
-                record["exit_fill_price"] = price
                 record["exit_fill_time"] = fill_time
-                record["exit_reason"] = "TP"
-                record["state"] = "TP_FILLED"
+                self.accumulate_quantity_and_notional(
+                    record,
+                    "cumulative_exit_quantity",
+                    "cumulative_exit_notional",
+                    "exit_fill_price",
+                    realized_quantity,
+                    price
+                )
+                self.accumulate_quantity_and_notional(
+                    record,
+                    "tp_exit_quantity",
+                    "tp_exit_notional",
+                    "tp_exit_fill_price",
+                    realized_quantity,
+                    price
+                )
+                if self.is_exit_fully_filled(record):
+                    record["realized_exit_quantity"] = float(record.get("cumulative_exit_quantity") or 0.0)
+                    record["exit_reason"] = self.derive_completed_exit_reason(record)
+                    record["state"] = "TP_FILLED" if record["exit_reason"] == "TP" else "CLOSED"
+                    self.append_trade_event(
+                        trade_id,
+                        f"EXIT FULLY FILLED exit_reason={record['exit_reason']} "
+                        f"cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill={record['exit_fill_price']}"
+                    )
+                    logger.info(
+                        "EXIT FULLY FILLED | "
+                        f"trade_id={trade_id} exit_reason={record['exit_reason']} "
+                        f"cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record['realized_entry_quantity']} "
+                        f"exit_fill_price={record['exit_fill_price']}"
+                    )
+                else:
+                    record["state"] = "EXIT_WORKING"
+                    self.append_trade_event(
+                        trade_id,
+                        f"EXIT PARTIAL FILL cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record.get('realized_entry_quantity')} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill={record['exit_fill_price']}"
+                    )
+                    logger.info(
+                        "EXIT PARTIAL FILL | "
+                        f"trade_id={trade_id} cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record.get('realized_entry_quantity')} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill_price={record['exit_fill_price']}"
+                    )
             elif order_id == record["sl_order_id"]:
-                record["exit_fill_price"] = price
                 record["exit_fill_time"] = fill_time
-                record["exit_reason"] = "SL"
-                record["state"] = "SL_FILLED"
+                self.accumulate_quantity_and_notional(
+                    record,
+                    "cumulative_exit_quantity",
+                    "cumulative_exit_notional",
+                    "exit_fill_price",
+                    realized_quantity,
+                    price
+                )
+                self.accumulate_quantity_and_notional(
+                    record,
+                    "sl_exit_quantity",
+                    "sl_exit_notional",
+                    "sl_exit_fill_price",
+                    realized_quantity,
+                    price
+                )
+                if self.is_exit_fully_filled(record):
+                    record["realized_exit_quantity"] = float(record.get("cumulative_exit_quantity") or 0.0)
+                    record["exit_reason"] = self.derive_completed_exit_reason(record)
+                    record["state"] = "SL_FILLED" if record["exit_reason"] == "SL" else "CLOSED"
+                    self.append_trade_event(
+                        trade_id,
+                        f"EXIT FULLY FILLED exit_reason={record['exit_reason']} "
+                        f"cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill={record['exit_fill_price']}"
+                    )
+                    logger.info(
+                        "EXIT FULLY FILLED | "
+                        f"trade_id={trade_id} exit_reason={record['exit_reason']} "
+                        f"cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record['realized_entry_quantity']} "
+                        f"exit_fill_price={record['exit_fill_price']}"
+                    )
+                else:
+                    record["state"] = "EXIT_WORKING"
+                    self.append_trade_event(
+                        trade_id,
+                        f"EXIT PARTIAL FILL cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record.get('realized_entry_quantity')} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill={record['exit_fill_price']}"
+                    )
+                    logger.info(
+                        "EXIT PARTIAL FILL | "
+                        f"trade_id={trade_id} cumulative_exit_quantity={record['cumulative_exit_quantity']} "
+                        f"realized_entry_quantity={record.get('realized_entry_quantity')} "
+                        f"tp_exit_quantity={record['tp_exit_quantity']} sl_exit_quantity={record['sl_exit_quantity']} "
+                        f"exit_fill_price={record['exit_fill_price']}"
+                    )
+
+            if record.get("exit_reason") == "MIXED_EXIT":
+                self.append_trade_event(
+                    trade_id,
+                    f"MIXED EXIT DETECTED tp_exit_quantity={record['tp_exit_quantity']} "
+                    f"sl_exit_quantity={record['sl_exit_quantity']}"
+                )
+                logger.warning(
+                    "MIXED EXIT DETECTED | "
+                    f"trade_id={trade_id} tp_exit_quantity={record['tp_exit_quantity']} "
+                    f"sl_exit_quantity={record['sl_exit_quantity']}"
+                )
 
             self.finalize_trade_if_complete(trade_id)
         except Exception:
             logger.exception("TRADE FILL ANALYSIS FAILED")
 
-    def update_trade_commission(self, trade, fill):
+    def update_trade_commission(self, trade, fill, report=None):
         try:
             order_id = getattr(fill.execution, "orderId", None)
-            report = getattr(fill, "commissionReport", None)
             if report is None:
+                report = getattr(fill, "commissionReport", None)
+            if report is None:
+                return
+            should_process, commission_identity = self.should_process_commission(order_id, report)
+            if not should_process:
+                logger.info(
+                    "DUPLICATE COMMISSION IGNORED | "
+                    f"order_id={order_id} commission_identity={commission_identity}"
+                )
                 return
 
             commission = float(getattr(report, "commission", 0.0) or 0.0)
@@ -871,7 +1975,42 @@ class ScalpingBot:
                 return
 
             record["commission"] = round(record["commission"] + commission, 2)
-            self.append_trade_event(trade_id, f"COMMISSION orderId={order_id} commission={commission}")
+            self.append_trade_event(
+                trade_id,
+                f"COMMISSION orderId={order_id} commission={commission} "
+                f"commission_identity={commission_identity}"
+            )
+
+            if record["summary_logged"]:
+                previous_net_pnl = record["net_pnl"]
+                if record["closed"]:
+                    record["net_pnl"] = round(record["gross_pnl"] - record["commission"], 2)
+                    self.aggregate_stats["commission"] = round(self.aggregate_stats["commission"] + commission, 2)
+                    self.aggregate_stats["net_pnl"] = round(
+                        self.aggregate_stats["net_pnl"] + (record["net_pnl"] - previous_net_pnl),
+                        2
+                    )
+                    self.append_trade_event(
+                        trade_id,
+                        f"LATE COMMISSION APPLIED commission={commission} "
+                        f"net_pnl={record['net_pnl']}"
+                    )
+                    logger.info(
+                        "LATE COMMISSION APPLIED | "
+                        f"trade_id={trade_id} commission={commission} "
+                        f"commission_identity={commission_identity} net_pnl={record['net_pnl']}"
+                    )
+                else:
+                    self.append_trade_event(
+                        trade_id,
+                        f"LATE COMMISSION RECORDED commission={commission}"
+                    )
+                    logger.info(
+                        "LATE COMMISSION RECORDED | "
+                        f"trade_id={trade_id} commission={commission} "
+                        f"commission_identity={commission_identity} closed={record['closed']}"
+                    )
+                return
 
             self.finalize_trade_if_complete(trade_id)
         except Exception:
@@ -904,6 +2043,9 @@ class ScalpingBot:
                     self.finalize_trade_if_complete(trade_id)
                 else:
                     self.append_anomaly(trade_id, f"CHILD_CANCELLED_{req_id}")
+
+            if error_code == 202 and record["state"] in ACTIVE_TRADE_STATES:
+                self.get_active_trade_candidates("ERROR_202_CANCEL_CLEANUP")
         except Exception:
             logger.exception("TRADE ERROR ANALYSIS FAILED")
 
@@ -1323,6 +2465,9 @@ class ScalpingBot:
         }
 
         normalized["candidate_side"] = normalized["candidate_side"] or normalized["side"]
+        normalized["side_hint"] = normalized["candidate_side"] or normalized["side"]
+        normalized["observations"] = normalized["bot_observations"]
+        normalized["pine_legacy_debug"] = normalized["pine_semantic_non_authority"]
         normalized["execution_ready"] = (
             payload_format == "legacy_execution" and
             bool(normalized["symbol"]) and
@@ -1434,6 +2579,25 @@ class ScalpingBot:
             f"reason_flags={normalized['reason_flags']}"
         )
 
+    def build_observation_layer(self, normalized_signal):
+        symbol = normalized_signal["symbol"]
+        market_profile = symbol or "unknown"
+        setup_profile = "default"
+
+        return {
+            "market_profile": market_profile,
+            "setup_profile": setup_profile,
+            "symbol": normalized_signal["symbol"],
+            "timeframe": normalized_signal["timeframe"],
+            "session_name": normalized_signal["session_name"],
+            "minutes_from_open": normalized_signal["minutes_from_open"],
+            "price": normalized_signal["price"],
+            "observations": normalized_signal["observations"],
+            "side_hint": normalized_signal["side_hint"],
+            "pine_legacy_debug": normalized_signal["pine_legacy_debug"],
+            "normalized_signal": normalized_signal,
+        }
+
     def evaluate_stage_execution_policy(self, normalized):
         stage = BOT_STAGE
         payload_format = normalized["payload_format"]
@@ -1445,18 +2609,18 @@ class ScalpingBot:
         allow_queue = False
 
         if payload_format == "enriched_candidate":
-            if stage == "TEST":
-                policy_branch = "future_det_gated_execution_test_enabled"
+            if stage in {"TEST", "PAPER", "LIVE"}:
+                policy_branch = "det_gated_execution_enabled"
                 allow_queue = True
                 policy_reason = (
-                    "DET-gated execution is enabled for TEST only; "
+                    "DET-gated execution is enabled for TEST, PAPER, and LIVE; "
                     "enriched candidates may execute if DET gate permits"
                 )
             else:
-                policy_branch = "future_det_gated_execution_restricted"
+                policy_branch = "det_gated_execution_unknown_stage_disabled"
                 allow_queue = False
                 policy_reason = (
-                    "DET-gated execution remains disabled for PAPER/LIVE in this patch"
+                    "DET-gated execution disabled because stage is not recognized for execution"
                 )
         elif payload_format == "legacy_execution":
             policy_branch = "legacy_execution_deprecated"
@@ -1468,12 +2632,22 @@ class ScalpingBot:
         else:
             policy_branch = "classification_only"
 
-        return {
+        policy = {
             "stage": stage,
             "policy_branch": policy_branch,
             "allow_queue": allow_queue,
+            "execution_enabled": allow_queue,
             "reason": policy_reason,
         }
+        logger.info(
+            "STAGE EXECUTION POLICY | "
+            f"stage={policy['stage']} "
+            f"payload_format={payload_format} "
+            f"execution_enabled={policy['execution_enabled']} "
+            f"policy_branch={policy['policy_branch']} "
+            f"reason={policy['reason']}"
+        )
+        return policy
 
     def assess_det_context(self, normalized):
         """Bot-side context assessment derived from observations."""
@@ -1630,7 +2804,7 @@ class ScalpingBot:
         has_anchors = structure_anchor_low is not None and structure_anchor_high is not None
         has_trigger_bar = trigger_bar_low is not None and trigger_bar_high is not None
         
-        # Structure quality - P058: More DET-meaningful assessment
+        # Structure quality: more DET-meaningful assessment
         structure_quality = "poor"
         
         # Strong: Clear structural support with anchor respect and sweep/rejection evidence
@@ -1667,7 +2841,7 @@ class ScalpingBot:
             "rejection_detected": rejection_detected,
         }
         
-        logger.info(f"P058 STRUCTURE ASSESSMENT: {structure_state} (side={side})")
+        logger.info(f"BOT STRUCTURE ASSESSMENT | state={structure_state} side={side}")
         return structure_state
 
     def assess_det_trigger(self, normalized, context_state, structure_state):
@@ -1737,6 +2911,107 @@ class ScalpingBot:
         return trigger_state
 
     def assess_det_signal(self, normalized):
+        observation_layer = self.build_observation_layer(normalized)
+        return self.assess_truth(
+            observation_layer,
+            observation_layer["market_profile"],
+            observation_layer["setup_profile"]
+        )
+
+    def derive_truth_plan_models(self, normalized, derived_side):
+        obs = normalized["bot_observations"]
+        entry_reference_price = obs.get("entry_reference_price")
+        price = obs.get("price")
+
+        if entry_reference_price is not None:
+            derived_entry_model = "reference_price"
+            entry_basis_price = entry_reference_price
+        elif price is not None:
+            derived_entry_model = "price"
+            entry_basis_price = price
+        else:
+            derived_entry_model = None
+            entry_basis_price = None
+
+        anchor_value = None
+        trigger_value = None
+        anchor_relevant = False
+        trigger_relevant = False
+
+        if derived_side == "long":
+            anchor_value = obs.get("structure_anchor_low")
+            trigger_value = obs.get("trigger_bar_low")
+            if anchor_value is not None and entry_basis_price is not None and anchor_value < entry_basis_price:
+                anchor_relevant = True
+            if trigger_value is not None and entry_basis_price is not None and trigger_value < entry_basis_price:
+                trigger_relevant = True
+        elif derived_side == "short":
+            anchor_value = obs.get("structure_anchor_high")
+            trigger_value = obs.get("trigger_bar_high")
+            if anchor_value is not None and entry_basis_price is not None and anchor_value > entry_basis_price:
+                anchor_relevant = True
+            if trigger_value is not None and entry_basis_price is not None and trigger_value > entry_basis_price:
+                trigger_relevant = True
+
+        if anchor_relevant and trigger_relevant:
+            derived_invalidation_model = "structure_anchor_or_trigger_bar"
+            derived_stop_model = "anchor_based"
+            invalidation_basis_quality = "strong"
+            stop_basis_quality = "strong"
+        elif anchor_relevant:
+            derived_invalidation_model = "structure_anchor"
+            derived_stop_model = "anchor_based"
+            invalidation_basis_quality = "strong"
+            stop_basis_quality = "strong"
+        elif trigger_relevant:
+            derived_invalidation_model = "trigger_bar"
+            derived_stop_model = "trigger_bar_based"
+            invalidation_basis_quality = "acceptable"
+            stop_basis_quality = "acceptable"
+        else:
+            derived_invalidation_model = "fallback_invalidation"
+            derived_stop_model = "fallback_stop"
+            invalidation_basis_quality = "weak"
+            stop_basis_quality = "weak"
+
+        if derived_stop_model == "fallback_stop":
+            derived_target_model = "fallback_2r"
+            target_basis_quality = "weak"
+        else:
+            derived_target_model = "fixed_2r"
+            target_basis_quality = "acceptable"
+
+        logger.info(
+            "BOT PLAN MODELS | "
+            f"side={derived_side} "
+            f"entry_model={derived_entry_model} "
+            f"invalidation_model={derived_invalidation_model} "
+            f"stop_model={derived_stop_model} "
+            f"target_model={derived_target_model} "
+            f"anchor_relevant={anchor_relevant} "
+            f"trigger_relevant={trigger_relevant} "
+            f"entry_basis_price={entry_basis_price} "
+            f"anchor_value={anchor_value} "
+            f"trigger_value={trigger_value}"
+        )
+
+        return {
+            "derived_entry_model": derived_entry_model,
+            "derived_invalidation_model": derived_invalidation_model,
+            "derived_stop_model": derived_stop_model,
+            "derived_target_model": derived_target_model,
+            "entry_basis_price": entry_basis_price,
+            "anchor_value": anchor_value,
+            "trigger_value": trigger_value,
+            "anchor_relevant": anchor_relevant,
+            "trigger_relevant": trigger_relevant,
+            "invalidation_basis_quality": invalidation_basis_quality,
+            "stop_basis_quality": stop_basis_quality,
+            "target_basis_quality": target_basis_quality,
+        }
+
+    def assess_truth(self, observation_layer, market_profile, setup_profile):
+        normalized = observation_layer["normalized_signal"]
         obs = normalized["bot_observations"]
         hints = normalized["weak_transition_hints"]
         semantic = normalized["pine_semantic_non_authority"]
@@ -1746,7 +3021,7 @@ class ScalpingBot:
         soft_blockers = []
         secondary_reasons = []
 
-        # P058: Bot-side DET assessments derived from categorized normalized data
+        # Bot-side DET assessments derived from categorized normalized data
         context_state = self.assess_det_context(normalized)
         structure_state = self.assess_det_structure(normalized, context_state)
         trigger_state = self.assess_det_trigger(normalized, context_state, structure_state)
@@ -1836,9 +3111,195 @@ class ScalpingBot:
         pine_structure_valid = semantic.get("structure_valid")
         pine_body_strength_valid = semantic.get("body_strength_valid")
 
-        logger.info(f"P058 DET CLASSIFICATION: {det_classification} -> {primary_reason} (hard={hard_blockers}, soft={soft_blockers})")
+        derived_side = side or observation_layer["side_hint"]
+        plan_models = self.derive_truth_plan_models(normalized, derived_side)
+        has_entry_basis = plan_models["derived_entry_model"] is not None
+        has_invalidation_basis = plan_models["derived_invalidation_model"] != "fallback_invalidation"
+
+        if context_state["session_state"] == "invalid" or context_state["chop_state"] == "choppy":
+            regime_truth = "invalid"
+        elif (
+            context_state["bias_state"] == "aligned" and
+            context_state["late_state"] == "not_late" and
+            context_state["departure_state"] == "not_departed"
+        ):
+            regime_truth = "strong"
+        else:
+            regime_truth = "usable"
+
+        if context_state["vwap_state"] == "unknown" or context_state["bias_state"] == "conflicting":
+            vwap_truth = "weak"
+        elif (
+            context_state["bias_state"] == "aligned" and
+            context_state["vwap_state"] in ("above", "below") and
+            context_state["departure_state"] == "not_departed"
+        ):
+            vwap_truth = "strong"
+        else:
+            vwap_truth = "aligned"
+
+        if context_state["chop_state"] == "choppy" or context_state["bias_state"] == "conflicting":
+            context_5m_truth = "dirty"
+        elif (
+            context_state["bias_state"] == "aligned" and
+            context_state["late_state"] == "not_late" and
+            context_state["departure_state"] == "not_departed"
+        ):
+            context_5m_truth = "strong"
+        elif context_state["bias_state"] == "aligned":
+            context_5m_truth = "clean"
+        else:
+            context_5m_truth = "mixed"
+
+        minutes_from_open = observation_layer["minutes_from_open"]
+        if context_state["late_state"] == "late":
+            timing_truth = "late"
+        elif minutes_from_open is not None and 0 <= minutes_from_open <= 45:
+            timing_truth = "early"
+        else:
+            timing_truth = "acceptable"
+
+        if (
+            structure_state["structure_quality"] == "strong" and
+            structure_state.get("has_anchors") and
+            structure_state.get("has_trigger_bar")
+        ):
+            structure_1m_truth = "strong"
+        elif structure_state["structure_quality"] == "strong":
+            structure_1m_truth = "clean"
+        elif structure_state["structure_quality"] == "moderate":
+            structure_1m_truth = "usable"
+        elif structure_state["structure_quality"] == "weak":
+            structure_1m_truth = "weak"
+        else:
+            structure_1m_truth = "weak"
+
+        trigger_effectively_absent = (
+            trigger_state["trigger_quality"] == "weak" and
+            trigger_state.get("strong_signals", 0) == 0 and
+            not trigger_state.get("reacceleration_1m_ok") and
+            not trigger_state.get("structure_1m_ok") and
+            not trigger_state.get("rejection_detected")
+        )
+
+        if trigger_effectively_absent:
+            trigger_truth = "false"
+        elif trigger_state["trigger_quality"] == "strong":
+            trigger_truth = "strong"
+        elif trigger_state["trigger_quality"] == "moderate":
+            trigger_truth = "valid"
+        else:
+            trigger_truth = "weak"
+
+        if (
+            regime_truth == "invalid" or
+            not derived_side or
+            context_5m_truth == "dirty" or
+            structure_1m_truth == "weak" or
+            trigger_truth == "false"
+        ):
+            setup_truth = "false"
+        elif (
+            regime_truth == "strong" and
+            vwap_truth == "strong" and
+            context_5m_truth == "strong" and
+            structure_1m_truth in {"clean", "strong"} and
+            trigger_truth == "strong"
+        ):
+            setup_truth = "strong"
+        elif (
+            regime_truth in {"usable", "strong"} and
+            vwap_truth in {"aligned", "strong"} and
+            context_5m_truth in {"clean", "strong"} and
+            structure_1m_truth in {"usable", "clean", "strong"} and
+            trigger_truth in {"valid", "strong"}
+        ):
+            setup_truth = "valid"
+        else:
+            setup_truth = "weak"
+
+        has_stop_model = plan_models["derived_stop_model"] in {"anchor_based", "trigger_bar_based", "fallback_stop"}
+        has_target_model = plan_models["derived_target_model"] in {"fixed_2r", "fallback_2r"}
+
+        if (
+            not derived_side or
+            not has_entry_basis or
+            not has_invalidation_basis or
+            not has_stop_model or
+            not has_target_model
+        ):
+            trade_plan_truth = "false"
+        elif (
+            setup_truth == "strong" and
+            plan_models["invalidation_basis_quality"] == "strong" and
+            plan_models["stop_basis_quality"] == "strong" and
+            plan_models["target_basis_quality"] == "acceptable"
+        ):
+            trade_plan_truth = "strong"
+        elif (
+            setup_truth in {"valid", "strong"} and
+            plan_models["invalidation_basis_quality"] in {"acceptable", "strong"} and
+            plan_models["stop_basis_quality"] in {"acceptable", "strong"} and
+            plan_models["target_basis_quality"] == "acceptable"
+        ):
+            trade_plan_truth = "valid"
+        else:
+            trade_plan_truth = "weak"
+
+        if (
+            trade_plan_truth == "false" or
+            trigger_truth == "false" or
+            structure_1m_truth == "weak" or
+            plan_models["invalidation_basis_quality"] == "weak" or
+            plan_models["target_basis_quality"] == "weak"
+        ):
+            r_truth = "poor"
+        elif (
+            trade_plan_truth in {"valid", "strong"} and
+            setup_truth == "strong" and
+            structure_1m_truth == "strong" and
+            trigger_truth == "strong" and
+            plan_models["stop_basis_quality"] == "strong" and
+            plan_models["target_basis_quality"] == "acceptable" and
+            timing_truth in {"early", "acceptable"} and
+            vwap_truth == "strong"
+        ):
+            r_truth = "efficient"
+        elif (
+            trade_plan_truth in {"valid", "strong"} and
+            plan_models["stop_basis_quality"] in {"acceptable", "strong"} and
+            trigger_truth in {"valid", "strong"} and
+            timing_truth in {"early", "acceptable"}
+        ):
+            r_truth = "acceptable"
+        else:
+            r_truth = "poor"
 
         return {
+            "market_profile": market_profile,
+            "setup_profile": setup_profile,
+            "regime_truth": regime_truth,
+            "vwap_truth": vwap_truth,
+            "context_5m_truth": context_5m_truth,
+            "structure_1m_truth": structure_1m_truth,
+            "setup_truth": setup_truth,
+            "trigger_truth": trigger_truth,
+            "timing_truth": timing_truth,
+            "trade_plan_truth": trade_plan_truth,
+            "r_truth": r_truth,
+            "derived_side": derived_side,
+            "derived_entry_model": plan_models["derived_entry_model"],
+            "derived_invalidation_model": plan_models["derived_invalidation_model"],
+            "derived_stop_model": plan_models["derived_stop_model"],
+            "derived_target_model": plan_models["derived_target_model"],
+            "hard_blockers": list(dict.fromkeys(hard_blockers)),
+            "soft_blockers": list(dict.fromkeys(soft_blockers)),
+            "primary_reason": primary_reason,
+            "secondary_reasons": list(dict.fromkeys(secondary_reasons)),
+            "legacy_det_classification": det_classification,
+            "bot_context_state": context_state,
+            "bot_structure_state": structure_state,
+            "bot_trigger_state": trigger_state,
             "session_valid": context_state["session_state"] == "valid",
             "vwap_bias_valid": context_state["bias_state"] != "conflicting",
             "structure_valid": structure_state["structure_quality"] != "poor",
@@ -1846,27 +3307,81 @@ class ScalpingBot:
             "pine_trigger_valid": pine_trigger_valid,
             "pine_structure_valid": pine_structure_valid,
             "pine_body_strength_valid": pine_body_strength_valid,
-            "hard_blockers": list(dict.fromkeys(hard_blockers)),
-            "soft_blockers": list(dict.fromkeys(soft_blockers)),
-            "primary_reason": primary_reason,
-            "secondary_reasons": list(dict.fromkeys(secondary_reasons)),
-            "det_classification": det_classification,
-            "bot_context_state": context_state,
-            "bot_structure_state": structure_state,
-            "bot_trigger_state": trigger_state,
         }
 
+    def classify_truth(self, truth_assessment):
+        hard_blockers = truth_assessment["hard_blockers"]
+        soft_blockers = truth_assessment["soft_blockers"]
+
+        if hard_blockers:
+            truth_classification = "REJECT"
+        else:
+            a_plus_criteria = (
+                truth_assessment["regime_truth"] == "strong" and
+                truth_assessment["vwap_truth"] == "strong" and
+                truth_assessment["context_5m_truth"] == "strong" and
+                truth_assessment["structure_1m_truth"] == "strong" and
+                truth_assessment["setup_truth"] == "strong" and
+                truth_assessment["trigger_truth"] == "strong" and
+                truth_assessment["timing_truth"] in ("early", "acceptable") and
+                truth_assessment["trade_plan_truth"] == "strong" and
+                truth_assessment["r_truth"] == "efficient" and
+                len(soft_blockers) == 0 and
+                truth_assessment["derived_side"] in {"long", "short"}
+            )
+
+            a_criteria = (
+                truth_assessment["regime_truth"] in {"usable", "strong"} and
+                truth_assessment["vwap_truth"] in {"aligned", "strong"} and
+                truth_assessment["context_5m_truth"] in {"clean", "strong"} and
+                truth_assessment["structure_1m_truth"] in {"usable", "clean", "strong"} and
+                truth_assessment["setup_truth"] in {"valid", "strong"} and
+                truth_assessment["trigger_truth"] in {"valid", "strong"} and
+                truth_assessment["timing_truth"] in {"early", "acceptable"} and
+                truth_assessment["trade_plan_truth"] in {"valid", "strong"} and
+                truth_assessment["r_truth"] in {"acceptable", "efficient"} and
+                truth_assessment["derived_side"] in {"long", "short"} and
+                len(soft_blockers) <= 1
+            )
+
+            if a_plus_criteria:
+                truth_classification = "A+"
+            elif a_criteria:
+                truth_classification = "A"
+            else:
+                truth_classification = "SHADOW"
+
+        logger.info(
+            "BOT TRUTH CLASSIFICATION | "
+            f"classification={truth_classification} "
+            f"primary_reason={truth_assessment['primary_reason']} "
+            f"hard_blockers={truth_assessment['hard_blockers']} "
+            f"soft_blockers={truth_assessment['soft_blockers']}"
+        )
+        return truth_classification
+
     def build_classification_result(self, normalized, assessment):
-        det_classification = assessment["det_classification"]
-        execution_permission = det_classification in ("EXECUTE_A", "EXECUTE_A_PLUS")
+        truth_classification = assessment.get("truth_classification")
+        if truth_classification is None:
+            truth_classification = self.classify_truth(assessment)
+
+        if truth_classification == "A+":
+            det_classification = "EXECUTE_A_PLUS"
+        elif truth_classification == "A":
+            det_classification = "EXECUTE_A"
+        else:
+            det_classification = truth_classification
+
+        execution_permission = truth_classification in ("A", "A+")
         execution_grade = ""
 
-        if det_classification == "EXECUTE_A_PLUS":
+        if truth_classification == "A+":
             execution_grade = "A+"
-        elif det_classification == "EXECUTE_A":
+        elif truth_classification == "A":
             execution_grade = "A"
 
         return {
+            "truth_classification": truth_classification,
             "det_classification": det_classification,
             "execution_permission": execution_permission,
             "execution_grade": execution_grade,
@@ -1883,14 +3398,18 @@ class ScalpingBot:
             "payload_format": normalized["payload_format"],
             "signal_id": normalized["signal_id"],
             "symbol": normalized["symbol"],
-            "side": normalized["side"],
-            "session_valid": assessment["session_valid"],
-            "vwap_bias_valid": assessment["vwap_bias_valid"],
-            "structure_valid": assessment["structure_valid"],
-            "pine_setup_valid": assessment["pine_setup_valid"],
-            "pine_trigger_valid": assessment["pine_trigger_valid"],
-            "pine_structure_valid": assessment["pine_structure_valid"],
-            "pine_body_strength_valid": assessment["pine_body_strength_valid"],
+            "side": assessment["derived_side"],
+            "market_profile": assessment["market_profile"],
+            "setup_profile": assessment["setup_profile"],
+            "regime_truth": assessment["regime_truth"],
+            "vwap_truth": assessment["vwap_truth"],
+            "context_5m_truth": assessment["context_5m_truth"],
+            "structure_1m_truth": assessment["structure_1m_truth"],
+            "setup_truth": assessment["setup_truth"],
+            "trigger_truth": assessment["trigger_truth"],
+            "timing_truth": assessment["timing_truth"],
+            "trade_plan_truth": assessment["trade_plan_truth"],
+            "r_truth": assessment["r_truth"],
             "hard_blockers": assessment["hard_blockers"],
             "soft_blockers": assessment["soft_blockers"],
         }
@@ -1908,7 +3427,7 @@ class ScalpingBot:
         stage = BOT_STAGE
 
         gate_eligible = det_classification in ("EXECUTE_A_PLUS", "EXECUTE_A")
-        gate_enabled = stage == "TEST"
+        gate_enabled = stage in {"TEST", "PAPER", "LIVE"}
         gate_branch = "det_execution_gate"
         queue_allowed = gate_enabled and gate_eligible
 
@@ -2055,7 +3574,7 @@ class ScalpingBot:
             self.update_trade_from_status(trade)
 
         def on_commission_report(trade, fill, report):
-            self.update_trade_commission(trade, fill)
+            self.update_trade_commission(trade, fill, report)
 
         def on_error(reqId, errorCode, errorString, contract):
             logger.error(
@@ -2085,7 +3604,7 @@ class ScalpingBot:
     def qualify_contracts(self):
         logger.info("QUALIFY CONTRACTS")
 
-        for sym in ["MNQ", "MES", "M6E", "FDXM"]:
+        for sym in QUALIFIED_FUTURE_SYMBOLS:
             try:
                 base = self.build_base_contract(sym)
                 details = self.ib.reqContractDetails(base)
@@ -2094,7 +3613,7 @@ class ScalpingBot:
                 contract = detail.contract
 
                 self.contract_cache[sym] = contract
-                self.contract_min_ticks[sym] = float(getattr(detail, "minTick", TICK_SIZES[sym]))
+                self.contract_min_ticks[sym] = float(getattr(detail, "minTick", self.get_instrument_spec(sym)["tick_size"]))
 
                 logger.info(f"{sym} → {contract.lastTradeDateOrContractMonth}")
             except Exception:
@@ -2109,7 +3628,7 @@ class ScalpingBot:
         self.qualify_contracts()
 
     def is_baseline_contract_cache_ready(self):
-        required = {"MNQ", "MES", "M6E", "FDXM"}
+        required = set(QUALIFIED_FUTURE_SYMBOLS)
         missing = required - set(self.contract_cache.keys())
         if missing:
             return False
@@ -2230,9 +3749,11 @@ class ScalpingBot:
         logger.warning(f"CONTRACT CACHE MISS | symbol={symbol} | attempting re-qualification")
 
         try:
-            if symbol == "EURUSD":
-                self.contract_cache[symbol] = Forex("EURUSD")
-                logger.info("CONTRACT CACHE RECOVERED | symbol=EURUSD")
+            spec = self.get_instrument_spec(symbol)
+            if spec["broker_type"] == "forex":
+                self.contract_cache[symbol] = self.build_base_contract(symbol)
+                self.contract_min_ticks[symbol] = spec["tick_size"]
+                logger.info(f"CONTRACT CACHE RECOVERED | symbol={symbol}")
                 return True
 
             base = self.build_base_contract(symbol)
@@ -2241,7 +3762,7 @@ class ScalpingBot:
             contract = detail.contract
 
             self.contract_cache[symbol] = contract
-            self.contract_min_ticks[symbol] = float(getattr(detail, "minTick", TICK_SIZES[symbol]))
+            self.contract_min_ticks[symbol] = float(getattr(detail, "minTick", spec["tick_size"]))
 
             logger.info(
                 f"CONTRACT CACHE RECOVERED | symbol={symbol} expiry={contract.lastTradeDateOrContractMonth}"
@@ -2301,19 +3822,114 @@ class ScalpingBot:
         except Exception:
             logger.exception(f"{label} SNAPSHOT FAILED")
 
+    def assess_broker_bracket_confirmation(self, parent_id, tp_id, sl_id):
+        expected_ids = {parent_id, tp_id, sl_id}
+        broker_orders = {}
+
+        try:
+            for trade in self.ib.openTrades():
+                order = getattr(trade, "order", None)
+                status = getattr(trade, "orderStatus", None)
+                order_id = getattr(order, "orderId", None)
+                if order_id in expected_ids:
+                    broker_orders[order_id] = {
+                        "source": "openTrades",
+                        "orderId": order_id,
+                        "parentId": getattr(order, "parentId", None),
+                        "permId": getattr(status, "permId", None),
+                        "status": getattr(status, "status", None),
+                    }
+
+            for order in self.ib.openOrders():
+                order_id = getattr(order, "orderId", None)
+                if order_id in expected_ids and order_id not in broker_orders:
+                    broker_orders[order_id] = {
+                        "source": "openOrders",
+                        "orderId": order_id,
+                        "parentId": getattr(order, "parentId", None),
+                        "permId": getattr(order, "permId", None),
+                        "status": None,
+                    }
+        except Exception:
+            logger.exception(
+                "BROKER BRACKET CONFIRMATION CHECK FAILED | "
+                f"parent_order_id={parent_id} tp_order_id={tp_id} sl_order_id={sl_id}"
+            )
+            return {
+                "confirmed": False,
+                "reason": "broker_state_check_failed",
+                "visible_count": 0,
+                "visible_order_ids": [],
+                "parent_visible": False,
+                "tp_visible": False,
+                "sl_visible": False,
+                "parent_link_ok": False,
+                "tp_link_ok": False,
+                "sl_link_ok": False,
+                "all_perm_ids_assigned": False,
+                "broker_orders": {},
+            }
+
+        parent_visible = parent_id in broker_orders
+        tp_visible = tp_id in broker_orders
+        sl_visible = sl_id in broker_orders
+
+        parent_link_ok = parent_visible and broker_orders[parent_id]["parentId"] in (0, None)
+        tp_link_ok = tp_visible and broker_orders[tp_id]["parentId"] == parent_id
+        sl_link_ok = sl_visible and broker_orders[sl_id]["parentId"] == parent_id
+
+        all_visible = parent_visible and tp_visible and sl_visible
+        all_links_ok = parent_link_ok and tp_link_ok and sl_link_ok
+        all_perm_ids_assigned = all(
+            broker_orders[order_id].get("permId") not in (None, 0)
+            for order_id in expected_ids
+            if order_id in broker_orders
+        ) and all_visible
+
+        confirmed = all_visible and all_links_ok and all_perm_ids_assigned
+
+        if not all_visible:
+            reason = "broker_missing_one_or_more_bracket_legs"
+        elif not all_links_ok:
+            reason = "broker_bracket_linkage_invalid"
+        elif not all_perm_ids_assigned:
+            reason = "broker_perm_id_assignment_incomplete"
+        else:
+            reason = "broker_visible_three_leg_chain_confirmed"
+
+        return {
+            "confirmed": confirmed,
+            "reason": reason,
+            "visible_count": len(broker_orders),
+            "visible_order_ids": sorted(broker_orders.keys()),
+            "parent_visible": parent_visible,
+            "tp_visible": tp_visible,
+            "sl_visible": sl_visible,
+            "parent_link_ok": parent_link_ok,
+            "tp_link_ok": tp_link_ok,
+            "sl_link_ok": sl_link_ok,
+            "all_perm_ids_assigned": all_perm_ids_assigned,
+            "broker_orders": broker_orders,
+        }
+
     # ==========================================================
     # CONTRACTS
     # ==========================================================
 
     def build_base_contract(self, symbol):
-        if symbol in ("MNQ", "MES", "M6E"):
-            return Future(symbol=symbol, exchange="CME", currency="USD")
-        elif symbol == "FDXM":
-            return Future(symbol="FDXM", exchange="EUREX", currency="EUR", tradingClass="FDXM")
-        elif symbol == "EURUSD":
-            return Forex("EURUSD")
-        else:
-            raise ValueError(f"Unsupported symbol: {symbol}")
+        spec = self.get_instrument_spec(symbol)
+        if spec["broker_type"] == "future":
+            contract_kwargs = {
+                "symbol": spec["symbol"],
+                "exchange": spec["exchange"],
+                "currency": spec["currency"],
+            }
+            if spec["trading_class"]:
+                contract_kwargs["tradingClass"] = spec["trading_class"]
+            return Future(**contract_kwargs)
+        if spec["broker_type"] == "forex":
+            return Forex(spec["symbol"])
+        raise ValueError(f"Unsupported symbol: {symbol}")
 
     def select_front_month_detail(self, details):
         sorted_details = sorted(
@@ -2332,8 +3948,9 @@ class ScalpingBot:
         if symbol in self.contract_cache:
             return self.contract_cache[symbol]
 
-        if symbol == "EURUSD":
-            return Forex("EURUSD")
+        spec = self.get_instrument_spec(symbol)
+        if spec["broker_type"] == "forex":
+            return self.build_base_contract(symbol)
 
         raise ValueError(f"{symbol} not cached")
 
@@ -2347,11 +3964,11 @@ class ScalpingBot:
         P049: Moved stop/target derivation to place_bracket_order() after final executable entry.
         This job now carries planning info only; final R is computed at execution time.
         """
-        entry = self.derive_entry_price_from_candidate(normalized)
         execution_grade = classification_result["execution_grade"]
         reference_price = self.get_preferred_reference_price(normalized)
         symbol = normalized["symbol"]
         side = normalized["side"]
+        planned_executable_entry = self.derive_entry_price_from_candidate(normalized)
 
         # Get intended risk percent for grade
         intended_risk_percent = self.get_grade_risk_percent(execution_grade)
@@ -2359,13 +3976,15 @@ class ScalpingBot:
         return {
             "symbol": symbol,
             "side": side,
-            "entry": entry,
+            "bot_stage": BOT_STAGE,
+            "entry": reference_price,
             "signal_time": normalized["timestamp_utc"] or normalized["time"],
             "enqueue_time": self.utc_now_iso(),
             "grade": execution_grade,
             "intended_risk_percent": intended_risk_percent,
             "det_classification": classification_result["det_classification"],
             "reference_price": reference_price,
+            "planned_executable_entry": planned_executable_entry,
             "normalized_signal": normalized,
             "raw_payload": normalized["raw_payload"],
             "payload_format": normalized["payload_format"],
@@ -2375,12 +3994,10 @@ class ScalpingBot:
 
     def derive_entry_price_from_candidate(self, normalized):
         if normalized["payload_format"] == "enriched_candidate":
-            price_ref = self.get_preferred_reference_price(normalized)
-            if price_ref is None:
+            entry_plan = self.derive_executable_entry_plan_from_normalized(normalized)
+            if entry_plan is None:
                 return None
-            if normalized["symbol"]:
-                return self.round_to_tick(normalized["symbol"], price_ref)
-            return price_ref
+            return entry_plan["final_entry"]
 
         return normalized["entry_price"] if normalized["entry_price"] is not None else normalized["price"]
 
@@ -2396,7 +4013,13 @@ class ScalpingBot:
 
         if normalized["payload_format"] == "diagnostic":
             self.log_diagnostic_signal(data)
-            assessment = self.assess_det_signal(normalized)
+            observation_layer = self.build_observation_layer(normalized)
+            assessment = self.assess_truth(
+                observation_layer,
+                observation_layer["market_profile"],
+                observation_layer["setup_profile"]
+            )
+            assessment["truth_classification"] = self.classify_truth(assessment)
             classification_result = self.build_classification_result(normalized, assessment)
             self.log_det_result(normalized, assessment, classification_result)
             logger.info(
@@ -2420,7 +4043,13 @@ class ScalpingBot:
         policy = self.evaluate_stage_execution_policy(normalized)
 
         if normalized["payload_format"] == "enriched_candidate":
-            assessment = self.assess_det_signal(normalized)
+            observation_layer = self.build_observation_layer(normalized)
+            assessment = self.assess_truth(
+                observation_layer,
+                observation_layer["market_profile"],
+                observation_layer["setup_profile"]
+            )
+            assessment["truth_classification"] = self.classify_truth(assessment)
             classification_result = self.build_classification_result(normalized, assessment)
             self.log_det_result(normalized, assessment, classification_result)
 
@@ -2435,7 +4064,7 @@ class ScalpingBot:
                 f"reason={gate_result['reason']}"
             )
 
-            if not policy["allow_queue"] or not gate_result["queue_allowed"]:
+            if not policy["allow_queue"]:
                 logger.info(
                     "QUEUE DECISION | "
                     f"path={policy['policy_branch']} "
@@ -2445,6 +4074,22 @@ class ScalpingBot:
                     f"side={normalized['side']} "
                     f"det_classification={classification_result['det_classification']} "
                     f"queued=false "
+                    "blocked_by=stage_execution_policy "
+                    f"reason={policy['reason']}"
+                )
+                return "enriched_candidate_classified_no_execution"
+
+            if not gate_result["queue_allowed"]:
+                logger.info(
+                    "QUEUE DECISION | "
+                    f"path={gate_result['gate_branch']} "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={normalized['symbol']} "
+                    f"side={normalized['side']} "
+                    f"det_classification={classification_result['det_classification']} "
+                    f"queued=false "
+                    "blocked_by=det_execution_gate "
                     f"reason={gate_result['reason']}"
                 )
                 return "enriched_candidate_classified_no_execution"
@@ -2453,13 +4098,14 @@ class ScalpingBot:
             if entry_for_job is None:
                 logger.info(
                     "QUEUE DECISION | "
-                    f"path=future_det_gated_execution "
+                    f"path=det_gated_execution "
                     f"payload_format={normalized['payload_format']} "
                     f"signal_id={normalized['signal_id']} "
                     f"symbol={normalized['symbol']} "
                     f"side={normalized['side']} "
                     f"det_classification={classification_result['det_classification']} "
                     f"queued=false "
+                    "blocked_by=missing_price_reference "
                     f"reason=missing_price_reference"
                 )
                 return "enriched_candidate_missing_price"
@@ -2482,7 +4128,8 @@ class ScalpingBot:
                     f"signal_id={normalized['signal_id']} "
                     f"symbol={symbol} "
                     f"side={side} "
-                    f"queued=false"
+                    f"queued=false "
+                    "blocked_by=candidate_entry_derivation"
                 )
                 return "enriched_candidate_entry_derivation_failed"
 
@@ -2504,7 +4151,8 @@ class ScalpingBot:
                     f"candidate_executable_entry={candidate_executable_entry} "
                     f"actual_drift={actual_drift} "
                     f"allowed_limit_price_distance={allowed_limit} "
-                    f"queued=false"
+                    f"queued=false "
+                    "blocked_by=entry_band_validation"
                 )
                 return "enriched_candidate_entry_band_rejected"
 
@@ -2524,8 +4172,8 @@ class ScalpingBot:
                 "QUEUE PUT | "
                 f"symbol={job['symbol']} "
                 f"side={job['side']} "
-                f"entry={job['entry']} "
                 f"reference_price={job['reference_price']} "
+                f"planned_executable_entry={job.get('planned_executable_entry')} "
                 f"grade={job['grade']} "
                 f"intended_risk_pct={job['intended_risk_percent']*100:.1f}% "
                 f"det_classification={job['det_classification']} "
@@ -2536,7 +4184,7 @@ class ScalpingBot:
             self.execution_queue.put(job)
             logger.info(
                 "QUEUE DECISION | "
-                f"path=future_det_gated_execution "
+                f"path=det_gated_execution "
                 f"payload_format={normalized['payload_format']} "
                 f"signal_id={normalized['signal_id']} "
                 f"symbol={normalized['symbol']} "
@@ -2664,14 +4312,29 @@ class ScalpingBot:
 
             try:
                 with self.execution_lock:
-                    has_lock, locked_trade_id, locked_symbol, locked_state = self.has_active_trade_locked()
-                    if has_lock:
+                    has_conflict, conflicting_trade, concurrency_policy = self.has_conflicting_active_trade_for_job(job)
+                    if has_conflict:
                         logger.warning(
-                            "TRADE LOCK BLOCKED EXECUTION | "
-                            f"locked_trade_id={locked_trade_id} "
-                            f"locked_symbol={locked_symbol} "
-                            f"locked_state={locked_state} "
+                            "CONCURRENCY BLOCKED EXECUTION | "
+                            f"stage={concurrency_policy['stage']} "
+                            f"mode={concurrency_policy['mode']} "
+                            f"conflicting_trade_id={conflicting_trade['trade_id']} "
+                            f"conflicting_symbol={conflicting_trade['symbol']} "
+                            f"conflicting_state={conflicting_trade['state']} "
                             f"incoming_symbol={job['symbol']}"
+                        )
+                        continue
+
+                    risk_regime = self.evaluate_live_execution_risk_regime(job)
+                    if not risk_regime["execution_allowed"]:
+                        logger.warning(
+                            "EXECUTION RISK REGIME BLOCKED | "
+                            f"stage={risk_regime['stage']} "
+                            f"risk_branch={risk_regime['risk_branch']} "
+                            f"incoming_symbol={job['symbol']} "
+                            f"day_key={risk_regime.get('day_key')} "
+                            f"trigger_trade_id={risk_regime.get('trigger_trade_id')} "
+                            f"reason={risk_regime['reason']}"
                         )
                         continue
 
@@ -2700,8 +4363,16 @@ class ScalpingBot:
         symbol = job["symbol"]
         side = job["side"]
 
-        spread_adjusted_entry = self.apply_spread(symbol, side, job["entry"])
-        entry = self.round_to_tick(symbol, spread_adjusted_entry)
+        entry_plan = self.derive_executable_entry_plan_from_job(job)
+        if entry_plan is None:
+            logger.error(
+                "EXECUTION ENTRY DERIVATION FAILED | "
+                f"symbol={symbol} side={side} reference_price={job.get('reference_price')}"
+            )
+            return
+
+        spread_adjusted_entry = entry_plan["spread_adjusted_entry"]
+        entry = entry_plan["final_entry"]
 
         contract = self.get_contract(symbol)
 
@@ -2719,6 +4390,55 @@ class ScalpingBot:
         # P049: Compute final 1R distance from final executable entry and stop
         risk_distance_r = abs(entry - stop)
 
+        sizing_result = self.calculate_execution_position_size(
+            symbol,
+            job.get("grade"),
+            entry,
+            stop
+        )
+        logger.info(
+            "SIZING PLAN | "
+            f"symbol={symbol} "
+            f"reference_price={entry_plan['reference_price']} "
+            f"spread_adjusted_entry={spread_adjusted_entry} "
+            f"final_entry={entry} "
+            f"capital_base={sizing_result['capital_base']} "
+            f"execution_grade={job.get('grade', '')} "
+            f"intended_risk_percent={sizing_result['intended_risk_percent']} "
+            f"allowed_money_risk={sizing_result['allowed_money_risk']} "
+            f"stop_distance_points={sizing_result['stop_distance_points']} "
+            f"point_value={sizing_result['point_value']} "
+            f"risk_per_contract={sizing_result['risk_per_contract']} "
+            f"raw_size={sizing_result['raw_position_size']} "
+            f"normalized_size={sizing_result['normalized_position_size']} "
+            f"validation_result={sizing_result['validation_reason']}"
+        )
+        if not sizing_result["ok"]:
+            logger.error(
+                "SIZING BLOCKED EXECUTION | "
+                f"symbol={symbol} "
+                f"side={side} "
+                f"reference_price={entry_plan['reference_price']} "
+                f"spread_adjusted_entry={spread_adjusted_entry} "
+                f"final_entry={entry} "
+                f"capital_base={sizing_result['capital_base']} "
+                f"execution_grade={job.get('grade', '')} "
+                f"intended_risk_percent={sizing_result['intended_risk_percent']} "
+                f"allowed_money_risk={sizing_result['allowed_money_risk']} "
+                f"stop_distance_points={sizing_result['stop_distance_points']} "
+                f"point_value={sizing_result['point_value']} "
+                f"raw_size={sizing_result['raw_position_size']} "
+                f"normalized_size={sizing_result['normalized_position_size']} "
+                f"reason={sizing_result['reason']}"
+            )
+            return
+
+        normalized_size = sizing_result["normalized_position_size"]
+        job["allowed_money_risk"] = sizing_result["allowed_money_risk"]
+        job["stop_distance_points"] = sizing_result["stop_distance_points"]
+        job["raw_position_size"] = sizing_result["raw_position_size"]
+        job["normalized_position_size"] = normalized_size
+
         if side == "long":
             parent_action = "BUY"
             child_action = "SELL"
@@ -2731,7 +4451,7 @@ class ScalpingBot:
             f"grade={job.get('grade', '')} "
             f"det_classification={job.get('det_classification', '')} "
             f"reference_price={job.get('reference_price', 'N/A')} "
-            f"entry_reference_price={job.get('normalized_signal', {}).get('entry_reference_price', 'N/A')} "
+            f"spread_adjusted_entry={spread_adjusted_entry} "
             f"trigger_bar_high={job.get('normalized_signal', {}).get('trigger_bar_high', 'N/A')} "
             f"trigger_bar_low={job.get('normalized_signal', {}).get('trigger_bar_low', 'N/A')} "
             f"structure_anchor_low={job.get('normalized_signal', {}).get('structure_anchor_low', 'N/A')} "
@@ -2739,6 +4459,7 @@ class ScalpingBot:
             f"final_entry={entry} "
             f"final_stop={stop} "
             f"final_target={target} "
+            f"planned_position_size={normalized_size} "
             f"risk_r={risk_distance_r} "
             f"intended_risk_pct={job.get('intended_risk_percent', 0)*100:.1f}%"
         )
@@ -2759,18 +4480,18 @@ class ScalpingBot:
             sl_id=sl_id
         )
 
-        parent = LimitOrder(parent_action, 1, entry)
+        parent = LimitOrder(parent_action, normalized_size, entry)
         parent.orderId = parent_id
         parent.transmit = False
         parent.tif = "GTC"
 
-        tp = LimitOrder(child_action, 1, target)
+        tp = LimitOrder(child_action, normalized_size, target)
         tp.orderId = tp_id
         tp.parentId = parent_id
         tp.transmit = False
         tp.tif = "GTC"
 
-        sl = StopOrder(child_action, 1, stop)
+        sl = StopOrder(child_action, normalized_size, stop)
         sl.orderId = sl_id
         sl.parentId = parent_id
         sl.transmit = True
@@ -2779,18 +4500,21 @@ class ScalpingBot:
         logger.info(
             f"ORDER DEF PARENT → orderId={parent.orderId} parentId={parent.parentId} "
             f"action={parent.action} orderType={parent.orderType} "
+            f"totalQuantity={getattr(parent, 'totalQuantity', None)} "
             f"lmtPrice={getattr(parent, 'lmtPrice', None)} auxPrice={getattr(parent, 'auxPrice', None)} "
             f"transmit={parent.transmit}"
         )
         logger.info(
             f"ORDER DEF TP → orderId={tp.orderId} parentId={tp.parentId} "
             f"action={tp.action} orderType={tp.orderType} "
+            f"totalQuantity={getattr(tp, 'totalQuantity', None)} "
             f"lmtPrice={getattr(tp, 'lmtPrice', None)} auxPrice={getattr(tp, 'auxPrice', None)} "
             f"transmit={tp.transmit}"
         )
         logger.info(
             f"ORDER DEF SL → orderId={sl.orderId} parentId={sl.parentId} "
             f"action={sl.action} orderType={sl.orderType} "
+            f"totalQuantity={getattr(sl, 'totalQuantity', None)} "
             f"lmtPrice={getattr(sl, 'lmtPrice', None)} auxPrice={getattr(sl, 'auxPrice', None)} "
             f"transmit={sl.transmit}"
         )
@@ -2813,6 +4537,7 @@ class ScalpingBot:
 
         submission_deadline = time.time() + 4.0
         confirmed = False
+        broker_confirmation = None
 
         parent_logged_transitions = set()
         tp_logged_transitions = set()
@@ -2849,11 +4574,8 @@ class ScalpingBot:
                     logger.info(f"ORDER TRANSITION | leg={leg} orderId={order_id} permId={perm} assigned")
                     logged_set.add("permId_assigned")
 
-            parent_ok = parent_status != "PendingSubmit" or parent_perm != 0
-            tp_ok = tp_status != "PendingSubmit" or tp_perm != 0
-            sl_ok = sl_status != "PendingSubmit" or sl_perm != 0
-
-            if parent_ok and tp_ok and sl_ok:
+            broker_confirmation = self.assess_broker_bracket_confirmation(parent_id, tp_id, sl_id)
+            if broker_confirmation["confirmed"]:
                 confirmed = True
                 break
 
@@ -2863,12 +4585,23 @@ class ScalpingBot:
         self.log_trade_snapshot("POST CONFIRM TP", tp_trade)
         self.log_trade_snapshot("POST CONFIRM SL", sl_trade)
 
+        if broker_confirmation is None:
+            broker_confirmation = self.assess_broker_bracket_confirmation(parent_id, tp_id, sl_id)
+
         logger.info(
             f"BRACKET CONFIRMATION ASSESSMENT | confirmed={confirmed} | "
             f"parent: orderId={parent_id} status={parent_status} permId={parent_perm} | "
             f"tp: orderId={tp_id} status={tp_status} permId={tp_perm} | "
             f"sl: orderId={sl_id} status={sl_status} permId={sl_perm} | "
-            f"reason={'all legs confirmed (status != PendingSubmit or permId != 0)' if confirmed else 'confirmation timeout or legs stuck in PendingSubmit with permId=0'}"
+            f"broker_visible_order_ids={broker_confirmation['visible_order_ids']} | "
+            f"parent_visible={broker_confirmation['parent_visible']} "
+            f"tp_visible={broker_confirmation['tp_visible']} "
+            f"sl_visible={broker_confirmation['sl_visible']} | "
+            f"parent_link_ok={broker_confirmation['parent_link_ok']} "
+            f"tp_link_ok={broker_confirmation['tp_link_ok']} "
+            f"sl_link_ok={broker_confirmation['sl_link_ok']} | "
+            f"all_perm_ids_assigned={broker_confirmation['all_perm_ids_assigned']} | "
+            f"reason={broker_confirmation['reason']}"
         )
 
         open_trades = self.ib.openTrades()
@@ -2886,12 +4619,14 @@ class ScalpingBot:
                 self.log_trade_snapshot(label, open_trade)
 
         if not confirmed:
-            self.append_anomaly(trade_id, "SUBMISSION_CONFIRMATION_TIMEOUT")
+            self.append_anomaly(trade_id, "BROKER_BRACKET_CONFIRMATION_FAILED")
             self.trade_analysis[trade_id]["state"] = "INCOMPLETE"
             self.finalize_trade_if_complete(trade_id)
             logger.error(
                 f"BRACKET NOT CONFIRMED | trade_id={trade_id} "
-                f"parent_order_id={parent_id} tp_order_id={tp_id} sl_order_id={sl_id}"
+                f"parent_order_id={parent_id} tp_order_id={tp_id} sl_order_id={sl_id} "
+                f"broker_reason={broker_confirmation['reason']} "
+                f"broker_visible_order_ids={broker_confirmation['visible_order_ids']}"
             )
             return
 
