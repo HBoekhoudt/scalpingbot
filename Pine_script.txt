@@ -1,10 +1,10 @@
 //@version=6
-indicator("DET_Enriched_Data_submitter", shorttitle="DET EDS v16", overlay=true, max_labels_count=500)
+indicator("DET_Observation_Router", shorttitle="DET OBS v21", overlay=true, max_labels_count=500)
 
 // ==========================================================
-// DET A / A+ CLASSIFIER
-// 2-STAGE MTF MODEL
-// 5m context/setup armed -> 1m trigger confirmed -> fire once
+// DET OBSERVATION ROUTER
+// 2-STAGE MTF DETECTOR
+// 5m context/setup armed -> 1m trigger observed -> route once
 // Pine Script v6
 //
 // ==========================================================
@@ -37,10 +37,10 @@ lateEntryATRMult = input.float(1.10, "Max distance from VWAP in ATR for valid en
 minMoveAwayFromVWAPATR = input.float(0.10, "Min move away from VWAP in ATR", minval=0.0, step=0.05, group=groupFilters)
 
 htfTf = input.timeframe("5", "Higher timeframe for context/setup", group=groupMTF)
-armedTimeoutBars = input.int(5, "Armed setup timeout (1m bars)", minval=1, maxval=30, group=groupMTF)
+armedTimeoutBars = input.int(7, "Armed setup timeout (1m bars)", minval=1, maxval=30, group=groupMTF)
 invalidateDistanceATR = input.float(1.35, "Invalidate if distance from VWAP exceeds ATR multiple", minval=0.5, step=0.05, group=groupMTF)
 
-showLabels = input.bool(true, "Show A / A+ labels", group=groupVisuals)
+showLabels = input.bool(true, "Show routing labels", group=groupVisuals)
 showDebugTable = input.bool(true, "Show debug table", group=groupVisuals)
 showBackground = input.bool(false, "Background by classification", group=groupVisuals)
 plotVWAP = input.bool(true, "Plot VWAP", group=groupVisuals)
@@ -311,6 +311,31 @@ htfSweepRejectionShort = request.security(
 htfContextLong = sessionOk and htfTrendUp and htfVwapUp and htfVwapNotFlat and htfNotChoppy and htfNotLateLong and htfMovedAwayFromVWAPLong and rr >= riskRewardMin
 htfContextShort = sessionOk and htfTrendDown and htfVwapDown and htfVwapNotFlat and htfNotChoppy and htfNotLateShort and htfMovedAwayFromVWAPShort and rr >= riskRewardMin
 
+htfContextLongScore = f_bool_to_int(htfTrendUp) + f_bool_to_int(htfVwapUp) + f_bool_to_int(htfVwapNotFlat) + f_bool_to_int(htfNotChoppy) + f_bool_to_int(htfNotLateLong) + f_bool_to_int(htfMovedAwayFromVWAPLong)
+htfContextShortScore = f_bool_to_int(htfTrendDown) + f_bool_to_int(htfVwapDown) + f_bool_to_int(htfVwapNotFlat) + f_bool_to_int(htfNotChoppy) + f_bool_to_int(htfNotLateShort) + f_bool_to_int(htfMovedAwayFromVWAPShort)
+
+htfCandidateContextLong = sessionOk and rr >= riskRewardMin and htfNotLateLong and htfContextLongScore >= 2 and (htfNotChoppy or htfEmaSpreadAtr > chopThreshold * 0.65) and (htfTrendUp or htfClose > htfEmaFast or htfVwapUp) and (htfClose >= htfVwap or htfVwapUp or htfClose > htfOpen)
+htfCandidateContextShort = sessionOk and rr >= riskRewardMin and htfNotLateShort and htfContextShortScore >= 2 and (htfNotChoppy or htfEmaSpreadAtr > chopThreshold * 0.65) and (htfTrendDown or htfClose < htfEmaFast or htfVwapDown) and (htfClose <= htfVwap or htfVwapDown or htfClose < htfOpen)
+
+htfCandidateLong = htfCandidateContextLong and (
+    htfStructureLong or
+    htfCloseLocationInRange >= 0.45 or
+    (htfClose > htfOpen and htfClose > htfEmaSlow) or
+    htfSweepRejectionLong or
+    htfBodyStrength >= 0.45
+)
+
+htfCandidateShort = htfCandidateContextShort and (
+    htfStructureShort or
+    htfCloseLocationInRange <= 0.55 or
+    (htfClose < htfOpen and htfClose < htfEmaSlow) or
+    htfSweepRejectionShort or
+    htfBodyStrength >= 0.45
+)
+
+htfHoldLong = sessionOk and rr >= riskRewardMin and htfDistanceFromVWAPAtr <= invalidateDistanceATR and htfContextLongScore >= 1 and (htfTrendUp or htfClose > htfEmaSlow or htfVwapUp or htfClose > htfOpen)
+htfHoldShort = sessionOk and rr >= riskRewardMin and htfDistanceFromVWAPAtr <= invalidateDistanceATR and htfContextShortScore >= 1 and (htfTrendDown or htfClose < htfEmaSlow or htfVwapDown or htfClose < htfOpen)
+
 htfSetupLong = htfContextLong and htfStructureLong and (
     htfSweepRejectionLong or
     (htfLowerWickRatio >= wickThreshold and htfClose > htfOpen and htfClose > htfEmaSlow)
@@ -342,14 +367,14 @@ newHtfBar = ta.change(htfTime) != 0
 armedExpired = armedActive and not na(armedStartBarIndex) and (bar_index - armedStartBarIndex > armedTimeoutBars)
 
 armedInvalidLong = armedActive and armedDir == 1 and (
-    not htfContextLong or
+    not htfHoldLong or
     htfSetupShort or
     distanceFromVWAPAtr > invalidateDistanceATR or
     not sessionOk
 )
 
 armedInvalidShort = armedActive and armedDir == -1 and (
-    not htfContextShort or
+    not htfHoldShort or
     htfSetupLong or
     distanceFromVWAPAtr > invalidateDistanceATR or
     not sessionOk
@@ -368,7 +393,7 @@ if armedActive and (armedExpired or armedInvalidLong or armedInvalidShort)
 
 if newHtfBar
     if not armedActive
-        if htfSetupLong and not htfSetupShort
+        if htfCandidateLong and not htfCandidateShort
             armedActive := true
             armedDir := 1
             armedStartBarIndex := bar_index
@@ -377,7 +402,8 @@ if newHtfBar
             armedPlusCandidate := htfPlusCandidateLong
             borderlineAlerted := false
             setupCandidateAlertedLong := false
-        else if htfSetupShort and not htfSetupLong
+            setupCandidateAlertedShort := false
+        else if htfCandidateShort and not htfCandidateLong
             armedActive := true
             armedDir := -1
             armedStartBarIndex := bar_index
@@ -385,6 +411,7 @@ if newHtfBar
             armedFired := false
             armedPlusCandidate := htfPlusCandidateShort
             borderlineAlerted := false
+            setupCandidateAlertedLong := false
             setupCandidateAlertedShort := false
     else
         if armedDir == 1 and htfSetupShort
@@ -395,6 +422,7 @@ if newHtfBar
             armedFired := false
             armedPlusCandidate := htfPlusCandidateShort
             borderlineAlerted := false
+            setupCandidateAlertedLong := false
             setupCandidateAlertedShort := false
         else if armedDir == -1 and htfSetupLong
             armedActive := true
@@ -405,18 +433,21 @@ if newHtfBar
             armedPlusCandidate := htfPlusCandidateLong
             borderlineAlerted := false
             setupCandidateAlertedLong := false
+            setupCandidateAlertedShort := false
 
 // ----------------------
 // 1m confirmation layer
 // ----------------------
-longTriggerBase = executionTimeframeOk and enableLongs and armedActive and armedDir == 1 and not armedFired and sessionOk and tradeableLong and ctxLongScore >= 3 and s1LongScore >= 3 and notLateLong and (
+longTriggerBase = executionTimeframeOk and enableLongs and armedActive and armedDir == 1 and not armedFired and sessionOk and tradeableLong and ctxLongScore >= 2 and s1LongScore >= 1 and notLateLong and (
     reAccelLong or
-    (close > high[1] and bodyStrength >= bodyStrengthThreshold and wickSupportLong)
+    (close > high[1] and bodyStrength >= bodyStrengthThreshold and wickSupportLong) or
+    (close >= high[1] and wickSupportLong)
 )
 
-shortTriggerBase = executionTimeframeOk and enableShorts and armedActive and armedDir == -1 and not armedFired and sessionOk and tradeableShort and ctxShortScore >= 3 and s1ShortScore >= 3 and notLateShort and (
+shortTriggerBase = executionTimeframeOk and enableShorts and armedActive and armedDir == -1 and not armedFired and sessionOk and tradeableShort and ctxShortScore >= 2 and s1ShortScore >= 1 and notLateShort and (
     reAccelShort or
-    (close < low[1] and bodyStrength >= bodyStrengthThreshold and wickSupportShort)
+    (close < low[1] and bodyStrength >= bodyStrengthThreshold and wickSupportShort) or
+    (close <= low[1] and wickSupportShort)
 )
 
 longTriggerPlus = longTriggerBase and armedPlusCandidate and plusLongScore >= 3 and ctxLongScore >= 4 and bodyStrength >= 0.70 and close > emaFast and close > emaSlow
@@ -455,15 +486,15 @@ if not armedActive and armedFired
     armedPlusCandidate := false
 
 // ----------------------
-// Final class (for visuals/debug)
+// Final routing state (for visuals/debug only)
 // ----------------------
 longClass = aPlusLongFire ? 3 : aLongFire ? 2 : 0
 shortClass = aPlusShortFire ? 3 : aShortFire ? 2 : 0
 
-finalClass = longClass > shortClass ? longClass : shortClass > longClass ? -shortClass : 0
-isLong = finalClass > 0
-isShort = finalClass < 0
-classAbs = math.abs(finalClass)
+finalRoute = longClass > shortClass ? longClass : shortClass > longClass ? -shortClass : 0
+isLong = finalRoute > 0
+isShort = finalRoute < 0
+routeAbs = math.abs(finalRoute)
 
 // ----------------------
 // Derived detector observability states
@@ -498,19 +529,19 @@ shortBodyStrengthValid = bodyStrength >= bodyStrengthThreshold
 longPlusQualityValid = armedPlusCandidate and plusLongScore >= 3 and bodyStrength >= 0.70
 shortPlusQualityValid = armedPlusCandidate and plusShortScore >= 3 and bodyStrength >= 0.70
 
-longExecutionCandidateValid = aLongFire or aPlusLongFire
-shortExecutionCandidateValid = aShortFire or aPlusShortFire
+longSendCandidate = aLongFire or aPlusLongFire
+shortSendCandidate = aShortFire or aPlusShortFire
 
-blockedLong = newHtfBar and enableLongs and htfContextLong and not htfSetupLong and not htfSetupShort
-blockedShort = newHtfBar and enableShorts and htfContextShort and not htfSetupShort and not htfSetupLong
+blockedLong = newHtfBar and enableLongs and htfContextLong and not htfCandidateLong and not htfCandidateShort
+blockedShort = newHtfBar and enableShorts and htfContextShort and not htfCandidateShort and not htfCandidateLong
 blockedEvent = blockedLong or blockedShort
 
 borderlineLong = armedActive and armedDir == 1 and not armedFired and not longTriggerBase
 borderlineShort = armedActive and armedDir == -1 and not armedFired and not shortTriggerBase
 borderlineEvent = (borderlineLong or borderlineShort) and not blockedEvent and not (aLongFire or aPlusLongFire or aShortFire or aPlusShortFire)
 
-setupCandidateLong = newHtfBar and enableLongs and htfSetupLong and not htfSetupShort and not setupCandidateAlertedLong
-setupCandidateShort = newHtfBar and enableShorts and htfSetupShort and not htfSetupLong and not setupCandidateAlertedShort
+setupCandidateLong = armedActive and armedDir == 1 and not armedFired and enableLongs and htfCandidateLong and not htfCandidateShort and not setupCandidateAlertedLong and not (aLongFire or aPlusLongFire or aShortFire or aPlusShortFire)
+setupCandidateShort = armedActive and armedDir == -1 and not armedFired and enableShorts and htfCandidateShort and not htfCandidateLong and not setupCandidateAlertedShort and not (aLongFire or aPlusLongFire or aShortFire or aPlusShortFire)
 
 // ----------------------
 // Derived reasons and scores
@@ -597,19 +628,23 @@ blockedShortFailCount = 7 - blockedShortPassCount
 borderlineLongFailCount = 9 - borderlineLongPassCount
 borderlineShortFailCount = 9 - borderlineShortPassCount
 
-executionLongScore = executionLongPassCount
-executionShortScore = executionShortPassCount
-blockedLongScore = blockedLongPassCount
-blockedShortScore = blockedShortPassCount
-borderlineLongScore = borderlineLongPassCount
-borderlineShortScore = borderlineShortPassCount
+executionLongHintScore = executionLongPassCount
+executionShortHintScore = executionShortPassCount
+dropLongHintScore = blockedLongPassCount
+dropShortHintScore = blockedShortPassCount
+sendLongHintScore = borderlineLongPassCount
+sendShortHintScore = borderlineShortPassCount
 
-executionLongBlocker = f_primary_reason(executionLongReasons)
-executionShortBlocker = f_primary_reason(executionShortReasons)
-blockedLongBlocker = f_primary_reason(blockedLongReasons)
-blockedShortBlocker = f_primary_reason(blockedShortReasons)
-borderlineLongBlocker = f_primary_reason(borderlineLongReasons)
-borderlineShortBlocker = f_primary_reason(borderlineShortReasons)
+executionLongHint = f_primary_reason(executionLongReasons)
+executionShortHint = f_primary_reason(executionShortReasons)
+dropLongHint = f_primary_reason(blockedLongReasons)
+dropShortHint = f_primary_reason(blockedShortReasons)
+sendLongHint = f_primary_reason(borderlineLongReasons)
+sendShortHint = f_primary_reason(borderlineShortReasons)
+
+detectorState = aLongFire or aPlusLongFire or aShortFire or aPlusShortFire ? "send_candidate" : setupCandidateLong or setupCandidateShort ? "setup_candidate" : blockedEvent ? "drop_candidate" : borderlineEvent ? "send_watch_candidate" : armedActive ? "armed_candidate" : "idle"
+candidateState = htfSetupLong ? "htf_setup_long" : htfSetupShort ? "htf_setup_short" : htfCandidateLong ? "htf_candidate_long" : htfCandidateShort ? "htf_candidate_short" : htfContextLong ? "htf_context_long" : htfContextShort ? "htf_context_short" : "none"
+armedAgeBarsJson = armedActive and not na(armedStartBarIndex) ? str.tostring(bar_index - armedStartBarIndex) : "null"
 
 triggerBarHigh = high
 triggerBarLow = low
@@ -620,6 +655,7 @@ entryReferencePriceShort = low
 entryReferencePriceDefault = close
 
 f_build_payload(
+    string eventName,
     string side,
     float bodyStrengthValue,
     float distanceValue,
@@ -644,7 +680,7 @@ f_build_payload(
     pullbackDepth1mProxy = f_safe_div(math.abs(close - emaFast), atr)
     f_common_json() +
          ',"mode":"candidate"' +
-         ',"event":"feature_snapshot"' +
+         ',"event":"' + eventName + '"' +
          ',"side":"' + side + '"' +
          ',"candidate_side":"' + side + '"' +
          ',"price":' + str.tostring(close) +
@@ -684,12 +720,16 @@ f_build_payload(
          ',"htf_vwap_up":' + str.tostring(htfVwapUp) +
          ',"htf_vwap_down":' + str.tostring(htfVwapDown) +
          ',"htf_vwap_not_flat":' + str.tostring(htfVwapNotFlat) +
+         ',"armed_active":' + str.tostring(armedActive) +
+         ',"armed_dir":' + str.tostring(armedDir) +
+         ',"armed_age_bars":' + armedAgeBarsJson +
          '}'
 
 // ----------------------
 // JSON payloads for observability
 // ----------------------
-executionLongJson = f_build_payload(
+prioritySendLongJson = f_build_payload(
+    "priority_trigger_observed",
     "long",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -703,7 +743,8 @@ executionLongJson = f_build_payload(
     minutesFromOpen
 )
 
-executionShortJson = f_build_payload(
+prioritySendShortJson = f_build_payload(
+    "priority_trigger_observed",
     "short",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -717,7 +758,8 @@ executionShortJson = f_build_payload(
     minutesFromOpen
 )
 
-blockedLongJson = f_build_payload(
+dropLongJson = f_build_payload(
+    "blocked_candidate_observed",
     "long",
     htfBodyStrength,
     htfDistanceFromVWAPAtr,
@@ -731,7 +773,8 @@ blockedLongJson = f_build_payload(
     minutesFromOpen
 )
 
-blockedShortJson = f_build_payload(
+dropShortJson = f_build_payload(
+    "blocked_candidate_observed",
     "short",
     htfBodyStrength,
     htfDistanceFromVWAPAtr,
@@ -745,7 +788,8 @@ blockedShortJson = f_build_payload(
     minutesFromOpen
 )
 
-borderlineLongJson = f_build_payload(
+sendLongJson = f_build_payload(
+    "trigger_observed",
     "long",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -759,7 +803,8 @@ borderlineLongJson = f_build_payload(
     minutesFromOpen
 )
 
-borderlineShortJson = f_build_payload(
+sendShortJson = f_build_payload(
+    "trigger_observed",
     "short",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -774,6 +819,7 @@ borderlineShortJson = f_build_payload(
 )
 
 setupCandidateLongJson = f_build_payload(
+    "setup_candidate_observed",
     "long",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -788,6 +834,37 @@ setupCandidateLongJson = f_build_payload(
 )
 
 setupCandidateShortJson = f_build_payload(
+    "setup_candidate_observed",
+    "short",
+    bodyStrength,
+    distanceFromVWAPAtr,
+    emaSpreadAtr,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
+)
+
+watchLongJson = f_build_payload(
+    "watch_candidate_observed",
+    "long",
+    bodyStrength,
+    distanceFromVWAPAtr,
+    emaSpreadAtr,
+    triggerBarHigh,
+    triggerBarLow,
+    structureAnchorLow,
+    structureAnchorHigh,
+    close > vwap,
+    trendStrength5m,
+    minutesFromOpen
+)
+
+watchShortJson = f_build_payload(
+    "watch_candidate_observed",
     "short",
     bodyStrength,
     distanceFromVWAPAtr,
@@ -818,35 +895,35 @@ bgcolor(
          aShortFire ? color.new(color.maroon, 88) : na) : na
 )
 
-plotshape(aLongFire, title="A Long", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="A")
-plotshape(aPlusLongFire, title="A+ Long", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="A+")
-plotshape(aShortFire, title="A Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="A")
-plotshape(aPlusShortFire, title="A+ Short", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small, text="A+")
+plotshape(aLongFire, title="Send Long", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="SEND")
+plotshape(aPlusLongFire, title="Priority Send Long", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="P_SEND")
+plotshape(aShortFire, title="Send Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SEND")
+plotshape(aPlusShortFire, title="Priority Send Short", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small, text="P_SEND")
 
-f_label(aLongFire, low, "A L", label.style_label_up, color.lime, color.black)
-f_label(aPlusLongFire, low, "A+ L", label.style_label_up, color.green, color.white)
-f_label(aShortFire, high, "A S", label.style_label_down, color.red, color.white)
-f_label(aPlusShortFire, high, "A+ S", label.style_label_down, color.maroon, color.white)
+f_label(aLongFire, low, "SEND L", label.style_label_up, color.lime, color.black)
+f_label(aPlusLongFire, low, "P_SEND L", label.style_label_up, color.green, color.white)
+f_label(aShortFire, high, "SEND S", label.style_label_down, color.red, color.white)
+f_label(aPlusShortFire, high, "P_SEND S", label.style_label_down, color.maroon, color.white)
 
 // ----------------------
 // Alerts
 // ----------------------
-alertcondition(aLongFire, title="DET A Long", message="DET A Long")
-alertcondition(aPlusLongFire, title="DET A+ Long", message="DET A+ Long")
-alertcondition(aShortFire, title="DET A Short", message="DET A Short")
-alertcondition(aPlusShortFire, title="DET A+ Short", message="DET A+ Short")
-alertcondition(blockedEvent, title="Blocked Candidate", message="Blocked Candidate")
-alertcondition(borderlineEvent, title="Borderline Candidate", message="Borderline Candidate")
+alertcondition(aLongFire, title="Send Long Candidate", message="Send Long Candidate")
+alertcondition(aPlusLongFire, title="Priority Send Long Candidate", message="Priority Send Long Candidate")
+alertcondition(aShortFire, title="Send Short Candidate", message="Send Short Candidate")
+alertcondition(aPlusShortFire, title="Priority Send Short Candidate", message="Priority Send Short Candidate")
+alertcondition(blockedEvent, title="Drop Candidate", message="Drop Candidate")
+alertcondition(borderlineEvent, title="Watch Candidate", message="Watch Candidate")
 
 if barstate.isconfirmed
     if aPlusLongFire
-        alert(executionLongJson, alert.freq_once_per_bar_close)
+        alert(prioritySendLongJson, alert.freq_once_per_bar_close)
     else if aLongFire
-        alert(executionLongJson, alert.freq_once_per_bar_close)
+        alert(sendLongJson, alert.freq_once_per_bar_close)
     else if aPlusShortFire
-        alert(executionShortJson, alert.freq_once_per_bar_close)
+        alert(prioritySendShortJson, alert.freq_once_per_bar_close)
     else if aShortFire
-        alert(executionShortJson, alert.freq_once_per_bar_close)
+        alert(sendShortJson, alert.freq_once_per_bar_close)
     else if setupCandidateLong
         setupCandidateAlertedLong := true
         alert(setupCandidateLongJson, alert.freq_once_per_bar_close)
@@ -854,14 +931,14 @@ if barstate.isconfirmed
         setupCandidateAlertedShort := true
         alert(setupCandidateShortJson, alert.freq_once_per_bar_close)
     else if blockedLong
-        alert(blockedLongJson, alert.freq_once_per_bar_close)
+        alert(dropLongJson, alert.freq_once_per_bar_close)
     else if blockedShort
-        alert(blockedShortJson, alert.freq_once_per_bar_close)
+        alert(dropShortJson, alert.freq_once_per_bar_close)
     else if borderlineLong and not borderlineAlerted
-        alert(borderlineLongJson, alert.freq_once_per_bar_close)
+        alert(watchLongJson, alert.freq_once_per_bar_close)
         borderlineAlerted := true
     else if borderlineShort and not borderlineAlerted
-        alert(borderlineShortJson, alert.freq_once_per_bar_close)
+        alert(watchShortJson, alert.freq_once_per_bar_close)
         borderlineAlerted := true
 
 // ----------------------
@@ -873,17 +950,17 @@ if barstate.islast and showDebugTable
     table.cell(t, 0, 0, "Metric", text_color=color.white, bgcolor=color.black)
     table.cell(t, 1, 0, "Value", text_color=color.white, bgcolor=color.black)
 
-    sideTxt = finalClass > 0 ? (classAbs == 3 ? "A+ LONG" : "A LONG") : finalClass < 0 ? (classAbs == 3 ? "A+ SHORT" : "A SHORT") : "NO FIRE"
+    sideTxt = finalRoute > 0 ? (routeAbs == 3 ? "PRIORITY_SEND LONG" : "SEND LONG") : finalRoute < 0 ? (routeAbs == 3 ? "PRIORITY_SEND SHORT" : "SEND SHORT") : "NO ROUTE"
     armedTxt = armedActive ? (armedDir == 1 ? "ARMED LONG" : armedDir == -1 ? "ARMED SHORT" : "ARMED") : "IDLE"
-    htfTxt = htfSetupLong ? "5m LONG SETUP" : htfSetupShort ? "5m SHORT SETUP" : htfContextLong ? "5m LONG CTX" : htfContextShort ? "5m SHORT CTX" : "NO 5m EDGE"
-    currentObsState = aLongFire or aPlusLongFire or aShortFire or aPlusShortFire ? "execution_candidate" : blockedEvent ? "blocked_candidate" : borderlineEvent ? "borderline_candidate" : "idle"
-    currentObsSide = aLongFire or aPlusLongFire ? "long" : aShortFire or aPlusShortFire ? "short" : blockedLong ? "long" : blockedShort ? "short" : borderlineLong ? "long" : borderlineShort ? "short" : "unknown"
+    htfTxt = htfSetupLong ? "5m LONG SETUP" : htfSetupShort ? "5m SHORT SETUP" : htfCandidateLong ? "5m LONG CANDIDATE" : htfCandidateShort ? "5m SHORT CANDIDATE" : htfContextLong ? "5m LONG CTX" : htfContextShort ? "5m SHORT CTX" : "NO 5m EDGE"
+    currentObsState = aLongFire or aPlusLongFire or aShortFire or aPlusShortFire ? "send_candidate" : setupCandidateLong or setupCandidateShort ? "setup_candidate" : blockedEvent ? "drop_candidate" : borderlineEvent ? "send_watch_candidate" : "idle"
+    currentObsSide = aLongFire or aPlusLongFire ? "long" : aShortFire or aPlusShortFire ? "short" : setupCandidateLong ? "long" : setupCandidateShort ? "short" : blockedLong ? "long" : blockedShort ? "short" : borderlineLong ? "long" : borderlineShort ? "short" : "unknown"
 
     currentPassCount = aLongFire or aPlusLongFire ? executionLongPassCount : aShortFire or aPlusShortFire ? executionShortPassCount : blockedLong ? blockedLongPassCount : blockedShort ? blockedShortPassCount : borderlineLong ? borderlineLongPassCount : borderlineShort ? borderlineShortPassCount : 0
     currentFailCount = aLongFire or aPlusLongFire ? executionLongFailCount : aShortFire or aPlusShortFire ? executionShortFailCount : blockedLong ? blockedLongFailCount : blockedShort ? blockedShortFailCount : borderlineLong ? borderlineLongFailCount : borderlineShort ? borderlineShortFailCount : 0
-    currentPrimaryBlocker = aLongFire or aPlusLongFire ? executionLongBlocker : aShortFire or aPlusShortFire ? executionShortBlocker : blockedLong ? blockedLongBlocker : blockedShort ? blockedShortBlocker : borderlineLong ? borderlineLongBlocker : borderlineShort ? borderlineShortBlocker : ""
+    currentPrefilterHint = aLongFire or aPlusLongFire ? executionLongHint : aShortFire or aPlusShortFire ? executionShortHint : blockedLong ? dropLongHint : blockedShort ? dropShortHint : borderlineLong ? sendLongHint : borderlineShort ? sendShortHint : ""
 
-    table.cell(t, 0, 1, "Class")
+    table.cell(t, 0, 1, "Routing")
     table.cell(t, 1, 1, sideTxt)
 
     table.cell(t, 0, 2, "Armed state")
@@ -898,8 +975,8 @@ if barstate.islast and showDebugTable
     table.cell(t, 0, 5, "Detector side")
     table.cell(t, 1, 5, currentObsSide)
 
-    table.cell(t, 0, 6, "Primary blocker")
-    table.cell(t, 1, 6, str.length(currentPrimaryBlocker) > 0 ? currentPrimaryBlocker : "none")
+    table.cell(t, 0, 6, "Prefilter hint")
+    table.cell(t, 1, 6, str.length(currentPrefilterHint) > 0 ? currentPrefilterHint : "none")
 
     table.cell(t, 0, 7, "Pass count")
     table.cell(t, 1, 7, str.tostring(currentPassCount))

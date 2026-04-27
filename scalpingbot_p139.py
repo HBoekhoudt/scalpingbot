@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P154 | STAGE: TEST
+# IKBR SCALPING BOT | VERSION v1.6.0 P139 | STAGE: TEST
 # ==========================================================
 
 import logging
@@ -21,7 +21,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P154"
+BOT_PATCH = "P139"
 BOT_STAGE = "TEST"  # TEST | PAPER | LIVE
 
 logger = logging.getLogger("ikbr_scalpingbot")
@@ -52,9 +52,6 @@ INSTRUMENT_SPECS = {
         "min_size": 1,
         "size_step": 1,
         "max_size": None,
-        "containment_max_size": 10,
-        "notional_model": "future_contract_value",
-        "notional_currency": "USD",
         "session_profile": "US_INDEX",
     },
     "MES": {
@@ -75,9 +72,6 @@ INSTRUMENT_SPECS = {
         "min_size": 1,
         "size_step": 1,
         "max_size": None,
-        "containment_max_size": 10,
-        "notional_model": "future_contract_value",
-        "notional_currency": "USD",
         "session_profile": "US_INDEX",
     },
     "FDXM": {
@@ -97,10 +91,7 @@ INSTRUMENT_SPECS = {
         "entry_band_a_plus": 1.00,
         "min_size": 1,
         "size_step": 1,
-        "max_size": None,
-        "containment_max_size": 10,
-        "notional_model": "future_contract_value",
-        "notional_currency": "EUR",
+        "max_size": 10,
         "session_profile": "EU_INDEX",
     },
     "M6E": {
@@ -121,9 +112,6 @@ INSTRUMENT_SPECS = {
         "min_size": 1,
         "size_step": 1,
         "max_size": None,
-        "containment_max_size": 10,
-        "notional_model": "fx_future_contract_value",
-        "notional_currency": "USD",
         "session_profile": "FX",
     },
     "EURUSD": {
@@ -144,9 +132,6 @@ INSTRUMENT_SPECS = {
         "min_size": None,
         "size_step": None,
         "max_size": None,
-        "containment_max_size": 100000,
-        "notional_model": "spot_fx_base_units",
-        "notional_currency": "USD",
         "session_profile": "FX",
     },
 }
@@ -154,63 +139,6 @@ INSTRUMENT_SPECS = {
 QUALIFIED_FUTURE_SYMBOLS = ("MNQ", "MES", "M6E", "FDXM")
 
 EXECUTION_CAPITAL_BASE = 170000.0
-
-CONTAINMENT_STAGE_PROFILES = {
-    "TEST": {
-        "profile": "TEST_WIDE",
-        "exceeds_cap_action": "cap",
-        "max_sizes": {
-            "MNQ": 10,
-            "MES": 10,
-            "FDXM": 10,
-            "M6E": 10,
-            "EURUSD": 100000,
-        },
-        "max_notionals": {
-            "MNQ": 800000,
-            "MES": 300000,
-            "FDXM": 1500000,
-            "M6E": 200000,
-            "EURUSD": 100000,
-        },
-    },
-    "PAPER": {
-        "profile": "PAPER_CONSERVATIVE",
-        "exceeds_cap_action": "cap",
-        "max_sizes": {
-            "MNQ": 5,
-            "MES": 5,
-            "FDXM": 5,
-            "M6E": 5,
-            "EURUSD": 50000,
-        },
-        "max_notionals": {
-            "MNQ": 300000,
-            "MES": 150000,
-            "FDXM": 750000,
-            "M6E": 100000,
-            "EURUSD": 50000,
-        },
-    },
-    "LIVE": {
-        "profile": "LIVE_STRICT",
-        "exceeds_cap_action": "deny",
-        "max_sizes": {
-            "MNQ": 1,
-            "MES": 1,
-            "FDXM": 1,
-            "M6E": 1,
-            "EURUSD": 25000,
-        },
-        "max_notionals": {
-            "MNQ": 100000,
-            "MES": 50000,
-            "FDXM": 250000,
-            "M6E": 25000,
-            "EURUSD": 25000,
-        },
-    },
-}
 
 BRACKET_CONFIRM_STATUSES = {
     "PreSubmitted",
@@ -271,19 +199,6 @@ RECOGNIZED_STRATEGY_FAMILIES = {
 
 RUNTIME_ACTIVE_EXECUTION_STRATEGY_FAMILIES = {
     "DET",
-}
-
-CONTAINMENT_ACTION_HIERARCHY = (
-    "approve_as_is",
-    "capped",
-    "denied",
-)
-
-CONTAINMENT_DECISION_SOURCES = {
-    "none",
-    "size_containment",
-    "exposure_containment",
-    "stage_containment",
 }
 
 # ==========================================================
@@ -497,64 +412,6 @@ class ScalpingBot:
             "broker_type": spec["broker_type"],
         }
 
-    def get_containment_profile(self, stage=None):
-        return CONTAINMENT_STAGE_PROFILES.get(stage or BOT_STAGE)
-
-    def get_containment_max_size(self, symbol, stage=None):
-        profile = self.get_containment_profile(stage)
-        if profile is None:
-            return None
-        return profile.get("max_sizes", {}).get(symbol)
-
-    def get_containment_max_notional(self, symbol, stage=None):
-        profile = self.get_containment_profile(stage)
-        if profile is None:
-            return None
-        return profile.get("max_notionals", {}).get(symbol)
-
-    def get_notional_metadata(self, symbol):
-        spec = self.get_instrument_spec(symbol)
-        return spec.get("notional_model"), spec.get("notional_currency")
-
-    def estimate_notional_exposure(self, symbol, size, reference_price):
-        try:
-            notional_model, notional_currency = self.get_notional_metadata(symbol)
-            if not notional_model or not notional_currency:
-                return None
-            if size is None or reference_price is None:
-                return None
-            size_value = abs(float(size))
-            reference_value = abs(float(reference_price))
-            if size_value <= 0 or reference_value <= 0:
-                return None
-            return round(size_value * reference_value * self.get_point_value(symbol), 2)
-        except Exception:
-            return None
-
-    def derive_notional_capped_size(self, symbol, reference_price, max_notional):
-        single_unit_notional = self.estimate_notional_exposure(symbol, 1, reference_price)
-        if single_unit_notional is None or single_unit_notional <= 0:
-            return None, "invalid_single_unit_notional"
-        if max_notional is None or max_notional <= 0:
-            return None, "invalid_max_notional"
-
-        raw_capped_size = max_notional / single_unit_notional
-        constraints = self.get_size_constraints(symbol)
-
-        if constraints["broker_type"] == "future":
-            capped_size = self.normalize_position_size(symbol, raw_capped_size)
-            size_valid, validation_reason = self.validate_position_size(symbol, capped_size)
-            if not size_valid:
-                return capped_size, validation_reason
-            return capped_size, "size_valid"
-
-        capped_decimal = decimal.Decimal(str(raw_capped_size)).to_integral_value(
-            rounding=decimal.ROUND_DOWN
-        )
-        if capped_decimal <= 0:
-            return None, "size_non_positive"
-        return int(capped_decimal), "size_valid"
-
     def calculate_allowed_money_risk(self, execution_grade):
         intended_risk_percent = self.get_grade_risk_percent(execution_grade)
         if intended_risk_percent <= 0:
@@ -759,316 +616,6 @@ class ScalpingBot:
             "normalized_position_size": normalized_size,
             "validation_reason": validation_reason,
         }
-
-    def resolve_execution_containment(self, symbol, theoretical_size_before_containment, reference_price=None):
-        containment_stage = BOT_STAGE
-        containment_profile = self.get_containment_profile(containment_stage)
-        containment_profile_name = None
-        containment_exceeds_cap_action = None
-        containment_max_size = None
-        containment_max_notional = None
-        notional_model, notional_currency = self.get_notional_metadata(symbol)
-
-        if containment_profile is not None:
-            containment_profile_name = containment_profile.get("profile")
-            containment_exceeds_cap_action = containment_profile.get("exceeds_cap_action")
-            containment_max_size = containment_profile.get("max_sizes", {}).get(symbol)
-            containment_max_notional = containment_profile.get("max_notionals", {}).get(symbol)
-
-        def containment_result(
-            action,
-            reason,
-            approved_size,
-            capped_size,
-            triggering_rule,
-            decision_source,
-            denial_source=None,
-        ):
-            if action not in CONTAINMENT_ACTION_HIERARCHY:
-                action = "denied"
-                reason = f"invalid_containment_action:{reason}"
-                approved_size = None
-                decision_source = "stage_containment"
-                denial_source = "stage_containment"
-
-            if decision_source not in CONTAINMENT_DECISION_SOURCES:
-                decision_source = "stage_containment"
-                denial_source = "stage_containment"
-
-            if action == "approve_as_is" and decision_source != "none":
-                action = "denied"
-                reason = f"invalid_approve_as_is_decision_source:{decision_source}"
-                approved_size = None
-                decision_source = "stage_containment"
-                denial_source = "stage_containment"
-
-            if action in {"capped", "denied"} and decision_source == "none":
-                action = "denied"
-                reason = f"invalid_containment_decision_source:{reason}"
-                approved_size = None
-                decision_source = "stage_containment"
-                denial_source = "stage_containment"
-
-            if action == "denied" and denial_source not in CONTAINMENT_DECISION_SOURCES:
-                denial_source = decision_source
-
-            if action == "denied" and denial_source == "none":
-                denial_source = decision_source if decision_source != "none" else "stage_containment"
-
-            estimated_notional_after_size_containment = self.estimate_notional_exposure(
-                symbol,
-                capped_size,
-                reference_price,
-            )
-            return {
-                "containment_status": "active",
-                "containment_stage": containment_stage,
-                "containment_profile": containment_profile_name,
-                "containment_action": action,
-                "containment_reason": reason,
-                "containment_hierarchy": ">".join(CONTAINMENT_ACTION_HIERARCHY),
-                "containment_decision_source": decision_source,
-                "containment_denial_source": denial_source if action == "denied" else "none",
-                "triggering_containment_rule": triggering_rule,
-                "notional_model": notional_model,
-                "notional_currency": notional_currency,
-                "theoretical_size_before_containment": theoretical_size_before_containment,
-                "capped_size_after_size_containment": capped_size,
-                "approved_size_after_containment": approved_size,
-                "containment_max_size": containment_max_size,
-                "containment_max_notional": containment_max_notional,
-                "estimated_notional_before_containment": self.estimate_notional_exposure(
-                    symbol,
-                    theoretical_size_before_containment,
-                    reference_price,
-                ),
-                "estimated_notional_after_size_containment": estimated_notional_after_size_containment,
-                "estimated_notional_after_containment": self.estimate_notional_exposure(
-                    symbol,
-                    approved_size,
-                    reference_price,
-                ),
-            }
-
-        if containment_profile is None or not containment_profile_name:
-            return containment_result(
-                "denied",
-                "missing_or_invalid_containment_profile",
-                None,
-                None,
-                "stage_profile",
-                "stage_containment",
-                "stage_containment",
-            )
-
-        if containment_max_size is None or containment_max_size <= 0:
-            return containment_result(
-                "denied",
-                "missing_or_invalid_stage_containment_max_size",
-                None,
-                None,
-                "instrument_size_cap",
-                "stage_containment",
-                "stage_containment",
-            )
-
-        if containment_max_notional is None or containment_max_notional <= 0:
-            return containment_result(
-                "denied",
-                "missing_or_invalid_stage_containment_max_notional",
-                None,
-                None,
-                "instrument_notional_cap",
-                "stage_containment",
-                "stage_containment",
-            )
-
-        if not notional_model or not notional_currency:
-            return containment_result(
-                "denied",
-                "missing_or_invalid_notional_metadata",
-                None,
-                None,
-                "instrument_notional_model",
-                "stage_containment",
-                "stage_containment",
-            )
-
-        if theoretical_size_before_containment is None:
-            return containment_result(
-                "denied",
-                "missing_theoretical_size_before_containment",
-                None,
-                None,
-                "theoretical_size",
-                "size_containment",
-                "size_containment",
-            )
-
-        if theoretical_size_before_containment <= 0:
-            return containment_result(
-                "denied",
-                "non_positive_theoretical_size_before_containment",
-                None,
-                None,
-                "theoretical_size",
-                "size_containment",
-                "size_containment",
-            )
-
-        if theoretical_size_before_containment <= containment_max_size:
-            approved_size_after_containment = theoretical_size_before_containment
-            capped_size_after_size_containment = theoretical_size_before_containment
-            containment_action = "approve_as_is"
-            containment_reason = "within_instrument_cap"
-            triggering_containment_rule = "none"
-        else:
-            if containment_exceeds_cap_action == "deny":
-                return containment_result(
-                    "denied",
-                    "exceeds_live_containment_cap",
-                    None,
-                    None,
-                    "instrument_size_cap",
-                    "stage_containment",
-                    "stage_containment",
-                )
-
-            if containment_exceeds_cap_action != "cap":
-                return containment_result(
-                    "denied",
-                    "invalid_containment_exceeds_cap_action",
-                    None,
-                    None,
-                    "stage_profile",
-                    "stage_containment",
-                    "stage_containment",
-                )
-
-            approved_size_after_containment = containment_max_size
-            capped_size_after_size_containment = containment_max_size
-            containment_action = "capped"
-            containment_reason = "exceeds_instrument_cap"
-            triggering_containment_rule = "instrument_size_cap"
-
-        if (
-            approved_size_after_containment is None or
-            approved_size_after_containment <= 0
-        ):
-            return containment_result(
-                "denied",
-                "capped_size_invalid:size_non_positive",
-                approved_size_after_containment,
-                capped_size_after_size_containment,
-                "instrument_size_cap",
-                "size_containment",
-                "size_containment",
-            )
-
-        size_constraints = self.get_size_constraints(symbol)
-        if size_constraints["broker_type"] == "future":
-            size_valid, validation_reason = self.validate_position_size(
-                symbol,
-                approved_size_after_containment,
-            )
-            if not size_valid:
-                return containment_result(
-                    "denied",
-                    f"capped_size_invalid:{validation_reason or 'size_invalid'}",
-                    approved_size_after_containment,
-                    capped_size_after_size_containment,
-                    "instrument_size_cap",
-                    "size_containment",
-                    "size_containment",
-                )
-
-        estimated_notional_after_containment = self.estimate_notional_exposure(
-            symbol,
-            approved_size_after_containment,
-            reference_price,
-        )
-
-        if estimated_notional_after_containment is None:
-            return containment_result(
-                "denied",
-                "estimated_notional_unavailable",
-                approved_size_after_containment,
-                capped_size_after_size_containment,
-                "instrument_notional_cap",
-                "exposure_containment",
-                "exposure_containment",
-            )
-
-        if estimated_notional_after_containment <= containment_max_notional:
-            return containment_result(
-                containment_action,
-                containment_reason,
-                approved_size_after_containment,
-                capped_size_after_size_containment,
-                triggering_containment_rule,
-                "none" if containment_action == "approve_as_is" else "size_containment",
-            )
-
-        notional_capped_size, notional_cap_reason = self.derive_notional_capped_size(
-            symbol,
-            reference_price,
-            containment_max_notional,
-        )
-        if (
-            notional_capped_size is None or
-            notional_capped_size <= 0 or
-            notional_capped_size >= approved_size_after_containment
-        ):
-            return containment_result(
-                "denied",
-                f"notional_cap_unable_to_reduce:{notional_cap_reason}",
-                None,
-                capped_size_after_size_containment,
-                "instrument_notional_cap",
-                "exposure_containment",
-                "exposure_containment",
-            )
-
-        if size_constraints["broker_type"] == "future":
-            size_valid, validation_reason = self.validate_position_size(symbol, notional_capped_size)
-            if not size_valid:
-                return containment_result(
-                    "denied",
-                    f"notional_capped_size_invalid:{validation_reason or 'size_invalid'}",
-                    notional_capped_size,
-                    capped_size_after_size_containment,
-                    "instrument_notional_cap",
-                    "exposure_containment",
-                    "exposure_containment",
-                )
-
-        estimated_notional_after_notional_cap = self.estimate_notional_exposure(
-            symbol,
-            notional_capped_size,
-            reference_price,
-        )
-        if (
-            estimated_notional_after_notional_cap is None or
-            estimated_notional_after_notional_cap > containment_max_notional
-        ):
-            return containment_result(
-                "denied",
-                "notional_capped_size_still_exceeds_cap",
-                notional_capped_size,
-                capped_size_after_size_containment,
-                "instrument_notional_cap",
-                "exposure_containment",
-                "exposure_containment",
-            )
-
-        return containment_result(
-            "capped",
-            "exceeds_instrument_notional_cap",
-            notional_capped_size,
-            capped_size_after_size_containment,
-            "instrument_notional_cap",
-            "exposure_containment",
-        )
 
     def get_fallback_stop_distance(self, symbol, execution_grade=None):
         """Return instrument-aware fallback stop distance in price units (not ticks).
@@ -1767,37 +1314,10 @@ class ScalpingBot:
             "stop_distance_points": job.get("stop_distance_points"),
             "raw_position_size": job.get("raw_position_size"),
             "normalized_position_size": job.get("normalized_position_size"),
-            "risk_intent_profile": job.get("risk_intent_profile"),
-            "risk_intent_percent": job.get("risk_intent_percent"),
-            "risk_intent_status": job.get("risk_intent_status"),
-            "risk_intent_reason": job.get("risk_intent_reason"),
-            "theoretical_size_before_containment": job.get("theoretical_size_before_containment"),
-            "containment_status": job.get("containment_status"),
-            "containment_stage": job.get("containment_stage"),
-            "containment_profile": job.get("containment_profile"),
-            "containment_max_size": job.get("containment_max_size"),
-            "containment_max_notional": job.get("containment_max_notional"),
-            "containment_hierarchy": job.get("containment_hierarchy"),
-            "containment_decision_source": job.get("containment_decision_source"),
-            "containment_denial_source": job.get("containment_denial_source"),
-            "triggering_containment_rule": job.get("triggering_containment_rule"),
-            "notional_model": job.get("notional_model"),
-            "notional_currency": job.get("notional_currency"),
-            "capped_size_after_size_containment": job.get("capped_size_after_size_containment"),
-            "estimated_notional_before_containment": job.get("estimated_notional_before_containment"),
-            "estimated_notional_after_size_containment": job.get("estimated_notional_after_size_containment"),
-            "estimated_notional_after_containment": job.get("estimated_notional_after_containment"),
-            "containment_action": job.get("containment_action"),
-            "containment_reason": job.get("containment_reason"),
-            "approved_size_after_containment": job.get("approved_size_after_containment"),
-            "intended_parent_quantity": float(
-                job.get("approved_size_after_containment") or 0.0
-            ),
-            "original_intended_parent_quantity": float(
-                job.get("approved_size_after_containment") or 0.0
-            ),
-            "planned_position_size": job.get("approved_size_after_containment"),
-            "position_size": job.get("approved_size_after_containment"),
+            "intended_parent_quantity": float(job.get("normalized_position_size", 0.0) or 0.0),
+            "original_intended_parent_quantity": float(job.get("normalized_position_size", 0.0) or 0.0),
+            "planned_position_size": job.get("normalized_position_size", 0.0),
+            "position_size": job.get("normalized_position_size", 0.0),
             "realized_entry_quantity": None,
             "realized_exit_quantity": None,
             "cumulative_entry_quantity": 0.0,
@@ -1904,29 +1424,6 @@ class ScalpingBot:
                 f"REGISTERED symbol={record['symbol']} side={record['side']} "
                 f"grade={record['grade']} det_classification={record['det_classification']} "
                 f"truth_classification={record['truth_classification']} "
-                f"risk_intent_profile={record.get('risk_intent_profile')} "
-                f"risk_intent_percent={record.get('risk_intent_percent')} "
-                f"risk_intent_status={record.get('risk_intent_status')} "
-                f"risk_intent_reason={record.get('risk_intent_reason')} "
-                f"theoretical_size_before_containment={record.get('theoretical_size_before_containment')} "
-                f"containment_status={record.get('containment_status')} "
-                f"containment_stage={record.get('containment_stage')} "
-                f"containment_profile={record.get('containment_profile')} "
-                f"containment_max_size={record.get('containment_max_size')} "
-                f"containment_max_notional={record.get('containment_max_notional')} "
-                f"containment_hierarchy={record.get('containment_hierarchy')} "
-                f"containment_decision_source={record.get('containment_decision_source')} "
-                f"containment_denial_source={record.get('containment_denial_source')} "
-                f"triggering_containment_rule={record.get('triggering_containment_rule')} "
-                f"notional_model={record.get('notional_model')} "
-                f"notional_currency={record.get('notional_currency')} "
-                f"capped_size_after_size_containment={record.get('capped_size_after_size_containment')} "
-                f"estimated_notional_before_containment={record.get('estimated_notional_before_containment')} "
-                f"estimated_notional_after_size_containment={record.get('estimated_notional_after_size_containment')} "
-                f"estimated_notional_after_containment={record.get('estimated_notional_after_containment')} "
-                f"containment_action={record.get('containment_action')} "
-                f"containment_reason={record.get('containment_reason')} "
-                f"approved_size_after_containment={record.get('approved_size_after_containment')} "
                 f"execution_lane={record['execution_lane']} "
                 f"promoted_from_shadow={record['promoted_from_shadow']} "
                 f"entry={record['entry_price']} stop={record['stop_price']} target={record['target_price']}"
@@ -3683,29 +3180,6 @@ class ScalpingBot:
                 f"det_classification={record['det_classification']} "
                 f"primary_reason={record.get('primary_reason')} "
                 f"execution_validation_status={record.get('execution_validation_status')} "
-                f"risk_intent_profile={record.get('risk_intent_profile')} "
-                f"risk_intent_percent={record.get('risk_intent_percent')} "
-                f"risk_intent_status={record.get('risk_intent_status')} "
-                f"risk_intent_reason={record.get('risk_intent_reason')} "
-                f"theoretical_size_before_containment={record.get('theoretical_size_before_containment')} "
-                f"containment_status={record.get('containment_status')} "
-                f"containment_stage={record.get('containment_stage')} "
-                f"containment_profile={record.get('containment_profile')} "
-                f"containment_max_size={record.get('containment_max_size')} "
-                f"containment_max_notional={record.get('containment_max_notional')} "
-                f"containment_hierarchy={record.get('containment_hierarchy')} "
-                f"containment_decision_source={record.get('containment_decision_source')} "
-                f"containment_denial_source={record.get('containment_denial_source')} "
-                f"triggering_containment_rule={record.get('triggering_containment_rule')} "
-                f"notional_model={record.get('notional_model')} "
-                f"notional_currency={record.get('notional_currency')} "
-                f"capped_size_after_size_containment={record.get('capped_size_after_size_containment')} "
-                f"estimated_notional_before_containment={record.get('estimated_notional_before_containment')} "
-                f"estimated_notional_after_size_containment={record.get('estimated_notional_after_size_containment')} "
-                f"estimated_notional_after_containment={record.get('estimated_notional_after_containment')} "
-                f"containment_action={record.get('containment_action')} "
-                f"containment_reason={record.get('containment_reason')} "
-                f"approved_size_after_containment={record.get('approved_size_after_containment')} "
                 f"planned_position_size={record['planned_position_size']} "
                 f"original_intended_parent_quantity={record.get('original_intended_parent_quantity')} "
                 f"intended_parent_quantity={record['intended_parent_quantity']} "
@@ -6685,19 +6159,6 @@ class ScalpingBot:
             "allowed_money_risk": allowed_money_risk,
         }
 
-    def resolve_risk_intent(self, classification):
-        risk_profile_result = self.resolve_risk_profile(classification)
-        return {
-            "classification": classification,
-            "risk_intent_profile": risk_profile_result["risk_profile"],
-            "risk_intent_percent": risk_profile_result["risk_percent"],
-            "allowed_money_risk": risk_profile_result["allowed_money_risk"],
-            "risk_intent_status": "RISK_INTENT_DEFINED",
-            "risk_intent_reason": "classification_mapped_to_risk_intent",
-            "risk_profile": risk_profile_result["risk_profile"],
-            "risk_percent": risk_profile_result["risk_percent"],
-        }
-
     def resolve_execution_intent(
         self,
         strategy_family,
@@ -6814,7 +6275,7 @@ class ScalpingBot:
         classification = self.map_det_truth_to_generic_classification(
             final_truth_classification
         )
-        risk_intent_result = self.resolve_risk_intent(classification)
+        risk_profile_result = self.resolve_risk_profile(classification)
 
         strategy_family = normalized["strategy_family"]
         if strategy_family not in RECOGNIZED_STRATEGY_FAMILIES:
@@ -6827,13 +6288,9 @@ class ScalpingBot:
             "det_classification": det_classification,
             "execution_permission": execution_permission,
             "execution_grade": execution_grade,
-            "risk_intent_profile": risk_intent_result["risk_intent_profile"],
-            "risk_intent_percent": risk_intent_result["risk_intent_percent"],
-            "risk_intent_status": risk_intent_result["risk_intent_status"],
-            "risk_intent_reason": risk_intent_result["risk_intent_reason"],
-            "risk_profile": risk_intent_result["risk_profile"],
-            "risk_percent": risk_intent_result["risk_percent"],
-            "allowed_money_risk": risk_intent_result["allowed_money_risk"],
+            "risk_profile": risk_profile_result["risk_profile"],
+            "risk_percent": risk_profile_result["risk_percent"],
+            "allowed_money_risk": risk_profile_result["allowed_money_risk"],
             "execution_intent_status": "NO_EXECUTION_INTENT",
             "execution_intent_reason": "execution_intent_pending_queue_decision",
             "execution_candidate": False,
@@ -6895,12 +6352,9 @@ class ScalpingBot:
             "DET EVALUATOR RESULT | "
             f"strategy_family={formal_contract['strategy_family']} "
             f"classification={formal_contract['classification']} "
+            f"risk_profile={formal_contract['risk_profile']} "
             f"truth_classification={formal_contract['truth_classification']} "
             f"det_classification={formal_contract['det_classification']} "
-            f"risk_intent_profile={formal_contract['risk_intent_profile']} "
-            f"risk_intent_percent={formal_contract['risk_intent_percent']} "
-            f"risk_intent_status={formal_contract['risk_intent_status']} "
-            f"risk_intent_reason={formal_contract['risk_intent_reason']} "
             f"execution_grade={formal_contract['execution_grade']} "
             f"primary_reason={formal_contract['primary_reason']}"
         )
@@ -8673,10 +8127,6 @@ class ScalpingBot:
             "strategy_family": formal_contract["strategy_family"],
             "classification": formal_contract["classification"],
             "risk_profile": formal_contract["risk_profile"],
-            "risk_intent_profile": formal_contract["risk_intent_profile"],
-            "risk_intent_percent": formal_contract["risk_intent_percent"],
-            "risk_intent_status": formal_contract["risk_intent_status"],
-            "risk_intent_reason": formal_contract["risk_intent_reason"],
             "execution_intent_reason": formal_contract["execution_intent_reason"],
             "execution_intent_status": formal_contract["execution_intent_status"],
             "generic_execution_permission": formal_contract["generic_execution_permission"],
@@ -8688,23 +8138,6 @@ class ScalpingBot:
             "execution_lane": gate_result["execution_lane"],
             "promoted_from_shadow": gate_result["promoted_from_shadow"],
             "shadow_override_reason": gate_result["shadow_override_reason"],
-            "theoretical_size_before_containment": None,
-            "approved_size_after_containment": None,
-            "containment_status": "prepared_not_active",
-            "containment_action": "approve_as_is",
-            "containment_reason": "containment_preparation_only",
-            "containment_hierarchy": ">".join(CONTAINMENT_ACTION_HIERARCHY),
-            "containment_decision_source": "none",
-            "containment_denial_source": "none",
-            "triggering_containment_rule": "none",
-            "containment_max_size": None,
-            "containment_max_notional": None,
-            "notional_model": None,
-            "notional_currency": None,
-            "capped_size_after_size_containment": None,
-            "estimated_notional_before_containment": None,
-            "estimated_notional_after_size_containment": None,
-            "estimated_notional_after_containment": None,
             "reference_price": reference_price,
             "planned_executable_entry": planned_executable_entry,
             "normalized_signal": normalized,
@@ -9240,7 +8673,6 @@ class ScalpingBot:
         side = job["side"]
         size_constraints = self.get_size_constraints(symbol)
         configured_max_size = size_constraints["max_size"]
-        configured_containment_max_size = self.get_containment_max_size(symbol)
         configured_min_stop_distance = self.get_min_stop_distance(symbol)
 
         entry_plan = self.derive_executable_entry_plan_from_job(job)
@@ -9270,8 +8702,8 @@ class ScalpingBot:
             containment_reason = None
             if configured_min_stop_distance is None or configured_min_stop_distance <= 0:
                 containment_reason = "missing_or_invalid_configured_min_stop_distance"
-            elif configured_containment_max_size is None or configured_containment_max_size <= 0:
-                containment_reason = "missing_or_invalid_configured_containment_max_size"
+            elif configured_max_size is None or configured_max_size <= 0:
+                containment_reason = "missing_or_invalid_configured_max_size"
             elif stop_validation["final_stop_distance"] is None:
                 containment_reason = "missing_final_stop_distance"
 
@@ -9285,7 +8717,7 @@ class ScalpingBot:
                 f"configured_min_stop_distance={configured_min_stop_distance} "
                 "raw_size=None "
                 "normalized_size=None "
-                f"configured_containment_max_size={configured_containment_max_size} "
+                f"configured_max_size={configured_max_size} "
                 "size_capping_happened=None "
                 f"stop_floor_affected_execution_eligibility={stop_floor_affected_execution_eligibility} "
                 f"containment_reason={containment_reason or 'stop_containment_ready'} "
@@ -9303,7 +8735,7 @@ class ScalpingBot:
                     f"configured_min_stop_distance={configured_min_stop_distance} "
                     "raw_size=None "
                     "normalized_size=None "
-                    f"configured_containment_max_size={configured_containment_max_size} "
+                    f"configured_max_size={configured_max_size} "
                     "size_capping_happened=None "
                     f"stop_floor_affected_execution_eligibility={stop_floor_affected_execution_eligibility} "
                     f"reason={containment_reason}"
@@ -9359,9 +8791,9 @@ class ScalpingBot:
         raw_size = sizing_result["raw_position_size"]
         normalized_size = sizing_result["normalized_position_size"]
         size_capping_happened = bool(
-            configured_containment_max_size is not None and
-            normalized_size is not None and
-            normalized_size > configured_containment_max_size
+            configured_max_size is not None and
+            raw_size is not None and
+            raw_size > configured_max_size
         )
 
         if symbol == "FDXM":
@@ -9381,7 +8813,7 @@ class ScalpingBot:
                 f"configured_min_stop_distance={configured_min_stop_distance} "
                 f"raw_size={raw_size} "
                 f"normalized_size={normalized_size} "
-                f"configured_containment_max_size={configured_containment_max_size} "
+                f"configured_max_size={configured_max_size} "
                 f"size_capping_happened={size_capping_happened} "
                 f"stop_floor_affected_execution_eligibility={stop_floor_affected_execution_eligibility} "
                 f"containment_reason={containment_reason or 'sizing_containment_ready'} "
@@ -9400,7 +8832,7 @@ class ScalpingBot:
                     f"configured_min_stop_distance={configured_min_stop_distance} "
                     f"raw_size={raw_size} "
                     f"normalized_size={normalized_size} "
-                    f"configured_containment_max_size={configured_containment_max_size} "
+                    f"configured_max_size={configured_max_size} "
                     f"size_capping_happened={size_capping_happened} "
                     f"stop_floor_affected_execution_eligibility={stop_floor_affected_execution_eligibility} "
                     f"reason={containment_reason}"
@@ -9458,252 +8890,21 @@ class ScalpingBot:
         job["stop_distance_points"] = sizing_result["stop_distance_points"]
         job["raw_position_size"] = sizing_result["raw_position_size"]
         job["normalized_position_size"] = normalized_size
-        job["risk_intent_profile"] = job.get("risk_intent_profile", job.get("risk_profile"))
-        job["risk_intent_percent"] = job.get("risk_intent_percent", sizing_result["intended_risk_percent"])
-        job["risk_intent_status"] = job.get("risk_intent_status", "RISK_INTENT_DEFINED")
-        job["risk_intent_reason"] = job.get("risk_intent_reason", "classification_mapped_to_risk_intent")
-        containment_result = self.resolve_execution_containment(symbol, normalized_size, entry)
-        job["theoretical_size_before_containment"] = containment_result["theoretical_size_before_containment"]
-        job["containment_status"] = containment_result["containment_status"]
-        job["containment_stage"] = containment_result["containment_stage"]
-        job["containment_profile"] = containment_result["containment_profile"]
-        job["containment_max_size"] = containment_result["containment_max_size"]
-        job["containment_max_notional"] = containment_result["containment_max_notional"]
-        job["containment_hierarchy"] = containment_result["containment_hierarchy"]
-        job["containment_decision_source"] = containment_result["containment_decision_source"]
-        job["containment_denial_source"] = containment_result["containment_denial_source"]
-        job["triggering_containment_rule"] = containment_result["triggering_containment_rule"]
-        job["notional_model"] = containment_result["notional_model"]
-        job["notional_currency"] = containment_result["notional_currency"]
-        job["capped_size_after_size_containment"] = containment_result["capped_size_after_size_containment"]
-        job["estimated_notional_before_containment"] = containment_result["estimated_notional_before_containment"]
-        job["estimated_notional_after_size_containment"] = containment_result["estimated_notional_after_size_containment"]
-        job["estimated_notional_after_containment"] = containment_result["estimated_notional_after_containment"]
-        job["containment_action"] = containment_result["containment_action"]
-        job["containment_reason"] = containment_result["containment_reason"]
-        job["approved_size_after_containment"] = containment_result["approved_size_after_containment"]
-        approved_size_after_containment = job["approved_size_after_containment"]
 
-        logger.info(
-            "EXECUTION CANDIDATE DET OUTCOME | "
-            f"symbol={symbol} "
-            f"grade={job.get('grade', '')} "
-            f"truth_classification={job.get('truth_classification', '')} "
-            f"det_classification={job.get('det_classification', '')} "
-            f"execution_lane={job.get('execution_lane', 'standard')} "
-            f"promoted_from_shadow={job.get('promoted_from_shadow', False)} "
-            f"shadow_override_reason={job.get('shadow_override_reason', '')}"
-        )
-        logger.info(
-            "EXECUTION CANDIDATE RISK INTENT | "
-            f"symbol={symbol} "
-            f"risk_intent_profile={job.get('risk_intent_profile')} "
-            f"risk_intent_percent={job.get('risk_intent_percent')} "
-            f"risk_intent_status={job.get('risk_intent_status')} "
-            f"risk_intent_reason={job.get('risk_intent_reason')} "
-            f"allowed_money_risk={job.get('allowed_money_risk')} "
-            f"stop_distance_points={job.get('stop_distance_points')} "
-            f"raw_position_size={job.get('raw_position_size')} "
-            f"normalized_position_size={job.get('normalized_position_size')}"
-        )
-        logger.info(
-            "EXECUTION CANDIDATE CONTAINMENT | "
-            f"symbol={symbol} "
-            f"containment_status={job.get('containment_status')} "
-            f"containment_stage={job.get('containment_stage')} "
-            f"containment_profile={job.get('containment_profile')} "
-            f"containment_action={job.get('containment_action')} "
-            f"containment_reason={job.get('containment_reason')} "
-            f"containment_hierarchy={job.get('containment_hierarchy')} "
-            f"containment_decision_source={job.get('containment_decision_source')} "
-            f"containment_denial_source={job.get('containment_denial_source')} "
-            f"triggering_containment_rule={job.get('triggering_containment_rule')} "
-            f"notional_model={job.get('notional_model')} "
-            f"notional_currency={job.get('notional_currency')} "
-            f"containment_max_size={job.get('containment_max_size')} "
-            f"containment_max_notional={job.get('containment_max_notional')} "
-            f"theoretical_size_before_containment={job.get('theoretical_size_before_containment')} "
-            f"capped_size_after_size_containment={job.get('capped_size_after_size_containment')} "
-            f"estimated_notional_before_containment={job.get('estimated_notional_before_containment')} "
-            f"estimated_notional_after_size_containment={job.get('estimated_notional_after_size_containment')} "
-            f"estimated_notional_after_containment={job.get('estimated_notional_after_containment')} "
-            f"approved_size_after_containment={job.get('approved_size_after_containment')}"
-        )
-
-        if job.get("containment_action") == "denied":
-            if job.get("containment_denial_source") not in CONTAINMENT_DECISION_SOURCES or job.get("containment_denial_source") == "none":
-                job["containment_reason"] = (
-                    f"final_containment_coherence_failed:invalid_denial_source:"
-                    f"{job.get('containment_reason')}"
-                )
-                job["containment_decision_source"] = "stage_containment"
-                job["containment_denial_source"] = "stage_containment"
-                job["approved_size_after_containment"] = None
-            logger.error(
-                "EXECUTION CONTAINMENT DENIED | "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"containment_status={job.get('containment_status')} "
-                f"containment_stage={job.get('containment_stage')} "
-                f"containment_profile={job.get('containment_profile')} "
-                f"containment_action={job.get('containment_action')} "
-                f"containment_reason={job.get('containment_reason')} "
-                f"containment_hierarchy={job.get('containment_hierarchy')} "
-                f"containment_decision_source={job.get('containment_decision_source')} "
-                f"containment_denial_source={job.get('containment_denial_source')} "
-                f"triggering_containment_rule={job.get('triggering_containment_rule')} "
-                f"notional_model={job.get('notional_model')} "
-                f"notional_currency={job.get('notional_currency')} "
-                f"containment_max_size={job.get('containment_max_size')} "
-                f"containment_max_notional={job.get('containment_max_notional')} "
-                f"theoretical_size_before_containment={job.get('theoretical_size_before_containment')} "
-                f"capped_size_after_size_containment={job.get('capped_size_after_size_containment')} "
-                f"estimated_notional_before_containment={job.get('estimated_notional_before_containment')} "
-                f"estimated_notional_after_size_containment={job.get('estimated_notional_after_size_containment')} "
-                f"estimated_notional_after_containment={job.get('estimated_notional_after_containment')} "
-                f"approved_size_after_containment={job.get('approved_size_after_containment')}"
-            )
-            return
-
-        if job.get("containment_action") == "capped":
+        if (
+            configured_max_size is not None and
+            sizing_result["raw_position_size"] is not None and
+            sizing_result["raw_position_size"] > configured_max_size
+        ):
             logger.warning(
-                "EXECUTION CONTAINMENT CAPPED | "
+                "POSITION SIZE CAPPED | "
                 f"symbol={symbol} "
                 f"side={side} "
-                f"containment_stage={job.get('containment_stage')} "
-                f"containment_profile={job.get('containment_profile')} "
-                f"theoretical_size_before_containment={job.get('theoretical_size_before_containment')} "
-                f"capped_size_after_size_containment={job.get('capped_size_after_size_containment')} "
-                f"approved_size_after_containment={job.get('approved_size_after_containment')} "
-                f"containment_max_size={job.get('containment_max_size')} "
-                f"containment_max_notional={job.get('containment_max_notional')} "
-                f"notional_model={job.get('notional_model')} "
-                f"notional_currency={job.get('notional_currency')} "
-                f"estimated_notional_before_containment={job.get('estimated_notional_before_containment')} "
-                f"estimated_notional_after_size_containment={job.get('estimated_notional_after_size_containment')} "
-                f"estimated_notional_after_containment={job.get('estimated_notional_after_containment')} "
-                f"triggering_containment_rule={job.get('triggering_containment_rule')} "
-                f"containment_decision_source={job.get('containment_decision_source')} "
-                f"containment_denial_source={job.get('containment_denial_source')} "
-                f"reason={job.get('containment_reason')}"
+                f"raw_size={sizing_result['raw_position_size']} "
+                f"normalized_size={normalized_size} "
+                f"max_size={configured_max_size} "
+                "reason=max_size_applied"
             )
-
-        containment_fail_closed_reason = None
-        containment_action = job.get("containment_action")
-        decision_source = job.get("containment_decision_source")
-        theoretical_size = job.get("theoretical_size_before_containment")
-        estimated_notional_after_containment = job.get("estimated_notional_after_containment")
-        containment_max_notional = job.get("containment_max_notional")
-
-        if containment_action not in CONTAINMENT_ACTION_HIERARCHY:
-            containment_fail_closed_reason = "invalid_containment_action"
-            decision_source = "stage_containment"
-        elif job.get("containment_status") != "active":
-            containment_fail_closed_reason = "containment_status_not_active"
-            decision_source = "stage_containment"
-        elif not job.get("containment_stage") or not job.get("containment_profile"):
-            containment_fail_closed_reason = "missing_stage_containment_context"
-            decision_source = "stage_containment"
-        elif decision_source not in CONTAINMENT_DECISION_SOURCES:
-            containment_fail_closed_reason = "invalid_containment_decision_source"
-            decision_source = "stage_containment"
-        elif containment_action == "approve_as_is" and decision_source != "none":
-            containment_fail_closed_reason = "approve_as_is_decision_source_not_none"
-            decision_source = "stage_containment"
-        elif containment_action == "capped" and decision_source not in {"size_containment", "exposure_containment"}:
-            containment_fail_closed_reason = "capped_decision_source_invalid"
-            decision_source = "stage_containment"
-        elif approved_size_after_containment is None:
-            containment_fail_closed_reason = "missing_containment_approved_size"
-            decision_source = "size_containment"
-        else:
-            try:
-                approved_size_value = float(approved_size_after_containment)
-                theoretical_size_value = float(theoretical_size)
-            except Exception:
-                containment_fail_closed_reason = "containment_size_values_not_numeric"
-                decision_source = "size_containment"
-            else:
-                if approved_size_value <= 0 or theoretical_size_value <= 0:
-                    containment_fail_closed_reason = "containment_size_values_non_positive"
-                    decision_source = "size_containment"
-                elif approved_size_value > theoretical_size_value + 1e-9:
-                    containment_fail_closed_reason = "approved_size_exceeds_theoretical_size"
-                    decision_source = "size_containment"
-                elif containment_action == "approve_as_is" and abs(approved_size_value - theoretical_size_value) > 1e-9:
-                    containment_fail_closed_reason = "approve_as_is_size_mismatch"
-                    decision_source = "size_containment"
-                elif containment_action == "capped" and approved_size_value >= theoretical_size_value - 1e-9:
-                    containment_fail_closed_reason = "capped_size_not_reduced"
-                    decision_source = "size_containment"
-                elif size_constraints["broker_type"] == "future":
-                    size_valid, validation_reason = self.validate_position_size(
-                        symbol,
-                        approved_size_after_containment,
-                    )
-                    if not size_valid:
-                        containment_fail_closed_reason = (
-                            f"approved_size_invalid:{validation_reason or 'size_invalid'}"
-                        )
-                        decision_source = "size_containment"
-
-        if containment_fail_closed_reason is None:
-            if containment_max_notional is None:
-                containment_fail_closed_reason = "missing_or_invalid_containment_max_notional"
-                decision_source = "stage_containment"
-            elif estimated_notional_after_containment is None:
-                containment_fail_closed_reason = "approved_notional_unavailable"
-                decision_source = "exposure_containment"
-            else:
-                try:
-                    approved_notional_value = float(estimated_notional_after_containment)
-                    containment_max_notional_value = float(containment_max_notional)
-                except Exception:
-                    containment_fail_closed_reason = "containment_notional_values_not_numeric"
-                    decision_source = "exposure_containment"
-                else:
-                    if approved_notional_value <= 0:
-                        containment_fail_closed_reason = "approved_notional_non_positive"
-                        decision_source = "exposure_containment"
-                    elif containment_max_notional_value <= 0:
-                        containment_fail_closed_reason = "containment_max_notional_non_positive"
-                        decision_source = "stage_containment"
-                    elif approved_notional_value > containment_max_notional_value:
-                        containment_fail_closed_reason = "approved_notional_exceeds_containment_cap"
-                        decision_source = "exposure_containment"
-
-        if containment_fail_closed_reason is not None:
-            fail_closed_triggering_rule = {
-                "size_containment": "instrument_size_cap",
-                "exposure_containment": "instrument_notional_cap",
-                "stage_containment": "stage_profile",
-            }.get(decision_source, "stage_profile")
-            job["containment_action"] = "denied"
-            job["containment_reason"] = f"final_containment_coherence_failed:{containment_fail_closed_reason}"
-            job["containment_decision_source"] = decision_source
-            job["containment_denial_source"] = decision_source
-            job["triggering_containment_rule"] = fail_closed_triggering_rule
-            job["approved_size_after_containment"] = None
-            approved_size_after_containment = None
-            logger.error(
-                "EXECUTION CONTAINMENT FAIL-CLOSED | "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"containment_stage={job.get('containment_stage')} "
-                f"containment_profile={job.get('containment_profile')} "
-                f"containment_action={job.get('containment_action')} "
-                f"containment_reason={job.get('containment_reason')} "
-                f"containment_decision_source={job.get('containment_decision_source')} "
-                f"containment_denial_source={job.get('containment_denial_source')} "
-                f"triggering_containment_rule={job.get('triggering_containment_rule')} "
-                f"theoretical_size_before_containment={job.get('theoretical_size_before_containment')} "
-                f"capped_size_after_size_containment={job.get('capped_size_after_size_containment')} "
-                f"approved_size_after_containment={job.get('approved_size_after_containment')} "
-                f"estimated_notional_after_containment={job.get('estimated_notional_after_containment')} "
-                f"containment_max_notional={job.get('containment_max_notional')} "
-                "decision=no_order_submitted"
-            )
-            return
 
         if side == "long":
             parent_action = "BUY"
@@ -9733,25 +8934,7 @@ class ScalpingBot:
             f"stop_source={stop_plan['stop_source']} "
             f"selected_stop_source={stop_plan['selected_stop_source']} "
             f"final_target={target} "
-            f"containment_stage={job.get('containment_stage')} "
-            f"containment_profile={job.get('containment_profile')} "
-            f"containment_max_size={job.get('containment_max_size')} "
-            f"containment_max_notional={job.get('containment_max_notional')} "
-            f"containment_hierarchy={job.get('containment_hierarchy')} "
-            f"containment_decision_source={job.get('containment_decision_source')} "
-            f"containment_denial_source={job.get('containment_denial_source')} "
-            f"triggering_containment_rule={job.get('triggering_containment_rule')} "
-            f"notional_model={job.get('notional_model')} "
-            f"notional_currency={job.get('notional_currency')} "
-            f"theoretical_size_before_containment={job.get('theoretical_size_before_containment')} "
-            f"capped_size_after_size_containment={job.get('capped_size_after_size_containment')} "
-            f"estimated_notional_before_containment={job.get('estimated_notional_before_containment')} "
-            f"estimated_notional_after_size_containment={job.get('estimated_notional_after_size_containment')} "
-            f"estimated_notional_after_containment={job.get('estimated_notional_after_containment')} "
-            f"approved_size_after_containment={approved_size_after_containment} "
-            f"containment_action={job.get('containment_action')} "
-            f"containment_reason={job.get('containment_reason')} "
-            f"planned_position_size={approved_size_after_containment} "
+            f"planned_position_size={normalized_size} "
             f"risk_r={risk_distance_r} "
             f"intended_risk_pct={job.get('intended_risk_percent', 0)*100:.1f}%"
         )
@@ -9772,18 +8955,18 @@ class ScalpingBot:
             sl_id=sl_id
         )
 
-        parent = LimitOrder(parent_action, approved_size_after_containment, entry)
+        parent = LimitOrder(parent_action, normalized_size, entry)
         parent.orderId = parent_id
         parent.transmit = False
         parent.tif = "GTC"
 
-        tp = LimitOrder(child_action, approved_size_after_containment, target)
+        tp = LimitOrder(child_action, normalized_size, target)
         tp.orderId = tp_id
         tp.parentId = parent_id
         tp.transmit = False
         tp.tif = "GTC"
 
-        sl = StopOrder(child_action, approved_size_after_containment, stop)
+        sl = StopOrder(child_action, normalized_size, stop)
         sl.orderId = sl_id
         sl.parentId = parent_id
         sl.transmit = True
