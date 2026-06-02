@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P213 | STAGE: ACC
+# IKBR SCALPING BOT | VERSION v1.6.0 P191 | STAGE: ACC
 # ==========================================================
 
 import logging
@@ -9,16 +9,11 @@ import queue
 import time
 import decimal
 import json
-import os
-import socket
-import hashlib
-import hmac
-import uuid
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
-from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder
+from ib_insync import IB, Future, Forex, LimitOrder, StopOrder
 
 # ==========================================================
 # VERSIONING
@@ -26,40 +21,13 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P213"
+BOT_PATCH = "P191"
 BOT_STAGE = "ACC"  # TST | ACC | PRD
-
-def generate_bot_run_id():
-    now = datetime.now(timezone.utc)
-    return f"{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond:06d}-{uuid.uuid4().hex[:8]}"
 
 logger = logging.getLogger("ikbr_scalpingbot")
 logging.basicConfig(level=logging.INFO)
 
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
-DEFAULT_IB_CLIENT_ID = 1
-WEBHOOK_SECRET_ENV_VAR = "IKBR_WEBHOOK_SECRET"
-PRD_DRY_RUN_ENV_VAR = "IKBR_PRD_DRY_RUN"
-EXECUTION_TRANSMISSION_MODE_ENV_VAR = "EXECUTION_TRANSMISSION_MODE"
-LIVE_ORDER_APPROVAL_ENV_VAR = "IKBR_ALLOW_LIVE_ORDERS"
-PRD_LIVE_APPROVAL_ENV_VAR = "IKBR_PRD_LIVE_APPROVED"
-BOT_ACCOUNT_CONTEXT = os.getenv("IKBR_ACCOUNT_CONTEXT", "default")
-SENSITIVE_PAYLOAD_KEYS = {
-    "secret",
-    "token",
-    "password",
-    "auth",
-    "authorization",
-    "api_key",
-    "apikey",
-    "webhook_secret",
-    "webhooksecret",
-}
-REDACTED_VALUE = "[REDACTED]"
-RUNTIME_LOCK_SOCKET = None
-RUNTIME_LOCK_KEY = None
-bot = None
-bot_init_lock = threading.Lock()
 
 # ==========================================================
 # CONFIG
@@ -185,8 +153,7 @@ INSTRUMENT_SPECS = {
 
 QUALIFIED_FUTURE_SYMBOLS = ("MNQ", "MES", "M6E", "FDXM")
 
-# Runtime kill-switch only. Empty means all configured futures are enabled.
-RUNTIME_DISABLED_SYMBOLS = set()
+RUNTIME_DISABLED_SYMBOLS = {"FDXM"}
 
 EXECUTION_CAPITAL_BASE = 170000.0
 EURUSD_EXECUTION_DISABLED_REASON = "eurusd_execution_disabled_spot_fx_sizing_not_implemented"
@@ -273,72 +240,6 @@ BROKER_READ_SLOW_MS = 250.0
 BROKER_WRITE_SLOW_MS = 250.0
 WEBHOOK_SLOW_MS = 500.0
 RECONNECT_FILL_RECONSTRUCTION_LOOKBACK_SECONDS = 900.0
-PROTECTIVE_SL_MISSING_POLICY = "EMERGENCY_FLATTEN"
-PROTECTIVE_SL_MISSING_MAX_ATTEMPTS = 3
-PROTECTIVE_SL_MISSING_RECHECK_SECONDS = 1.0
-PROTECTIVE_SL_MISSING_CANCEL_CONFLICTING_ORDERS = True
-PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS = 10.0
-TIME_EXIT_ENABLED = True
-TIME_EXIT_AFTER_SECONDS = 300.0
-TIME_EXIT_MAX_ATTEMPTS = 3
-TIME_EXIT_REASON = "TIME_EXIT_5_MIN_MAX_DURATION"
-
-PROTECTIVE_EMERGENCY_INFLIGHT_STATUSES = {
-    None,
-    "",
-    "PendingSubmit",
-    "ApiPending",
-    "PreSubmitted",
-    "Submitted",
-    "PendingCancel",
-    "unknown_recent",
-    "submit_in_progress",
-    "flatten_order_submitted",
-    "in_flight",
-    "pending_position_confirmation",
-    "submit_failed_submission_uncertain",
-    "broker_submission_uncertain",
-}
-
-PROTECTIVE_EMERGENCY_TERMINAL_STATUSES = {
-    "Cancelled",
-    "ApiCancelled",
-    "Inactive",
-    "Rejected",
-}
-
-PROTECTIVE_EMERGENCY_EXIT_REASON = "EMERGENCY_FLATTEN_SL_MISSING"
-
-SESSION_CLOSE_ENABLED = True
-NO_NEW_ENTRIES_BEFORE_CLOSE_MIN = 15
-EOD_FLATTEN_ENABLED = True
-EOD_FLATTEN_BEFORE_CLOSE_MIN = 5
-EOD_FLATTEN_ORDER_TYPE = "MKT"
-EOD_FLATTEN_MAX_ATTEMPTS = 3
-EOD_FLATTEN_RECHECK_SECONDS = 2
-EOD_FLATTEN_SCOPE = "CONFIGURED_BOT_SYMBOLS"
-ACCOUNT_WIDE_FLATTEN = False
-SESSION_CLOSE_FORCE_BLOCK_NEW_ENTRIES = True
-SESSION_CLOSE_CANCEL_WORKING_ENTRIES = True
-SESSION_CLOSE_MONITOR_POLL_SECONDS = 5.0
-SESSION_CLOSE_SYSTEM_JOB_DEDUPE_SECONDS = 20.0
-
-SESSION_FLAT_BY_TIMES = {
-    "MES": {"timezone": "America/Chicago", "flat_by": "16:00"},
-    "MNQ": {"timezone": "America/Chicago", "flat_by": "16:00"},
-    "M6E": {"timezone": "America/Chicago", "flat_by": "16:00"},
-    "FDXM": {"timezone": "Europe/Berlin", "flat_by": "22:00"},
-}
-
-SESSION_CLOSE_SYSTEM_JOB_TYPES = {
-    "SESSION_CLOSE_SWEEP",
-    "SESSION_CLOSE_FLATTEN",
-}
-
-BROKER_SYSTEM_JOB_TYPES = SESSION_CLOSE_SYSTEM_JOB_TYPES | {
-    "RECONNECT_RECOVERY",
-    "BROKER_REALITY_RECONCILIATION",
-}
 
 SHADOW_TEST_PROHIBITED_REASONS = {
     "chop",
@@ -350,7 +251,6 @@ SHADOW_TEST_PROHIBITED_REASONS = {
 
 ACTIVE_TRADE_STATES = {
     "SUBMITTING",
-    "BRACKET_SUBMIT_FAILED_UNCERTAIN",
     "BROKER_ACK_PENDING",
     "ENTRY_WORKING",
     "PARTIAL_TIMEOUT_PENDING_PARENT_FINAL",
@@ -358,11 +258,6 @@ ACTIVE_TRADE_STATES = {
     "EXIT_WORKING",
     "TP_FILLED",
     "SL_FILLED",
-    "TIME_EXIT_ARMED",
-    "TIME_EXIT_DUE",
-    "TIME_EXIT_SUBMITTED",
-    "TIME_EXIT_PENDING_CONFIRMATION",
-    "TIME_EXIT_FAILED_UNCERTAIN",
 }
 
 OPEN_BROKER_ORDER_STATUSES = {
@@ -398,132 +293,6 @@ CONTAINMENT_DECISION_SOURCES = {
     "stage_containment",
 }
 
-def get_configured_webhook_secret():
-    return os.getenv(WEBHOOK_SECRET_ENV_VAR)
-
-def webhook_secret_required():
-    return BOT_STAGE in {"ACC", "PRD"}
-
-def validate_webhook_secret_config():
-    configured_secret = get_configured_webhook_secret()
-    if webhook_secret_required() and not configured_secret:
-        raise RuntimeError(f"{WEBHOOK_SECRET_ENV_VAR}_missing_for_{BOT_STAGE.lower()}")
-    return configured_secret
-
-def parse_env_bool(value):
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    return None
-
-def get_execution_transmission_mode():
-    value = os.getenv(EXECUTION_TRANSMISSION_MODE_ENV_VAR)
-    if value is None or not str(value).strip():
-        return None
-    return str(value).strip().lower()
-
-def normalize_sensitive_payload_key(key):
-    return "".join(
-        character
-        for character in str(key).lower()
-        if character.isalnum()
-    )
-
-def is_sensitive_payload_key(key):
-    normalized_key = normalize_sensitive_payload_key(key)
-    normalized_sensitive_keys = {
-        normalize_sensitive_payload_key(sensitive_key)
-        for sensitive_key in SENSITIVE_PAYLOAD_KEYS
-    }
-    return any(
-        sensitive_key and sensitive_key in normalized_key
-        for sensitive_key in normalized_sensitive_keys
-    )
-
-def redact_sensitive_payload(value):
-    if isinstance(value, dict):
-        redacted = {}
-        for key, item in value.items():
-            if is_sensitive_payload_key(key):
-                redacted[key] = REDACTED_VALUE
-            else:
-                redacted[key] = redact_sensitive_payload(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_sensitive_payload(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_sensitive_payload(item) for item in value)
-    return value
-
-def build_sanitized_payload_summary(payload):
-    if not isinstance(payload, dict):
-        return {"payload_type": type(payload).__name__}
-    return {
-        "payload_format_hint": payload.get("payload_format") or payload.get("mode") or payload.get("event"),
-        "symbol": payload.get("symbol"),
-        "side": payload.get("side") or payload.get("candidate_side") or payload.get("direction"),
-        "grade": payload.get("grade") or payload.get("candidate_grade") or payload.get("tv_candidate_grade"),
-        "signal_id": payload.get("signal_id"),
-        "schema_version": payload.get("schema_version"),
-        "sanitized_payload": redact_sensitive_payload(payload),
-    }
-
-def get_runtime_lock_key():
-    return f"{BOT_NAME}:{BOT_STAGE}:client_id={DEFAULT_IB_CLIENT_ID}:account={BOT_ACCOUNT_CONTEXT}"
-
-def get_runtime_lock_port(lock_key):
-    digest = hashlib.sha256(lock_key.encode("utf-8")).hexdigest()
-    return 20000 + (int(digest[:8], 16) % 20000)
-
-def acquire_runtime_process_lock():
-    global RUNTIME_LOCK_SOCKET, RUNTIME_LOCK_KEY
-    if RUNTIME_LOCK_SOCKET is not None:
-        return
-
-    lock_key = get_runtime_lock_key()
-    lock_port = get_runtime_lock_port(lock_key)
-    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-    try:
-        lock_socket.bind(("127.0.0.1", lock_port))
-        lock_socket.listen(1)
-    except OSError as exc:
-        lock_socket.close()
-        logger.critical(
-            "RUNTIME_SINGLETON_LOCK_FAILED | "
-            f"lock_key={lock_key} "
-            f"lock_port={lock_port} "
-            f"reason={exc} "
-            "decision=fail_startup_closed"
-        )
-        raise RuntimeError(f"runtime_singleton_lock_unavailable:{lock_key}:{lock_port}") from exc
-
-    RUNTIME_LOCK_SOCKET = lock_socket
-    RUNTIME_LOCK_KEY = lock_key
-    logger.warning(
-        "RUNTIME_SINGLETON_LOCK_ACQUIRED | "
-        f"lock_key={lock_key} "
-        f"lock_port={lock_port}"
-    )
-
-def release_runtime_process_lock():
-    global RUNTIME_LOCK_SOCKET, RUNTIME_LOCK_KEY
-    if RUNTIME_LOCK_SOCKET is None:
-        return
-    try:
-        RUNTIME_LOCK_SOCKET.close()
-        logger.warning(
-            "RUNTIME_SINGLETON_LOCK_RELEASED | "
-            f"lock_key={RUNTIME_LOCK_KEY}"
-        )
-    finally:
-        RUNTIME_LOCK_SOCKET = None
-        RUNTIME_LOCK_KEY = None
-
 # ==========================================================
 # BOT
 # ==========================================================
@@ -536,25 +305,15 @@ class ScalpingBot:
 
         self.IB_HOST = "127.0.0.1"
         self.IB_PORT = 7497
-        self.IB_CLIENT_ID = DEFAULT_IB_CLIENT_ID
-        self.run_id = generate_bot_run_id()
-        logger.warning(
-            "RUN_ID_CREATED | "
-            f"run_id={self.run_id} "
-            f"bot_name={BOT_NAME} "
-            f"bot_version={BOT_VERSION} "
-            f"bot_patch={BOT_PATCH} "
-            f"bot_stage={BOT_STAGE}"
-        )
+        self.IB_CLIENT_ID = 1
 
         self.contract_cache = {}
         self.contract_min_ticks = {}
         self.execution_queue = queue.Queue()
-        self.broker_io_owner_mode = "enforce_single_owner"
+        self.broker_io_owner_mode = "audit_only_no_enforcement"
         self.broker_io_owner_expected = "execution_worker"
         self.broker_io_owner_thread_ident = None
         self.broker_io_owner_thread_name = None
-        self.broker_system_job_last_queued = {}
 
         # Legacy observability flag only; not the authoritative execution-safety gate.
         # Active trade authority lives in trade_analysis + broker reality + concurrency policy.
@@ -571,8 +330,6 @@ class ScalpingBot:
         self.session_socket_connected = False
         self.session_initialized = False
         self.session_healthy = False
-        self.session_initialization_failed = False
-        self.session_initialization_failure_reason = None
         self.session_reconnect_count = 0
         self.last_reconnect_time = None
         self.events_attached = False
@@ -609,17 +366,6 @@ class ScalpingBot:
         self.live_daily_stop_trigger_trade_id = None
         self.paper_daily_stop_day_key = None
         self.paper_symbol_daily_sl_stops = {}
-        self.session_close_config_logged = False
-        self.session_close_last_system_job_queued = {}
-        self.session_close_symbol_states = {}
-        self.startup_reconciliation_required = True
-        self.startup_reconciliation_completed = False
-        self.startup_reconciliation_started_at = None
-        self.startup_reconciliation_completed_at = None
-        self.startup_reconciliation_status = "required"
-        self.startup_reconciliation_block_reason = "startup_reconciliation_required"
-        self.startup_reconciliation_ambiguous_symbols = set()
-        self.external_entries_blocked_reason = "startup_reconciliation_required"
 
         self.trade_analysis = {}
         self.order_to_trade = {}
@@ -647,8 +393,6 @@ class ScalpingBot:
             "execution_execute_a_plus_count": 0,
             "queued_count": 0,
             "shadow_test_queued_count": 0,
-            "dry_run_planned_count": 0,
-            "dry_run_not_transmitted_count": 0,
             "submitted_count": 0,
             "shadow_test_submitted_count": 0,
             "broker_acknowledged_count": 0,
@@ -657,8 +401,6 @@ class ScalpingBot:
             "shadow_test_tp_count": 0,
             "shadow_test_sl_count": 0,
             "shadow_test_incomplete_count": 0,
-            "emergency_flatten_count": 0,
-            "time_exit_count": 0,
             "gross_pnl": 0.0,
             "commission": 0.0,
             "net_pnl": 0.0,
@@ -667,13 +409,9 @@ class ScalpingBot:
         self.symbol_stats = {
             symbol: {
                 "total_trades": 0,
-                "dry_run_planned_count": 0,
-                "dry_run_not_transmitted_count": 0,
                 "filled_trades": 0,
                 "tp_count": 0,
                 "sl_count": 0,
-                "emergency_flatten_count": 0,
-                "time_exit_count": 0,
                 "gross_pnl": 0.0,
                 "commission": 0.0,
                 "net_pnl": 0.0,
@@ -683,7 +421,6 @@ class ScalpingBot:
 
         threading.Thread(target=self.execution_worker, daemon=True).start()
         threading.Thread(target=self.ib_watchdog, daemon=True).start()
-        threading.Thread(target=self.session_close_monitor, daemon=True).start()
 
     # ==========================================================
     # PRICE LOGIC
@@ -719,319 +456,6 @@ class ScalpingBot:
             "reason=unsupported_broker_type"
         )
         return None
-
-    def get_order_transmission_policy(self):
-        mode = get_execution_transmission_mode()
-        dry_run_flag_raw = os.getenv(PRD_DRY_RUN_ENV_VAR)
-        live_approval_raw = os.getenv(LIVE_ORDER_APPROVAL_ENV_VAR)
-        prd_live_approval_raw = os.getenv(PRD_LIVE_APPROVAL_ENV_VAR)
-        dry_run_flag = parse_env_bool(dry_run_flag_raw)
-        live_approval = parse_env_bool(live_approval_raw)
-        prd_live_approval = parse_env_bool(prd_live_approval_raw)
-        invalid_reasons = []
-
-        if mode is not None and mode not in {"dry_run", "live"}:
-            invalid_reasons.append(f"invalid_{EXECUTION_TRANSMISSION_MODE_ENV_VAR}")
-        if dry_run_flag_raw is not None and dry_run_flag is None:
-            invalid_reasons.append(f"invalid_{PRD_DRY_RUN_ENV_VAR}")
-        if live_approval_raw is not None and live_approval is None:
-            invalid_reasons.append(f"invalid_{LIVE_ORDER_APPROVAL_ENV_VAR}")
-        if prd_live_approval_raw is not None and prd_live_approval is None:
-            invalid_reasons.append(f"invalid_{PRD_LIVE_APPROVAL_ENV_VAR}")
-        if mode == "dry_run" and dry_run_flag is False:
-            invalid_reasons.append("dry_run_mode_conflicts_with_false_flag")
-        if mode == "live" and dry_run_flag is True:
-            invalid_reasons.append("live_mode_conflicts_with_dry_run_flag")
-
-        dry_run_enabled = (
-            BOT_STAGE == "PRD" and
-            (mode == "dry_run" or dry_run_flag is True)
-        )
-
-        if BOT_STAGE != "PRD":
-            live_allowed = not dry_run_enabled
-            reason = "non_prd_stage_transmission_policy"
-        elif dry_run_enabled:
-            live_allowed = False
-            reason = "prd_dry_run_no_order_transmission"
-        elif invalid_reasons:
-            live_allowed = False
-            reason = "prd_transmission_config_invalid:" + ",".join(invalid_reasons)
-        elif mode == "live" and live_approval is True and prd_live_approval is True:
-            live_allowed = True
-            reason = "prd_live_order_transmission_explicitly_approved"
-        else:
-            live_allowed = False
-            reason = "prd_live_order_transmission_not_explicitly_approved"
-
-        return {
-            "stage": BOT_STAGE,
-            "mode": mode,
-            "dry_run_enabled": dry_run_enabled,
-            "live_allowed": live_allowed,
-            "live_approval": live_approval,
-            "prd_live_approval": prd_live_approval,
-            "invalid_reasons": invalid_reasons,
-            "reason": reason,
-        }
-
-    def is_prd_dry_run_enabled(self):
-        return self.get_order_transmission_policy()["dry_run_enabled"]
-
-    def is_live_order_transmission_allowed(self):
-        return self.get_order_transmission_policy()["live_allowed"]
-
-    def get_enabled_futures_symbols(self):
-        return [
-            symbol for symbol in QUALIFIED_FUTURE_SYMBOLS
-            if symbol in INSTRUMENT_SPECS and symbol not in RUNTIME_DISABLED_SYMBOLS
-        ]
-
-    def is_webhook_secret_production_ready(self):
-        secret = get_configured_webhook_secret()
-        if not secret:
-            return False
-        secret_text = str(secret).strip()
-        unsafe_values = {
-            "",
-            "secret",
-            "changeme",
-            "default",
-            "password",
-            "test",
-            "fdax_bot_secure_2026",
-        }
-        return len(secret_text) >= 16 and secret_text.lower() not in unsafe_values
-
-    def evaluate_prd_live_release_gates(self, symbol=None, job=None, trade_id=None):
-        passed_gates = []
-        failed_gates = []
-        unknown_gates = []
-
-        def gate(name, condition, unknown=False):
-            if unknown:
-                unknown_gates.append(name)
-            elif condition:
-                passed_gates.append(name)
-            else:
-                failed_gates.append(name)
-
-        policy = self.get_order_transmission_policy()
-        enabled_symbols = self.get_enabled_futures_symbols()
-        target_symbol = symbol or (job or {}).get("symbol")
-        prd_profile = CONTAINMENT_STAGE_PROFILES.get("PRD")
-
-        gate("stage_is_prd", BOT_STAGE == "PRD")
-        gate("prd_live_release_approved", policy.get("prd_live_approval") is True)
-        gate("prd_dry_run_disabled", not policy.get("dry_run_enabled"))
-        gate("webhook_secret_production_ready", self.is_webhook_secret_production_ready())
-        gate("runtime_singleton_lock_acquired", RUNTIME_LOCK_SOCKET is not None)
-        gate("broker_io_owner_enforced", getattr(self, "broker_io_owner_mode", None) == "enforce_single_owner")
-        gate("execution_worker_owner_registered", self.get_broker_io_owner_thread_ident() is not None)
-        gate("startup_reconciliation_completed", getattr(self, "startup_reconciliation_completed", None) is True)
-        gate("startup_reconciliation_clear", getattr(self, "startup_reconciliation_status", None) == "clear")
-        gate(
-            "startup_reconciliation_no_ambiguity",
-            not bool(getattr(self, "startup_reconciliation_ambiguous_symbols", set())),
-        )
-        gate("connectivity_reconciliation_not_pending", not bool(getattr(self, "connectivity_reconciliation_required", True)))
-        gate("connectivity_not_uncertain", not bool(getattr(self, "connectivity_uncertain", True)))
-        gate(
-            "ibkr_session_healthy",
-            bool(getattr(self, "session_socket_connected", False)) and
-            bool(getattr(self, "session_initialized", False)) and
-            bool(getattr(self, "session_healthy", False)),
-        )
-
-        contracts_ready = True
-        for enabled_symbol in enabled_symbols:
-            contract = self.contract_cache.get(enabled_symbol) if hasattr(self, "contract_cache") else None
-            spec = INSTRUMENT_SPECS.get(enabled_symbol, {})
-            if contract is None:
-                contracts_ready = False
-                break
-            if getattr(contract, "conId", None) in (None, 0):
-                contracts_ready = False
-                break
-            if not getattr(contract, "localSymbol", None):
-                contracts_ready = False
-                break
-            if spec.get("trading_class") and getattr(contract, "tradingClass", None) != spec.get("trading_class"):
-                contracts_ready = False
-                break
-            if getattr(contract, "currency", None) != spec.get("currency"):
-                contracts_ready = False
-                break
-        gate("qualified_contracts_ready", contracts_ready)
-
-        gate(
-            "symbol_supported_and_enabled",
-            target_symbol is None or (
-                target_symbol in INSTRUMENT_SPECS and
-                target_symbol not in RUNTIME_DISABLED_SYMBOLS and
-                target_symbol != "EURUSD"
-            ),
-        )
-        gate("eurusd_execution_disabled", EURUSD_EXECUTION_DISABLED_REASON and target_symbol != "EURUSD")
-
-        prd_profile_valid = bool(prd_profile and prd_profile.get("profile"))
-        if prd_profile_valid:
-            for enabled_symbol in enabled_symbols:
-                max_size = prd_profile.get("max_sizes", {}).get(enabled_symbol)
-                max_notional = prd_profile.get("max_notionals", {}).get(enabled_symbol)
-                if max_size is None or max_size <= 0 or max_notional is None or max_notional <= 0:
-                    prd_profile_valid = False
-                    break
-        gate("prd_containment_profile_valid", prd_profile_valid)
-
-        session_close_valid = bool(SESSION_CLOSE_ENABLED)
-        for enabled_symbol in enabled_symbols:
-            config = SESSION_FLAT_BY_TIMES.get(enabled_symbol)
-            if not config or not config.get("timezone") or not config.get("flat_by"):
-                session_close_valid = False
-                break
-        gate("session_close_configured", session_close_valid)
-        gate("prd_daily_sl_stop_clear", getattr(self, "live_daily_stop_active", None) is False)
-        gate("no_active_execution_trade", getattr(self, "active_execution_trade_id", None) is None)
-        gate(
-            "no_ambiguous_broker_reality_cached",
-            getattr(self, "startup_reconciliation_status", None) == "clear" and
-            not bool(getattr(self, "startup_reconciliation_ambiguous_symbols", set())) and
-            not bool(getattr(self, "external_entries_blocked_reason", None)),
-        )
-        gate(
-            "raw_secret_logging_disabled",
-            "secret" in SENSITIVE_PAYLOAD_KEYS and REDACTED_VALUE == "[REDACTED]",
-        )
-        gate(
-            "live_transmission_approval_explicit",
-            policy.get("mode") == "live" and
-            policy.get("live_approval") is True and
-            policy.get("prd_live_approval") is True,
-        )
-
-        allowed = not failed_gates and not unknown_gates
-        reason = "prd_live_release_gates_passed" if allowed else "prd_live_release_gates_blocked"
-        return {
-            "allowed": allowed,
-            "stage": BOT_STAGE,
-            "failed_gates": failed_gates,
-            "passed_gates": passed_gates,
-            "unknown_gates": unknown_gates,
-            "reason": reason,
-            "policy": policy,
-        }
-
-    def assert_prd_live_release_allowed(self, symbol=None, job=None, trade_id=None):
-        if BOT_STAGE != "PRD":
-            return {
-                "allowed": True,
-                "stage": BOT_STAGE,
-                "failed_gates": [],
-                "passed_gates": ["non_prd_stage_not_applicable"],
-                "unknown_gates": [],
-                "reason": "non_prd_stage_not_applicable",
-            }
-
-        gate_result = self.evaluate_prd_live_release_gates(symbol=symbol, job=job, trade_id=trade_id)
-        if gate_result["allowed"]:
-            logger.warning(
-                "PRD_LIVE_RELEASE_GATES_PASSED | "
-                f"symbol={symbol} "
-                f"trade_id={trade_id} "
-                f"passed_gates={','.join(gate_result['passed_gates'])} "
-                f"reason={gate_result['reason']}"
-            )
-            return gate_result
-
-        logger.critical(
-            "PRD_LIVE_RELEASE_GATE_BLOCKED | "
-            f"symbol={symbol} "
-            f"trade_id={trade_id} "
-            f"failed_gates={','.join(gate_result['failed_gates'])} "
-            f"unknown_gates={','.join(gate_result['unknown_gates'])} "
-            f"reason={gate_result['reason']} "
-            "operator_action_required=True"
-        )
-        if trade_id is not None:
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["state"] = "PRD_LIVE_RELEASE_BLOCKED"
-                    record["transmitted"] = False
-                    record["transmission_block_reason"] = gate_result["reason"]
-                    record["execution_validation_status"] = "prd_live_release_blocked"
-                    self.append_trade_event(
-                        trade_id,
-                        "PRD_LIVE_RELEASE_BLOCKED "
-                        f"failed_gates={','.join(gate_result['failed_gates'])} "
-                        f"unknown_gates={','.join(gate_result['unknown_gates'])}",
-                    )
-                    if self.active_execution_trade_id == trade_id:
-                        self.active_execution_trade_id = None
-        raise RuntimeError(gate_result["reason"])
-
-    def assert_order_transmission_allowed(self, symbol=None, trade_id=None, reason_label=None):
-        policy = self.get_order_transmission_policy()
-        if policy["live_allowed"]:
-            return policy
-
-        log_label = (
-            "ORDER_TRANSMISSION_BLOCKED_DRY_RUN"
-            if policy["dry_run_enabled"]
-            else "ORDER_TRANSMISSION_BLOCKED_FAIL_CLOSED"
-        )
-        logger.critical(
-            f"{log_label} | "
-            f"stage={policy['stage']} "
-            f"mode={policy['mode']} "
-            f"dry_run_enabled={policy['dry_run_enabled']} "
-            f"live_approval={policy['live_approval']} "
-            f"symbol={symbol} "
-            f"trade_id={trade_id} "
-            f"reason_label={reason_label} "
-            "operator_action_required=True "
-            f"reason={policy['reason']}"
-        )
-        raise RuntimeError(policy["reason"])
-
-    def assert_cancel_mutation_allowed(self, symbol=None, trade_id=None, reason_label=None, real_broker_exposure=False):
-        policy = self.get_order_transmission_policy()
-        if policy["stage"] != "PRD":
-            return policy
-        if not policy["dry_run_enabled"]:
-            if policy["live_allowed"]:
-                return policy
-            logger.critical(
-                "CANCEL_MUTATION_BLOCKED_FAIL_CLOSED | "
-                f"stage={policy['stage']} "
-                f"mode={policy['mode']} "
-                f"live_approval={policy['live_approval']} "
-                f"symbol={symbol} "
-                f"trade_id={trade_id} "
-                f"reason_label={reason_label} "
-                f"reason={policy['reason']}"
-            )
-            raise RuntimeError(policy["reason"])
-        if real_broker_exposure:
-            logger.warning(
-                "PRD_DRY_RUN_CANCEL_ALLOWED_REAL_EXPOSURE | "
-                f"symbol={symbol} "
-                f"trade_id={trade_id} "
-                f"reason_label={reason_label} "
-                "reason=prd_dry_run_real_broker_exposure_cleanup"
-            )
-            return policy
-
-        logger.critical(
-            "CANCEL_MUTATION_BLOCKED_DRY_RUN | "
-            f"symbol={symbol} "
-            f"trade_id={trade_id} "
-            f"reason_label={reason_label} "
-            "operator_action_required=True "
-            "reason=prd_dry_run_cancel_requires_real_broker_exposure"
-        )
-        raise RuntimeError("prd_dry_run_cancel_requires_real_broker_exposure")
 
     def get_tick_size(self, symbol):
         spec = self.get_instrument_spec(symbol)
@@ -2222,380 +1646,6 @@ class ScalpingBot:
             return value.isoformat()
         return value
 
-    # ==========================================================
-    # SESSION CLOSE / EOD FLATTEN POLICY
-    # ==========================================================
-
-    def log_session_close_config_loaded_once(self):
-        if self.session_close_config_logged:
-            return
-        self.session_close_config_logged = True
-        logger.warning(
-            "SESSION_CLOSE_CONFIG_LOADED | "
-            f"enabled={SESSION_CLOSE_ENABLED} "
-            f"no_new_entries_before_close_min={NO_NEW_ENTRIES_BEFORE_CLOSE_MIN} "
-            f"eod_flatten_enabled={EOD_FLATTEN_ENABLED} "
-            f"eod_flatten_before_close_min={EOD_FLATTEN_BEFORE_CLOSE_MIN} "
-            f"eod_flatten_order_type={EOD_FLATTEN_ORDER_TYPE} "
-            f"eod_flatten_max_attempts={EOD_FLATTEN_MAX_ATTEMPTS} "
-            f"eod_flatten_recheck_seconds={EOD_FLATTEN_RECHECK_SECONDS} "
-            f"eod_flatten_scope={EOD_FLATTEN_SCOPE} "
-            f"account_wide_flatten={ACCOUNT_WIDE_FLATTEN} "
-            f"force_block_new_entries={SESSION_CLOSE_FORCE_BLOCK_NEW_ENTRIES} "
-            f"cancel_working_entries={SESSION_CLOSE_CANCEL_WORKING_ENTRIES} "
-            f"session_flat_by_times={json.dumps(SESSION_FLAT_BY_TIMES, sort_keys=True)}"
-        )
-
-    def get_session_close_scope_symbols(self):
-        if ACCOUNT_WIDE_FLATTEN or EOD_FLATTEN_SCOPE == "ACCOUNT_WIDE":
-            return [
-                symbol for symbol in INSTRUMENT_SPECS.keys()
-                if symbol not in RUNTIME_DISABLED_SYMBOLS
-            ]
-        return [
-            symbol for symbol in SESSION_FLAT_BY_TIMES.keys()
-            if symbol in INSTRUMENT_SPECS and symbol not in RUNTIME_DISABLED_SYMBOLS
-        ]
-
-    def get_configured_flat_by_datetime(self, symbol, reference_time=None):
-        config = SESSION_FLAT_BY_TIMES.get(symbol)
-        if not config:
-            return None, None
-        try:
-            configured_tz = ZoneInfo(config["timezone"])
-            if reference_time is None:
-                local_now = datetime.now(configured_tz)
-            elif isinstance(reference_time, datetime):
-                local_now = (
-                    reference_time.astimezone(configured_tz)
-                    if reference_time.tzinfo
-                    else reference_time.replace(tzinfo=timezone.utc).astimezone(configured_tz)
-                )
-            else:
-                local_now = datetime.now(configured_tz)
-
-            hour_text, minute_text = str(config["flat_by"]).split(":", 1)
-            flat_by = local_now.replace(
-                hour=int(hour_text),
-                minute=int(minute_text),
-                second=0,
-                microsecond=0,
-            )
-            return flat_by, config["timezone"]
-        except Exception as exc:
-            logger.exception(
-                "SESSION_CLOSE_CONFIG_INVALID | "
-                f"symbol={symbol} config={config} reason={exc}"
-            )
-            return None, config.get("timezone") if isinstance(config, dict) else None
-
-    def get_session_close_state(self, symbol, reference_time=None):
-        self.log_session_close_config_loaded_once()
-        flat_by, timezone_name = self.get_configured_flat_by_datetime(symbol, reference_time)
-        if not SESSION_CLOSE_ENABLED or flat_by is None:
-            return {
-                "enabled": False,
-                "symbol": symbol,
-                "timezone": timezone_name,
-                "configured_flat_by_time": self.to_iso(flat_by),
-                "minutes_to_close": None,
-                "no_entry_active": False,
-                "flatten_window_active": False,
-                "hard_close_active": False,
-                "reason": "session_close_disabled_or_unconfigured",
-            }
-
-        now_value = reference_time if isinstance(reference_time, datetime) else datetime.now(timezone.utc)
-        if now_value.tzinfo is None:
-            now_value = now_value.replace(tzinfo=timezone.utc)
-        now_local = now_value.astimezone(flat_by.tzinfo)
-        minutes_to_close = round((flat_by - now_local).total_seconds() / 60.0, 3)
-        hard_close_active = minutes_to_close <= 0
-        no_entry_active = (
-            SESSION_CLOSE_FORCE_BLOCK_NEW_ENTRIES
-            and minutes_to_close <= NO_NEW_ENTRIES_BEFORE_CLOSE_MIN
-        )
-        flatten_window_active = (
-            EOD_FLATTEN_ENABLED
-            and minutes_to_close <= EOD_FLATTEN_BEFORE_CLOSE_MIN
-        )
-        reason = "session_close_clear"
-        if hard_close_active:
-            reason = "session_flat_by_time_reached"
-        elif flatten_window_active:
-            reason = "session_flatten_window_active"
-        elif no_entry_active:
-            reason = "session_close_entry_cutoff"
-
-        return {
-            "enabled": True,
-            "symbol": symbol,
-            "timezone": timezone_name,
-            "configured_flat_by_time": self.to_iso(flat_by),
-            "minutes_to_close": minutes_to_close,
-            "no_entry_active": no_entry_active,
-            "flatten_window_active": flatten_window_active,
-            "hard_close_active": hard_close_active,
-            "reason": reason,
-        }
-
-    def should_block_new_entry_for_session_close(self, symbol, reference_time=None):
-        if not symbol or self.is_runtime_symbol_disabled(symbol):
-            return False, self.get_session_close_state(symbol, reference_time)
-        state = self.get_session_close_state(symbol, reference_time)
-        return bool(state.get("enabled") and state.get("no_entry_active")), state
-
-    def log_session_entry_blocked(self, symbol, side=None, job=None, normalized=None, location=None, state=None):
-        if state is None:
-            state = self.get_session_close_state(symbol)
-        logger.warning(
-            "SESSION_ENTRY_BLOCKED | "
-            f"symbol={symbol} "
-            f"side={side or (job or {}).get('side') or (normalized or {}).get('side')} "
-            "reason=session_close_entry_cutoff "
-            f"minutes_to_close={state.get('minutes_to_close')} "
-            f"cutoff_minutes={NO_NEW_ENTRIES_BEFORE_CLOSE_MIN} "
-            f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-            f"timezone={state.get('timezone')} "
-            f"stage={BOT_STAGE} "
-            f"job_id={(job or {}).get('job_id')} "
-            f"job_type={(job or {}).get('job_type')} "
-            f"signal_id={(job or {}).get('signal_id') or (normalized or {}).get('signal_id')} "
-            f"location={location} "
-            "blocked_by=session_close_policy"
-        )
-
-    def is_session_close_system_job(self, job):
-        return isinstance(job, dict) and job.get("job_type") in SESSION_CLOSE_SYSTEM_JOB_TYPES
-
-    def is_broker_system_job(self, job):
-        return isinstance(job, dict) and job.get("job_type") in BROKER_SYSTEM_JOB_TYPES
-
-    def enqueue_broker_system_job(self, job_type, reason_label, symbol=None, force=False, **fields):
-        if job_type not in BROKER_SYSTEM_JOB_TYPES:
-            logger.error(
-                "BROKER_SYSTEM_JOB_REJECTED | "
-                f"job_type={job_type} "
-                f"symbol={symbol} "
-                f"reason={reason_label} "
-                "decision=unknown_system_job_type"
-            )
-            return False
-
-        if (
-            job_type == "RECONNECT_RECOVERY"
-            and self.is_unresolved_contract_qualification_failure()
-        ):
-            logger.critical(
-                "BROKER_SYSTEM_JOB_SUPPRESSED | "
-                f"job_type={job_type} "
-                f"symbol={symbol} "
-                f"reason={reason_label} "
-                f"session_initialization_failure_reason={self.session_initialization_failure_reason} "
-                "decision=suppress_reconnect_recovery_until_initialization_failure_cleared"
-            )
-            return False
-
-        dedupe_key = f"{job_type}:{symbol or 'ALL'}:{reason_label}"
-        now_value = time.time()
-        last_queued = self.broker_system_job_last_queued.get(dedupe_key)
-        if not force and last_queued is not None and now_value - last_queued < SESSION_CLOSE_SYSTEM_JOB_DEDUPE_SECONDS:
-            return False
-
-        self.broker_system_job_last_queued[dedupe_key] = now_value
-        job = {
-            "job_type": job_type,
-            "symbol": symbol,
-            "reason_label": reason_label,
-            "queue_put_time": datetime.now(timezone.utc),
-            "enqueue_time": datetime.now(timezone.utc),
-            "internal_system_job": True,
-        }
-        job.update(fields)
-        self.execution_queue.put(job)
-        logger.warning(
-            "BROKER_SYSTEM_JOB_QUEUED | "
-            f"job_type={job_type} "
-            f"symbol={symbol} "
-            f"reason={reason_label} "
-            f"queue_size_after_put={self.execution_queue.qsize()}"
-        )
-        return True
-
-    def enqueue_session_close_system_job(self, reason_label, symbol=None, force=False):
-        if not SESSION_CLOSE_ENABLED:
-            return False
-        dedupe_key = f"{symbol or 'ALL'}:{reason_label}"
-        now_value = time.time()
-        last_queued = self.session_close_last_system_job_queued.get(dedupe_key)
-        if not force and last_queued is not None and now_value - last_queued < SESSION_CLOSE_SYSTEM_JOB_DEDUPE_SECONDS:
-            return False
-
-        self.session_close_last_system_job_queued[dedupe_key] = now_value
-        self.execution_queue.put({
-            "job_type": "SESSION_CLOSE_SWEEP",
-            "symbol": symbol,
-            "reason_label": reason_label,
-            "queue_put_time": datetime.now(timezone.utc),
-            "enqueue_time": datetime.now(timezone.utc),
-        })
-        logger.warning(
-            "SESSION_CLOSE_SYSTEM_JOB_QUEUED | "
-            f"job_type=SESSION_CLOSE_SWEEP "
-            f"symbol={symbol} "
-            f"reason={reason_label} "
-            f"queue_size_after_put={self.execution_queue.qsize()}"
-        )
-        return True
-
-    def process_broker_system_job(self, job):
-        job_type = job.get("job_type")
-        reason_label = job.get("reason_label") or job_type or "broker_system_job"
-
-        if job_type in SESSION_CLOSE_SYSTEM_JOB_TYPES:
-            return self.run_session_close_sweep(
-                reason_label,
-                target_symbol=job.get("symbol"),
-            )
-
-        if job_type == "RECONNECT_RECOVERY":
-            return self.run_reconnect_recovery_job(job)
-
-        if job_type == "BROKER_REALITY_RECONCILIATION":
-            return self.run_broker_reality_reconciliation_job(job)
-
-        logger.error(
-            "BROKER_SYSTEM_JOB_UNKNOWN | "
-            f"job_type={job_type} "
-            f"reason={reason_label}"
-        )
-        return 0
-
-    def run_broker_reality_reconciliation_job(self, job):
-        reason_label = job.get("reason_label") or "broker_reality_reconciliation"
-        logger.warning(
-            "BROKER_REALITY_RECONCILIATION_STARTED | "
-            f"reason={reason_label} "
-            f"symbol={job.get('symbol')}"
-        )
-        reconciled = self.reconcile_active_trade_lifecycle_from_broker_fills(
-            reason_label
-        )
-        if job.get("check_flat_positions"):
-            try:
-                positions = self.broker_read_positions(
-                    caller="broker_reality_reconciliation",
-                    reason_label=f"{reason_label}:flat_position_check",
-                    symbol=job.get("symbol"),
-                    trade_analysis_lock_context="not_locked",
-                    failure_log_level="info",
-                )
-                if not any(position.position != 0 for position in positions):
-                    self.trade_state = "IDLE"
-                    logger.info("→ IDLE")
-            except Exception as exc:
-                logger.warning(
-                    "BROKER_REALITY_RECONCILIATION_FLAT_CHECK_FAILED | "
-                    f"reason={reason_label} "
-                    f"failure={exc}"
-                )
-        if job.get("include_active_candidate_check"):
-            self.get_active_trade_candidates(f"{reason_label}:active_candidate_check")
-        if job.get("connectivity_restore_complete"):
-            self.connectivity_uncertain = False
-            self.connectivity_reconciliation_required = False
-            self.connectivity_reconciliation_completed_at = datetime.now(timezone.utc)
-            self.connectivity_reconstruction_anchor_since = None
-        logger.warning(
-            "BROKER_REALITY_RECONCILIATION_COMPLETE | "
-            f"reason={reason_label} "
-            f"reconciled={reconciled} "
-            f"connectivity_restore_complete={job.get('connectivity_restore_complete')}"
-        )
-        return reconciled
-
-    def run_reconnect_recovery_job(self, job):
-        reason_label = job.get("reason_label") or "reconnect_recovery"
-        logger.warning(
-            "RECONNECT_RECOVERY_JOB_STARTED | "
-            f"reason={reason_label} "
-            f"reconnect_count={self.session_reconnect_count}"
-        )
-        self.update_session_health()
-
-        try:
-            if not self.session_socket_connected:
-                self.connect_ib()
-                self.post_reconnect_fill_reconstruction_sweep(
-                    f"{reason_label}:post_connect_reconstruction",
-                    since_time=job.get("since_time") or self.get_reconnect_fill_reconstruction_since(),
-                )
-            elif not self.session_healthy:
-                self.force_session_recovery(reason_label)
-            elif job.get("force_reconciliation"):
-                self.post_reconnect_fill_reconstruction_sweep(
-                    f"{reason_label}:forced_reconciliation",
-                    since_time=job.get("since_time") or self.get_reconnect_fill_reconstruction_since(),
-                )
-        except Exception:
-            logger.exception(
-                "RECONNECT_RECOVERY_JOB_FAILED | "
-                f"reason={reason_label}"
-            )
-            self.update_session_health()
-            return 0
-
-        self.update_session_health()
-        self.log_session_health(f"RECONNECT_RECOVERY_JOB_COMPLETE_{reason_label}")
-        logger.warning(
-            "RECONNECT_RECOVERY_JOB_COMPLETE | "
-            f"reason={reason_label} "
-            f"socket_connected={self.session_socket_connected} "
-            f"session_initialized={self.session_initialized} "
-            f"session_healthy={self.session_healthy}"
-        )
-        return 1
-
-    def session_close_monitor(self):
-        self.log_session_close_config_loaded_once()
-        while True:
-            try:
-                for symbol in self.get_session_close_scope_symbols():
-                    block_active, state = self.should_block_new_entry_for_session_close(symbol)
-                    if block_active:
-                        logger.warning(
-                            "SESSION_ENTRY_CUTOFF_ACTIVE | "
-                            f"symbol={symbol} "
-                            f"minutes_to_close={state.get('minutes_to_close')} "
-                            f"cutoff_minutes={NO_NEW_ENTRIES_BEFORE_CLOSE_MIN} "
-                            f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                            f"timezone={state.get('timezone')} "
-                            f"reason={state.get('reason')} "
-                            f"stage={BOT_STAGE}"
-                        )
-                        self.enqueue_session_close_system_job(
-                            state.get("reason") or "session_close_monitor",
-                            symbol=symbol,
-                        )
-                    if state.get("hard_close_active"):
-                        logger.critical(
-                            "SESSION_CLOSE_HARD_FLATTEN_REQUIRED | "
-                            f"symbol={symbol} "
-                            f"minutes_to_close={state.get('minutes_to_close')} "
-                            f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                            f"timezone={state.get('timezone')} "
-                            "operator_action_required=False "
-                            "reason=session_flat_by_time_reached"
-                        )
-                        self.enqueue_session_close_system_job(
-                            "session_close_hard_flatten_required",
-                            symbol=symbol,
-                        )
-                time.sleep(SESSION_CLOSE_MONITOR_POLL_SECONDS)
-            except Exception:
-                logger.exception("SESSION CLOSE MONITOR FAILED")
-                time.sleep(SESSION_CLOSE_MONITOR_POLL_SECONDS)
-
     # P180/P181/P182: observability-only timing helpers for broker reads and webhook processing.
     def current_monotonic_ms(self):
         return time.perf_counter() * 1000.0
@@ -2626,19 +1676,7 @@ class ScalpingBot:
     def classify_broker_read_owner(self, caller=None):
         caller_text = str(caller or "").lower()
 
-        if caller_text in {
-            "place_bracket_order",
-            "protective_emergency_flatten",
-            "execution_worker",
-            "session_close_sweep",
-            "session_close_flatten",
-            "session_close_cancel_working_entries",
-            "session_close_cancel_stale_orders",
-            "process_broker_system_job",
-            "broker_reality_reconciliation",
-            "reconnect_recovery",
-            "startup_reconciliation",
-        }:
+        if caller_text in {"place_bracket_order", "execution_worker"}:
             return "execution_worker_owned_candidate"
         if caller_text in {"on_exec", "on_open_order", "on_order_status", "on_commission", "on_error"}:
             return "callback_owned_current"
@@ -2649,7 +1687,6 @@ class ScalpingBot:
             "update_session_health",
             "qualify_contracts",
             "ensure_symbol_contract_ready",
-            "update_session_health",
         }:
             return "watchdog_or_session_recovery"
         if caller_text in {"handle_webhook_signal", "webhook_handler"}:
@@ -2667,7 +1704,6 @@ class ScalpingBot:
             "place_timeout_retained_replacement_protection",
             "reconcile_timeout_retained_child_protection",
             "get_partial_timeout_parent_finality_snapshot",
-            "post_reconnect_fill_reconstruction_sweep",
         }:
             return "lifecycle_recovery_current"
 
@@ -2696,7 +1732,7 @@ class ScalpingBot:
             return "unknown"
         return "unknown"
 
-    # P184/P197: broker I/O owner audit and single-owner enforcement.
+    # P184: broker I/O owner audit; observability-only, no routing or execution semantics change.
     def register_broker_io_owner_candidate(self, owner_label):
         try:
             self.broker_io_owner_expected = owner_label or self.broker_io_owner_expected
@@ -2708,7 +1744,7 @@ class ScalpingBot:
                 f"broker_io_owner_expected={self.broker_io_owner_expected} "
                 f"broker_io_owner_thread_name={self.broker_io_owner_thread_name} "
                 f"broker_io_owner_thread_ident={self.broker_io_owner_thread_ident} "
-                f"broker_io_owner_action={self.get_broker_io_owner_action()}"
+                "broker_io_owner_action=audit_only"
             )
         except Exception:
             try:
@@ -2724,12 +1760,6 @@ class ScalpingBot:
         if expected_ident is None:
             return False
         return threading.get_ident() == expected_ident
-
-    def is_broker_io_enforcement_active(self):
-        return getattr(self, "broker_io_owner_mode", None) == "enforce_single_owner"
-
-    def get_broker_io_owner_action(self):
-        return "enforced" if self.is_broker_io_enforcement_active() else "audit_only"
 
     def classify_broker_io_owner_violation(self, caller=None):
         owner_class = self.classify_broker_read_owner(caller)
@@ -2767,7 +1797,7 @@ class ScalpingBot:
             "broker_io_owner_actual": f"{current_name}:{current_ident}",
             "broker_io_owner_match": str(bool(owner_match)).lower(),
             "broker_io_owner_violation_class": self.classify_broker_io_owner_violation(caller),
-            "broker_io_owner_action": self.get_broker_io_owner_action(),
+            "broker_io_owner_action": "audit_only",
         }
 
     def format_broker_io_owner_audit_fields(self, caller=None):
@@ -2802,33 +1832,6 @@ class ScalpingBot:
             except Exception:
                 pass
 
-    def assert_broker_io_owner(
-        self,
-        caller,
-        broker_call,
-        operation_type,
-        trade_id=None,
-        symbol=None,
-    ):
-        if not self.is_broker_io_enforcement_active():
-            return
-        if self.is_current_broker_io_owner_context(caller):
-            return
-
-        message = (
-            "BROKER_IO_OWNER_VIOLATION | "
-            f"broker_call={broker_call} "
-            f"caller={caller} "
-            f"operation_type={operation_type} "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"thread_name={threading.current_thread().name} "
-            f"thread_ident={threading.get_ident()} "
-            f"{self.format_broker_io_owner_audit_fields(caller)}"
-        )
-        logger.critical(message)
-        raise RuntimeError(message)
-
     def log_broker_read_lock_risk(
         self,
         broker_call,
@@ -2852,7 +1855,7 @@ class ScalpingBot:
                 f"thread_name={threading.current_thread().name} "
                 f"thread_ident={threading.get_ident()} "
                 f"trade_analysis_lock_context={trade_analysis_lock_context} "
-                f"broker_read_lock_action={self.get_broker_io_owner_action()} "
+                "broker_read_lock_action=audit_only "
                 f"{self.format_broker_io_owner_audit_fields(caller)}"
             )
         except Exception:
@@ -2929,7 +1932,7 @@ class ScalpingBot:
                 f"failure={failure} "
                 f"trade_analysis_lock_context={trade_analysis_lock_context} "
                 f"broker_read_lock_risk={broker_read_lock_risk} "
-                f"broker_read_lock_action={self.get_broker_io_owner_action()} "
+                "broker_read_lock_action=audit_only "
                 f"{self.format_broker_io_owner_audit_fields(caller)}"
             )
             if success:
@@ -2946,7 +1949,7 @@ class ScalpingBot:
             except Exception:
                 pass
 
-    # P183/P197: broker I/O wrappers with audit, timing, and single-owner enforcement.
+    # P183: broker I/O audit wrappers; observability-only, no execution semantics change.
     def broker_read(
         self,
         broker_call,
@@ -2978,13 +1981,6 @@ class ScalpingBot:
             broker_call=broker_call,
             caller=caller,
             reason_label=reason_label,
-            trade_id=trade_id,
-            symbol=symbol,
-        )
-        self.assert_broker_io_owner(
-            caller=caller,
-            broker_call=broker_call,
-            operation_type="read",
             trade_id=trade_id,
             symbol=symbol,
         )
@@ -3062,18 +2058,6 @@ class ScalpingBot:
             trade_analysis_lock_context=trade_analysis_lock_context,
         )
 
-    def broker_read_is_connected(self, caller, reason_label, trade_id=None, symbol=None, failure_log_level="warning"):
-        return self.broker_read(
-            "isConnected",
-            self.ib.isConnected,
-            caller,
-            reason_label,
-            trade_id=trade_id,
-            symbol=symbol,
-            trade_analysis_lock_context="not_locked",
-            failure_log_level=failure_log_level,
-        )
-
     def broker_read_open_trades_open_orders(self, caller, reason_label, trade_id=None, symbol=None, trade_analysis_lock_context="not_locked"):
         return self.broker_read(
             "openTrades+openOrders",
@@ -3096,7 +2080,7 @@ class ScalpingBot:
             trade_analysis_lock_context=trade_analysis_lock_context,
         )
 
-    # P186/P197: broker write owner audit used by enforced broker writes.
+    # P186: broker write owner audit; observability-only, no execution semantics change.
     def log_broker_write_owner_audit(
         self,
         broker_call,
@@ -3185,13 +2169,6 @@ class ScalpingBot:
             trade_id=trade_id,
             symbol=symbol,
         )
-        self.assert_broker_io_owner(
-            caller=caller,
-            broker_call=broker_call,
-            operation_type="write",
-            trade_id=trade_id,
-            symbol=symbol,
-        )
         broker_write_start_ms = self.current_monotonic_ms()
         try:
             result = write_fn()
@@ -3220,15 +2197,6 @@ class ScalpingBot:
             raise
 
     def broker_write_place_order(self, contract, order, caller, reason_label, trade_id=None, symbol=None):
-        self.assert_order_transmission_allowed(
-            symbol=symbol,
-            trade_id=trade_id,
-            reason_label=reason_label,
-        )
-        self.assert_prd_live_release_allowed(
-            symbol=symbol,
-            trade_id=trade_id,
-        )
         return self.broker_write(
             "placeOrder",
             lambda: self.ib.placeOrder(contract, order),
@@ -3238,13 +2206,7 @@ class ScalpingBot:
             symbol=symbol,
         )
 
-    def broker_write_cancel_order(self, order, caller, reason_label, trade_id=None, symbol=None, real_broker_exposure=False):
-        self.assert_cancel_mutation_allowed(
-            symbol=symbol,
-            trade_id=trade_id,
-            reason_label=reason_label,
-            real_broker_exposure=real_broker_exposure,
-        )
+    def broker_write_cancel_order(self, order, caller, reason_label, trade_id=None, symbol=None):
         return self.broker_write(
             "cancelOrder",
             lambda: self.ib.cancelOrder(order),
@@ -3280,1080 +2242,6 @@ class ScalpingBot:
             trade_id=trade_id,
             symbol=symbol,
         )
-
-    def broker_get_req_id(self, caller, reason_label, trade_id=None, symbol=None):
-        return self.broker_read(
-            "client.getReqId",
-            self.ib.client.getReqId,
-            caller,
-            reason_label,
-            trade_id=trade_id,
-            symbol=symbol,
-            trade_analysis_lock_context="not_locked",
-        )
-
-    def normalize_broker_position_quantity(self, value):
-        try:
-            quantity = float(value or 0.0)
-            if abs(quantity) <= 1e-9:
-                return 0.0
-            return quantity
-        except Exception:
-            return 0.0
-
-    def get_position_quantity_from_positions(self, positions, symbol):
-        total = 0.0
-        for position in positions or []:
-            contract = getattr(position, "contract", None)
-            if self.contract_matches_symbol(contract, symbol):
-                total += self.normalize_broker_position_quantity(getattr(position, "position", 0.0))
-        return self.normalize_broker_position_quantity(total)
-
-    def read_session_close_broker_snapshot(self, reason_label, symbol=None):
-        open_trades, positions, open_orders = self.broker_read_open_trades_positions_open_orders(
-            caller="session_close_sweep",
-            reason_label=reason_label,
-            symbol=symbol,
-            trade_analysis_lock_context="not_locked",
-        )
-        return {
-            "open_trades": open_trades,
-            "positions": positions,
-            "open_orders": open_orders,
-        }
-
-    def get_startup_reconciliation_symbols(self):
-        return [
-            symbol for symbol in QUALIFIED_FUTURE_SYMBOLS
-            if symbol in INSTRUMENT_SPECS and symbol not in RUNTIME_DISABLED_SYMBOLS
-        ]
-
-    def should_block_external_entry_for_startup_reconciliation(self):
-        if not self.startup_reconciliation_required:
-            return False
-        return not self.startup_reconciliation_completed
-
-    def should_block_external_entry(self):
-        if self.should_block_external_entry_for_startup_reconciliation():
-            return True, "startup_reconciliation", (
-                self.external_entries_blocked_reason
-                or self.startup_reconciliation_block_reason
-                or "startup_reconciliation_required"
-            )
-        if self.external_entries_blocked_reason:
-            return True, "broker_quarantine", self.external_entries_blocked_reason
-        return False, None, None
-
-    def log_startup_entry_blocked(self, job=None, normalized=None, location=None):
-        logger.warning(
-            "STARTUP_RECONCILIATION_ENTRY_BLOCKED | "
-            f"status={self.startup_reconciliation_status} "
-            f"reason={self.startup_reconciliation_block_reason} "
-            f"external_entries_blocked_reason={self.external_entries_blocked_reason} "
-            f"ambiguous_symbols={sorted(self.startup_reconciliation_ambiguous_symbols)} "
-            f"symbol={(job or {}).get('symbol') or (normalized or {}).get('symbol')} "
-            f"signal_id={(job or {}).get('signal_id') or (normalized or {}).get('signal_id')} "
-            f"location={location}"
-        )
-
-    def log_external_entry_blocked(self, job=None, normalized=None, location=None, block_source=None, reason=None):
-        if block_source == "startup_reconciliation":
-            self.log_startup_entry_blocked(job=job, normalized=normalized, location=location)
-            return
-
-        logger.critical(
-            "EXTERNAL_ENTRY_BLOCKED | "
-            f"block_source={block_source} "
-            f"reason={reason} "
-            f"external_entries_blocked_reason={self.external_entries_blocked_reason} "
-            f"symbol={(job or {}).get('symbol') or (normalized or {}).get('symbol')} "
-            f"signal_id={(job or {}).get('signal_id') or (normalized or {}).get('signal_id')} "
-            f"location={location}"
-        )
-
-    def read_startup_broker_snapshot(self):
-        open_trades, positions, open_orders = self.broker_read_open_trades_positions_open_orders(
-            caller="startup_reconciliation",
-            reason_label="startup_reconciliation_snapshot",
-            trade_analysis_lock_context="not_locked",
-        )
-        return {
-            "open_trades": open_trades,
-            "positions": positions,
-            "open_orders": open_orders,
-        }
-
-    def is_startup_bot_owned_order_for_symbol(self, order, symbol):
-        order_ref = getattr(order, "orderRef", None)
-        parsed = self.parse_order_ref(order_ref)
-        return bool(parsed.get("symbol") == str(symbol).upper())
-
-    def get_startup_bot_order_role(self, order, symbol):
-        if not self.is_startup_bot_owned_order_for_symbol(order, symbol):
-            return None
-        parsed = self.parse_order_ref(getattr(order, "orderRef", None))
-        return parsed.get("leg_role")
-
-    def cleanup_startup_stale_orders_if_safe(self, snapshot, symbols):
-        cancel_count = 0
-        for symbol in symbols:
-            position_qty = self.get_position_quantity_from_positions(
-                snapshot.get("positions"),
-                symbol,
-            )
-            if position_qty != 0.0:
-                continue
-
-            orders_by_id = {}
-            ambiguous_order_ids = set()
-            for trade in snapshot.get("open_trades") or []:
-                order = getattr(trade, "order", None)
-                status = getattr(trade, "orderStatus", None)
-                contract = getattr(trade, "contract", None)
-                if not self.order_is_open_for_session_close(order, status):
-                    continue
-                if not self.contract_matches_symbol(contract, symbol):
-                    continue
-                order_id = getattr(order, "orderId", None)
-                if self.is_startup_bot_owned_order_for_symbol(order, symbol):
-                    orders_by_id[order_id] = order
-                elif order_id is not None:
-                    ambiguous_order_ids.add(order_id)
-
-            for order in snapshot.get("open_orders") or []:
-                order_id = getattr(order, "orderId", None)
-                if self.is_startup_bot_owned_order_for_symbol(order, symbol):
-                    orders_by_id[order_id] = order
-
-            if ambiguous_order_ids:
-                logger.critical(
-                    "STARTUP_RECONCILIATION_AMBIGUOUS | "
-                    f"symbol={symbol} "
-                    f"ambiguous_order_ids={sorted(ambiguous_order_ids)} "
-                    "decision=skip_startup_cleanup_and_block"
-                )
-                continue
-
-            for order_id, order in list(orders_by_id.items()):
-                if order is None:
-                    continue
-                logger.warning(
-                    "STARTUP_RECONCILIATION_STALE_ORDER_CANCEL_REQUESTED | "
-                    f"symbol={symbol} "
-                    f"order_id={order_id} "
-                    f"order_ref={getattr(order, 'orderRef', None)} "
-                    "reason=no_position_bot_owned_open_order"
-                )
-                self.broker_write_cancel_order(
-                    order,
-                    caller="startup_reconciliation",
-                    reason_label="startup_stale_order_cleanup",
-                    symbol=symbol,
-                    real_broker_exposure=True,
-                )
-                cancel_count += 1
-
-        if cancel_count:
-            self.broker_write_sleep(
-                EOD_FLATTEN_RECHECK_SECONDS,
-                caller="startup_reconciliation",
-                reason_label="startup_stale_order_cleanup_wait",
-            )
-        return cancel_count
-
-    def get_startup_position_for_symbol(self, snapshot, symbol):
-        for position in snapshot.get("positions") or []:
-            contract = getattr(position, "contract", None)
-            position_qty = self.normalize_broker_position_quantity(
-                getattr(position, "position", 0.0)
-            )
-            if position_qty and self.contract_matches_symbol(contract, symbol):
-                return position, position_qty
-        return None, 0.0
-
-    def get_startup_protective_orders_for_symbol(self, snapshot, symbol):
-        orders_by_role = {"TP": [], "SL": []}
-        ambiguous_order_ids = []
-        for trade in snapshot.get("open_trades") or []:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            contract = getattr(trade, "contract", None)
-            if not self.order_is_open_for_session_close(order, status):
-                continue
-            if not self.contract_matches_symbol(contract, symbol):
-                continue
-            role = self.get_startup_bot_order_role(order, symbol)
-            order_id = getattr(order, "orderId", None)
-            if role in orders_by_role:
-                orders_by_role[role].append(order)
-            elif order_id is not None:
-                ambiguous_order_ids.append(order_id)
-        return orders_by_role, sorted(set(ambiguous_order_ids))
-
-    def build_startup_reconstruction_job(self, symbol, side, position_qty, entry_price):
-        now_dt = datetime.now(timezone.utc)
-        return {
-            "symbol": symbol,
-            "side": side,
-            "bot_stage": BOT_STAGE,
-            "entry": entry_price,
-            "signal_time": now_dt,
-            "enqueue_time": now_dt,
-            "grade": "STARTUP_RECONSTRUCTED",
-            "truth_classification": "STARTUP_RECONSTRUCTED",
-            "det_classification": "STARTUP_RECONSTRUCTED",
-            "primary_reason": "startup_reconstructed_protected_position",
-            "execution_lane": "startup_reconstruction",
-            "promoted_from_shadow": False,
-            "shadow_override_reason": "",
-            "webhook_received_time": None,
-            "classification_completed_time": None,
-            "queue_put_time": None,
-            "worker_pickup_time": now_dt,
-            "preflight_completed_time": None,
-            "intended_risk_percent": None,
-            "allowed_money_risk": None,
-            "stop_distance_points": None,
-            "raw_position_size": None,
-            "normalized_position_size": abs(float(position_qty)),
-            "risk_intent_profile": "STARTUP_RECONSTRUCTED",
-            "risk_intent_percent": None,
-            "risk_intent_status": "startup_reconstructed",
-            "risk_intent_reason": "startup_reconstructed_existing_position",
-            "theoretical_size_before_containment": abs(float(position_qty)),
-            "approved_size_after_containment": abs(float(position_qty)),
-            "containment_status": "startup_reconstructed",
-            "containment_stage": BOT_STAGE,
-            "containment_profile": None,
-            "containment_max_size": self.get_containment_max_size(symbol),
-            "containment_max_notional": self.get_containment_max_notional(symbol),
-            "containment_hierarchy": ">".join(CONTAINMENT_ACTION_HIERARCHY),
-            "containment_decision_source": "none",
-            "containment_denial_source": "none",
-            "triggering_containment_rule": "none",
-            "notional_model": self.get_notional_metadata(symbol)[0],
-            "notional_currency": self.get_notional_metadata(symbol)[1],
-            "capped_size_after_size_containment": abs(float(position_qty)),
-            "estimated_notional_before_containment": self.estimate_notional_exposure(
-                symbol,
-                abs(float(position_qty)),
-                entry_price,
-            ),
-            "estimated_notional_after_size_containment": self.estimate_notional_exposure(
-                symbol,
-                abs(float(position_qty)),
-                entry_price,
-            ),
-            "estimated_notional_after_containment": self.estimate_notional_exposure(
-                symbol,
-                abs(float(position_qty)),
-                entry_price,
-            ),
-            "containment_action": "approve_as_is",
-            "containment_reason": "startup_reconstructed_existing_position",
-        }
-
-    def validate_startup_protective_order_pair(self, symbol, side, position_qty, tp_order, sl_order):
-        expected_exit_action = "SELL" if side == "long" else "BUY"
-        tp_action = str(getattr(tp_order, "action", "") or "").upper()
-        sl_action = str(getattr(sl_order, "action", "") or "").upper()
-        tp_qty = self.normalize_fill_quantity(getattr(tp_order, "totalQuantity", None))
-        sl_qty = self.normalize_fill_quantity(getattr(sl_order, "totalQuantity", None))
-        expected_qty = abs(float(position_qty))
-        tp_price = getattr(tp_order, "lmtPrice", None)
-        sl_price = getattr(sl_order, "auxPrice", None)
-
-        reasons = []
-        if self.get_startup_bot_order_role(tp_order, symbol) != "TP":
-            reasons.append("tp_role_invalid")
-        if self.get_startup_bot_order_role(sl_order, symbol) != "SL":
-            reasons.append("sl_role_invalid")
-        if tp_action != expected_exit_action:
-            reasons.append("tp_action_mismatch")
-        if sl_action != expected_exit_action:
-            reasons.append("sl_action_mismatch")
-        if abs(tp_qty - expected_qty) > 1e-9:
-            reasons.append("tp_quantity_mismatch")
-        if abs(sl_qty - expected_qty) > 1e-9:
-            reasons.append("sl_quantity_mismatch")
-        if tp_price is None or float(tp_price or 0.0) <= 0:
-            reasons.append("tp_price_invalid")
-        if sl_price is None or float(sl_price or 0.0) <= 0:
-            reasons.append("sl_price_invalid")
-
-        if reasons:
-            return False, ",".join(reasons)
-        return True, "startup_protective_pair_valid"
-
-    def reconstruct_startup_trade_record(self, symbol, position, position_qty, tp_order, sl_order):
-        side = "long" if position_qty > 0 else "short"
-        entry_price = getattr(position, "avgCost", None) or 0.0
-        stop_price = getattr(sl_order, "auxPrice", None) or 0.0
-        target_price = getattr(tp_order, "lmtPrice", None) or 0.0
-        now_dt = datetime.now(timezone.utc)
-        synthetic_job = self.build_startup_reconstruction_job(
-            symbol,
-            side,
-            position_qty,
-            entry_price,
-        )
-        record = self.build_trade_record(
-            synthetic_job,
-            now_dt,
-            now_dt,
-            now_dt,
-            entry_price,
-            entry_price,
-            stop_price,
-            target_price,
-            None,
-            getattr(tp_order, "orderId", None),
-            getattr(sl_order, "orderId", None),
-        )
-        tp_order_quantity = self.normalize_broker_quantity_or_none(
-            getattr(tp_order, "totalQuantity", None)
-        )
-        sl_order_quantity = self.normalize_broker_quantity_or_none(
-            getattr(sl_order, "totalQuantity", None)
-        )
-        planned_tp_quantity = tp_order_quantity if tp_order_quantity is not None else abs(float(position_qty))
-        planned_sl_quantity = sl_order_quantity if sl_order_quantity is not None else abs(float(position_qty))
-        tp_order_ref = self.get_order_ref(order=tp_order)
-        sl_order_ref = self.get_order_ref(order=sl_order)
-        parsed_tp_order_ref = self.parse_order_ref(tp_order_ref)
-        parsed_sl_order_ref = self.parse_order_ref(sl_order_ref)
-        parsed_startup_refs = [parsed_tp_order_ref, parsed_sl_order_ref]
-        startup_has_foreign_run_ref = any(
-            parsed.get("is_valid")
-            and not parsed.get("is_legacy")
-            and parsed.get("run_id") != self.run_id
-            for parsed in parsed_startup_refs
-        )
-        startup_has_legacy_ref = any(
-            parsed.get("is_legacy") or not parsed.get("is_valid")
-            for parsed in parsed_startup_refs
-        )
-        broker_identity_scope = (
-            "startup_reconstructed_foreign"
-            if startup_has_foreign_run_ref
-            else "startup_reconstructed_legacy"
-            if startup_has_legacy_ref
-            else "startup_reconstructed_current_run"
-        )
-        with self.trade_analysis_lock:
-            trade_id = record["trade_id"]
-            record.update({
-                "state": "EXIT_WORKING",
-                "planned_parent_quantity": None,
-                "planned_tp_quantity": planned_tp_quantity,
-                "planned_sl_quantity": planned_sl_quantity,
-                "order_ref_entry": None,
-                "order_ref_tp": tp_order_ref,
-                "order_ref_sl": sl_order_ref,
-                "broker_identity_scope": broker_identity_scope,
-                "startup_reconstructed_order_refs": {
-                    "tp": tp_order_ref,
-                    "sl": sl_order_ref,
-                },
-                "tp_perm_id": getattr(tp_order, "permId", None),
-                "sl_perm_id": getattr(sl_order, "permId", None),
-                "entry_fill_price": entry_price,
-                "entry_fill_time": now_dt,
-                "entry_filled": True,
-                "position_size": abs(float(position_qty)),
-                "planned_position_size": abs(float(position_qty)),
-                "realized_entry_quantity": abs(float(position_qty)),
-                "cumulative_entry_quantity": abs(float(position_qty)),
-                "execution_validation_status": "startup_reconstructed",
-                "broker_acknowledged_at": now_dt,
-                "broker_live_at": now_dt,
-                "reconstructed_from_startup": True,
-                "startup_reconstructed_at": now_dt,
-                "submitted_counted": True,
-                "broker_acknowledged_counted": True,
-                "broker_live_counted": True,
-            })
-            record["events"].append(f"{self.utc_now_iso()} | STARTUP_RECONSTRUCTED protected_position")
-            self.trade_analysis[trade_id] = record
-            if record["tp_order_id"] is not None:
-                self.order_to_trade[record["tp_order_id"]] = trade_id
-            if record["sl_order_id"] is not None:
-                self.order_to_trade[record["sl_order_id"]] = trade_id
-            self.active_execution_trade_id = trade_id
-            self.arm_time_exit_on_entry_exposure(trade_id, record, now_dt)
-            record["events"].append(
-                f"{self.utc_now_iso()} | TIME_EXIT_RESTART_SAFE_ARMED startup_reconstructed_position"
-            )
-
-        logger.warning(
-            "STARTUP_RECONCILIATION_RECONSTRUCTED | "
-            f"trade_id={trade_id} "
-            f"run_id={self.run_id} "
-            f"broker_identity_scope={broker_identity_scope} "
-            f"symbol={symbol} "
-            f"side={side} "
-            f"position_qty={position_qty} "
-            f"tp_order_id={record['tp_order_id']} "
-            f"sl_order_id={record['sl_order_id']} "
-            f"tp_order_ref={tp_order_ref} "
-            f"sl_order_ref={sl_order_ref} "
-            f"time_exit_status={record.get('time_exit_status')} "
-            f"time_exit_deadline_at={record.get('time_exit_deadline_at')} "
-            "decision=track_existing_protected_position_with_restart_safe_time_exit"
-        )
-        if broker_identity_scope in {"startup_reconstructed_legacy", "startup_reconstructed_foreign"}:
-            logger.warning(
-                "LEGACY_ORDER_REF_DETECTED | "
-                f"trade_id={trade_id} "
-                f"run_id={self.run_id} "
-                f"symbol={symbol} "
-                f"broker_identity_scope={broker_identity_scope} "
-                f"tp_order_ref={tp_order_ref} "
-                f"tp_parsed_run_id={parsed_tp_order_ref.get('run_id')} "
-                f"tp_parse_error={parsed_tp_order_ref.get('parse_error')} "
-                f"sl_order_ref={sl_order_ref} "
-                f"sl_parsed_run_id={parsed_sl_order_ref.get('run_id')} "
-                f"sl_parse_error={parsed_sl_order_ref.get('parse_error')} "
-                "decision=allow_only_startup_reconstructed_exact_order_or_perm_matches"
-            )
-        return trade_id
-
-    def reconstruct_startup_positions_if_safe(self, snapshot, symbols):
-        reconstructed_symbols = set()
-        for symbol in symbols:
-            position, position_qty = self.get_startup_position_for_symbol(snapshot, symbol)
-            if position is None or position_qty == 0.0:
-                continue
-            orders_by_role, ambiguous_order_ids = self.get_startup_protective_orders_for_symbol(
-                snapshot,
-                symbol,
-            )
-            if ambiguous_order_ids:
-                logger.critical(
-                    "STARTUP_RECONCILIATION_AMBIGUOUS | "
-                    f"symbol={symbol} "
-                    f"ambiguous_order_ids={ambiguous_order_ids} "
-                    "decision=skip_reconstruction_and_block"
-                )
-                continue
-            if len(orders_by_role["TP"]) == 1 and len(orders_by_role["SL"]) == 1:
-                side = "long" if position_qty > 0 else "short"
-                pair_valid, validation_reason = self.validate_startup_protective_order_pair(
-                    symbol,
-                    side,
-                    position_qty,
-                    orders_by_role["TP"][0],
-                    orders_by_role["SL"][0],
-                )
-                if not pair_valid:
-                    logger.critical(
-                        "STARTUP_RECONCILIATION_AMBIGUOUS | "
-                        f"symbol={symbol} "
-                        f"position_qty={position_qty} "
-                        f"reason={validation_reason} "
-                        "decision=skip_reconstruction_and_block"
-                    )
-                    continue
-                self.reconstruct_startup_trade_record(
-                    symbol,
-                    position,
-                    position_qty,
-                    orders_by_role["TP"][0],
-                    orders_by_role["SL"][0],
-                )
-                reconstructed_symbols.add(symbol)
-                continue
-            if not orders_by_role["SL"]:
-                logger.critical(
-                    "STARTUP_RECONCILIATION_BLOCKED | "
-                    f"symbol={symbol} "
-                    f"position_qty={position_qty} "
-                    "reason=position_without_protective_sl "
-                    "decision=external_entries_remain_blocked_operator_action_required"
-                )
-        return reconstructed_symbols
-
-    def classify_startup_symbol_reality(self, symbol, snapshot, reconstructed_symbols=None):
-        reconstructed_symbols = reconstructed_symbols or set()
-        position_qty = self.get_position_quantity_from_positions(
-            snapshot.get("positions"),
-            symbol,
-        )
-        matching_open_trade_order_ids = []
-        matching_open_order_ids = []
-        ambiguous_open_trade_order_ids = []
-
-        for trade in snapshot.get("open_trades") or []:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            contract = getattr(trade, "contract", None)
-            if (
-                self.order_is_open_for_session_close(order, status)
-                and self.contract_matches_symbol(contract, symbol)
-            ):
-                order_id = getattr(order, "orderId", None)
-                if self.is_startup_bot_owned_order_for_symbol(order, symbol) and order_id is not None:
-                    matching_open_trade_order_ids.append(order_id)
-                elif order_id is not None:
-                    ambiguous_open_trade_order_ids.append(order_id)
-
-        for order in snapshot.get("open_orders") or []:
-            order_id = getattr(order, "orderId", None)
-            order_symbol_match = False
-            order_ref = getattr(order, "orderRef", None)
-            if order_ref and f"|{symbol}|" in str(order_ref):
-                order_symbol_match = True
-            if order_symbol_match and order_id is not None:
-                matching_open_order_ids.append(order_id)
-
-        has_position = position_qty != 0.0
-        has_open_orders = bool(matching_open_trade_order_ids or matching_open_order_ids)
-        has_ambiguous_orders = bool(ambiguous_open_trade_order_ids)
-        status = "clear"
-        reason = "no_position_no_open_orders"
-        if symbol in reconstructed_symbols:
-            status = "reconstructed"
-            reason = "startup_reconstructed_protected_position"
-        elif has_ambiguous_orders:
-            status = "blocked"
-            reason = "ambiguous_open_orders"
-        elif has_position and has_open_orders:
-            status = "blocked"
-            reason = "position_with_open_orders_requires_reconstruction"
-        elif has_position:
-            status = "blocked"
-            reason = "position_without_confirmed_protection"
-        elif has_open_orders:
-            status = "blocked"
-            reason = "open_orders_require_startup_cleanup_or_operator_review"
-
-        logger.warning(
-            "STARTUP_RECONCILIATION_SYMBOL_SNAPSHOT | "
-            f"symbol={symbol} "
-            f"status={status} "
-            f"reason={reason} "
-            f"position_qty={position_qty} "
-            f"matching_open_trade_order_ids={sorted(set(matching_open_trade_order_ids))} "
-            f"matching_open_order_ids={sorted(set(matching_open_order_ids))} "
-            f"ambiguous_open_trade_order_ids={sorted(set(ambiguous_open_trade_order_ids))}"
-        )
-        return {
-            "symbol": symbol,
-            "status": status,
-            "reason": reason,
-            "position_qty": position_qty,
-            "matching_open_trade_order_ids": sorted(set(matching_open_trade_order_ids)),
-            "matching_open_order_ids": sorted(set(matching_open_order_ids)),
-            "ambiguous_open_trade_order_ids": sorted(set(ambiguous_open_trade_order_ids)),
-        }
-
-    def run_startup_reconciliation(self):
-        self.startup_reconciliation_started_at = datetime.now(timezone.utc)
-        self.startup_reconciliation_status = "running"
-        self.startup_reconciliation_block_reason = "startup_reconciliation_running"
-        self.external_entries_blocked_reason = "startup_reconciliation_running"
-        self.startup_reconciliation_ambiguous_symbols.clear()
-        symbols = self.get_startup_reconciliation_symbols()
-
-        logger.warning(
-            "STARTUP_RECONCILIATION_STARTED | "
-            f"symbols={symbols} "
-            f"stage={BOT_STAGE}"
-        )
-
-        try:
-            snapshot = self.read_startup_broker_snapshot()
-            cleanup_count = self.cleanup_startup_stale_orders_if_safe(
-                snapshot,
-                symbols,
-            )
-            if cleanup_count:
-                logger.warning(
-                    "STARTUP_RECONCILIATION_STALE_ORDER_CLEANUP_COMPLETE | "
-                    f"cancel_count={cleanup_count} "
-                    "decision=resnapshot_before_classification"
-                )
-                snapshot = self.read_startup_broker_snapshot()
-            reconstructed_symbols = self.reconstruct_startup_positions_if_safe(
-                snapshot,
-                symbols,
-            )
-            symbol_results = [
-                self.classify_startup_symbol_reality(
-                    symbol,
-                    snapshot,
-                    reconstructed_symbols=reconstructed_symbols,
-                )
-                for symbol in symbols
-            ]
-        except Exception as exc:
-            self.startup_reconciliation_status = "blocked"
-            self.startup_reconciliation_block_reason = f"startup_reconciliation_snapshot_failed:{exc}"
-            self.external_entries_blocked_reason = self.startup_reconciliation_block_reason
-            logger.exception(
-                "STARTUP_RECONCILIATION_BLOCKED | "
-                f"reason={self.startup_reconciliation_block_reason}"
-            )
-            return False
-
-        blocked = [
-            result for result in symbol_results
-            if result["status"] not in {"clear", "reconstructed"}
-        ]
-        if blocked:
-            self.startup_reconciliation_status = "blocked"
-            self.startup_reconciliation_block_reason = "startup_reconciliation_broker_reality_not_clear"
-            self.external_entries_blocked_reason = self.startup_reconciliation_block_reason
-            self.startup_reconciliation_ambiguous_symbols = {
-                result["symbol"] for result in blocked
-            }
-            logger.critical(
-                "STARTUP_RECONCILIATION_BLOCKED | "
-                f"blocked_symbols={sorted(self.startup_reconciliation_ambiguous_symbols)} "
-                f"results={json.dumps(symbol_results, sort_keys=True)} "
-                "decision=external_entries_remain_blocked"
-            )
-            return False
-
-        self.startup_reconciliation_completed = True
-        self.startup_reconciliation_completed_at = datetime.now(timezone.utc)
-        self.startup_reconciliation_status = "clear"
-        self.startup_reconciliation_block_reason = None
-        self.external_entries_blocked_reason = None
-        logger.warning(
-            "STARTUP_RECONCILIATION_CLEAR | "
-            f"symbols={symbols}"
-        )
-        logger.warning(
-            "STARTUP_RECONCILIATION_COMPLETED | "
-            f"started_at={self.to_iso(self.startup_reconciliation_started_at)} "
-            f"completed_at={self.to_iso(self.startup_reconciliation_completed_at)} "
-            "external_entries_allowed=true"
-        )
-        return True
-
-    def get_session_close_symbol_record_snapshots(self, symbol):
-        with self.trade_analysis_lock:
-            return [
-                dict(record)
-                for record in self.trade_analysis.values()
-                if (
-                    record.get("symbol") == symbol
-                    and not record.get("summary_logged")
-                    and record.get("state") in ACTIVE_TRADE_STATES
-                )
-            ]
-
-    def order_is_open_for_session_close(self, order=None, status=None):
-        order_status = getattr(status, "status", None)
-        if order_status not in OPEN_BROKER_ORDER_STATUSES:
-            return False
-        remaining = getattr(status, "remaining", None)
-        try:
-            if remaining is not None and float(remaining) <= 0:
-                return False
-        except Exception:
-            pass
-        return order is not None
-
-    def collect_session_close_orders_for_symbol(self, symbol, snapshot):
-        records = self.get_session_close_symbol_record_snapshots(symbol)
-        parent_order_ids = {record.get("parent_order_id") for record in records}
-        child_order_ids = {
-            order_id
-            for record in records
-            for order_id in (record.get("tp_order_id"), record.get("sl_order_id"))
-        }
-        parent_order_ids.discard(None)
-        child_order_ids.discard(None)
-
-        working_entries = {}
-        symbol_orders = {}
-        child_orders = {}
-
-        for trade in snapshot.get("open_trades") or []:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            contract = getattr(trade, "contract", None)
-            if not self.order_is_open_for_session_close(order, status):
-                continue
-            order_id = getattr(order, "orderId", None)
-            if order_id in parent_order_ids:
-                working_entries[order_id] = order
-            if order_id in child_order_ids:
-                child_orders[order_id] = order
-            if self.contract_matches_symbol(contract, symbol):
-                symbol_orders[order_id] = order
-
-        for order in snapshot.get("open_orders") or []:
-            order_id = getattr(order, "orderId", None)
-            if order_id in parent_order_ids:
-                working_entries[order_id] = order
-            if order_id in child_order_ids:
-                child_orders[order_id] = order
-
-        return working_entries, child_orders, symbol_orders
-
-    def cancel_session_close_orders(self, orders_by_id, symbol, reason_label, log_event):
-        cancel_count = 0
-        for order_id, order in list((orders_by_id or {}).items()):
-            if order is None:
-                continue
-            try:
-                logger.warning(
-                    f"{log_event} | "
-                    f"symbol={symbol} "
-                    f"order_id={order_id} "
-                    f"perm_id={getattr(order, 'permId', None)} "
-                    f"action={getattr(order, 'action', None)} "
-                    f"order_type={getattr(order, 'orderType', None)} "
-                    f"reason={reason_label} "
-                    "lifecycle_state=SESSION_CLOSING"
-                )
-                self.broker_write_cancel_order(
-                    order,
-                    caller=(
-                        "session_close_cancel_working_entries"
-                        if log_event == "SESSION_WORKING_ENTRY_CANCEL_REQUESTED"
-                        else "session_close_cancel_stale_orders"
-                    ),
-                    reason_label=reason_label,
-                    symbol=symbol,
-                    real_broker_exposure=True,
-                )
-                cancel_count += 1
-            except Exception as exc:
-                logger.exception(
-                    "SESSION_CLOSE_ORDER_CANCEL_FAILED | "
-                    f"symbol={symbol} order_id={order_id} reason={reason_label} failure={exc}"
-                )
-        return cancel_count
-
-    def cancel_working_entries_for_session_close(self, symbol, state, snapshot, reason_label):
-        if not SESSION_CLOSE_CANCEL_WORKING_ENTRIES:
-            return 0
-
-        working_entries, child_orders, _ = self.collect_session_close_orders_for_symbol(symbol, snapshot)
-        if not working_entries:
-            return 0
-
-        cancel_count = self.cancel_session_close_orders(
-            working_entries,
-            symbol,
-            reason_label,
-            "SESSION_WORKING_ENTRY_CANCEL_REQUESTED",
-        )
-        self.broker_write_sleep(
-            EOD_FLATTEN_RECHECK_SECONDS,
-            caller="session_close_cancel_working_entries",
-            reason_label=reason_label,
-            symbol=symbol,
-        )
-        refreshed = self.read_session_close_broker_snapshot(reason_label, symbol=symbol)
-        remaining_entries, _, _ = self.collect_session_close_orders_for_symbol(symbol, refreshed)
-        position_qty = self.get_position_quantity_from_positions(refreshed.get("positions"), symbol)
-
-        for order_id in working_entries:
-            if order_id not in remaining_entries:
-                logger.warning(
-                    "SESSION_WORKING_ENTRY_CANCELLED | "
-                    f"symbol={symbol} "
-                    f"order_id={order_id} "
-                    f"position_qty={position_qty} "
-                    f"minutes_to_close={state.get('minutes_to_close')} "
-                    f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                    f"timezone={state.get('timezone')} "
-                    f"reason={reason_label} "
-                    "lifecycle_state=SESSION_ENTRY_CANCELLED"
-                )
-
-        if position_qty == 0.0 and child_orders:
-            self.cancel_session_close_orders(
-                child_orders,
-                symbol,
-                reason_label,
-                "SESSION_CLOSE_STALE_ORDER_CANCEL_REQUESTED",
-            )
-
-        return cancel_count
-
-    def get_current_broker_position_quantity_for_symbol(self, symbol, reason_label):
-        positions = self.broker_read_positions(
-            caller="session_close_flatten",
-            reason_label=reason_label,
-            symbol=symbol,
-            trade_analysis_lock_context="not_locked",
-        )
-        return self.get_position_quantity_from_positions(positions, symbol)
-
-    def cancel_symbol_orders_for_session_close(self, symbol, reason_label):
-        snapshot = self.read_session_close_broker_snapshot(reason_label, symbol=symbol)
-        _, child_orders, symbol_orders = self.collect_session_close_orders_for_symbol(symbol, snapshot)
-        orders_to_cancel = dict(symbol_orders)
-        orders_to_cancel.update(child_orders)
-        return self.cancel_session_close_orders(
-            orders_to_cancel,
-            symbol,
-            reason_label,
-            "SESSION_CLOSE_STALE_ORDER_CANCEL_REQUESTED",
-        )
-
-    def submit_session_close_flatten_order(self, symbol, quantity, action, reason_label, attempt):
-        if EOD_FLATTEN_ORDER_TYPE != "MKT":
-            raise RuntimeError(f"Unsupported EOD flatten order type: {EOD_FLATTEN_ORDER_TYPE}")
-        if self.is_prd_dry_run_enabled():
-            logger.critical(
-                "SESSION_CLOSE_FLATTEN_BLOCKED_DRY_RUN | "
-                f"symbol={symbol} "
-                f"action={action} "
-                f"quantity={quantity} "
-                f"attempt={attempt} "
-                f"reason_label={reason_label} "
-                "operator_action_required=True "
-                "reason=prd_dry_run_no_order_transmission"
-            )
-            raise RuntimeError("prd_dry_run_no_order_transmission")
-        if not self.ensure_symbol_contract_ready(symbol):
-            raise RuntimeError(f"contract_not_ready:{symbol}")
-        contract = self.get_contract(symbol)
-        order = MarketOrder(action, quantity)
-        with self.order_id_lock:
-            if self.next_order_id is None:
-                self.next_order_id = self.broker_get_req_id(
-                    caller="session_close_flatten",
-                    reason_label=reason_label,
-                    symbol=symbol,
-                )
-            order.orderId = self.next_order_id
-            self.next_order_id += 1
-        order.tif = self.get_order_tif(symbol, "session_close_flatten") or "DAY"
-        order.orderRef = self.build_order_ref("SESSION_CLOSE", symbol, f"EOD_FLATTEN_ATTEMPT_{attempt}")
-        trade = self.broker_write_place_order(
-            contract,
-            order,
-            caller="session_close_flatten",
-            reason_label=reason_label,
-            symbol=symbol,
-        )
-        logger.critical(
-            "SESSION_CLOSE_FLATTEN_ORDER_SUBMITTED | "
-            f"symbol={symbol} "
-            f"action={action} "
-            f"quantity={quantity} "
-            f"order_id={getattr(order, 'orderId', None)} "
-            f"perm_id={getattr(order, 'permId', None)} "
-            f"order_ref={getattr(order, 'orderRef', None)} "
-            f"attempt={attempt} "
-            f"order_type={EOD_FLATTEN_ORDER_TYPE} "
-            f"reason={reason_label} "
-            "lifecycle_state=EOD_FLATTENING"
-        )
-        return trade
-
-    def confirm_session_close_flat_for_symbol(self, symbol, reason_label):
-        position_qty = self.get_current_broker_position_quantity_for_symbol(symbol, reason_label)
-        if position_qty == 0.0:
-            self.cancel_symbol_orders_for_session_close(symbol, f"{reason_label}:flat_confirmed_cleanup")
-            logger.warning(
-                "SESSION_CLOSE_POSITION_FLAT_CONFIRMED | "
-                f"symbol={symbol} "
-                f"position_qty={position_qty} "
-                f"reason={reason_label} "
-                "lifecycle_state=EOD_FLAT_CONFIRMED"
-            )
-            return True
-        return False
-
-    def flatten_symbol_for_session_close(self, symbol, state, reason_label):
-        if not EOD_FLATTEN_ENABLED:
-            return False
-        last_position_qty = None
-        logger.critical(
-            "SESSION_CLOSE_FLATTEN_STARTED | "
-            f"symbol={symbol} "
-            f"minutes_to_close={state.get('minutes_to_close')} "
-            f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-            f"timezone={state.get('timezone')} "
-            f"reason={reason_label} "
-            "lifecycle_state=EOD_FLATTENING"
-        )
-
-        for attempt in range(1, EOD_FLATTEN_MAX_ATTEMPTS + 1):
-            self.cancel_symbol_orders_for_session_close(symbol, f"{reason_label}:attempt_{attempt}:pre_flatten_cancel")
-            self.broker_write_sleep(
-                EOD_FLATTEN_RECHECK_SECONDS,
-                caller="session_close_flatten",
-                reason_label=reason_label,
-                symbol=symbol,
-            )
-            position_qty = self.get_current_broker_position_quantity_for_symbol(symbol, reason_label)
-            last_position_qty = position_qty
-            logger.warning(
-                "SESSION_CLOSE_FLATTEN_RECHECK | "
-                f"symbol={symbol} "
-                f"position_qty={position_qty} "
-                f"attempt={attempt} "
-                f"reason=pre_order_position_recheck "
-                f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                f"timezone={state.get('timezone')}"
-            )
-            if position_qty == 0.0:
-                return self.confirm_session_close_flat_for_symbol(symbol, reason_label)
-
-            action = "SELL" if position_qty > 0 else "BUY"
-            quantity = abs(position_qty)
-            self.submit_session_close_flatten_order(
-                symbol,
-                quantity,
-                action,
-                reason_label,
-                attempt,
-            )
-            self.broker_write_sleep(
-                EOD_FLATTEN_RECHECK_SECONDS,
-                caller="session_close_flatten",
-                reason_label=reason_label,
-                symbol=symbol,
-            )
-            post_qty = self.get_current_broker_position_quantity_for_symbol(symbol, reason_label)
-            last_position_qty = post_qty
-            logger.warning(
-                "SESSION_CLOSE_FLATTEN_RECHECK | "
-                f"symbol={symbol} "
-                f"position_qty={post_qty} "
-                f"attempt={attempt} "
-                f"reason=post_order_position_recheck "
-                f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                f"timezone={state.get('timezone')}"
-            )
-            if post_qty == 0.0:
-                return self.confirm_session_close_flat_for_symbol(symbol, reason_label)
-
-        logger.critical(
-            "SESSION_CLOSE_FLATTEN_FAILED | "
-            "severity=critical "
-            f"symbol={symbol} "
-            f"position={last_position_qty} "
-            f"reason=max_flatten_attempts_exhausted:{reason_label} "
-            f"attempts={EOD_FLATTEN_MAX_ATTEMPTS} "
-            f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-            f"timezone={state.get('timezone')} "
-            "operator_action_required=True "
-            "lifecycle_state=EOD_FLATTEN_FAILED"
-        )
-        return False
-
-    def run_session_close_sweep(self, reason_label, target_symbol=None):
-        if not SESSION_CLOSE_ENABLED:
-            return 0
-        symbols = [target_symbol] if target_symbol else self.get_session_close_scope_symbols()
-        symbols = [symbol for symbol in symbols if symbol and not self.is_runtime_symbol_disabled(symbol)]
-        if not symbols:
-            return 0
-
-        logger.warning(
-            "SESSION_CLOSE_SWEEP_STARTED | "
-            f"job_type=SESSION_CLOSE_SWEEP "
-            f"target_symbol={target_symbol} "
-            f"symbols={symbols} "
-            f"reason={reason_label} "
-            f"stage={BOT_STAGE}"
-        )
-
-        self.update_session_health()
-        if not self.session_socket_connected or not self.session_initialized or not self.session_healthy:
-            logger.critical(
-                "SESSION_CLOSE_BROKER_DISCONNECTED | "
-                f"reason={reason_label} "
-                f"session_socket_connected={self.session_socket_connected} "
-                f"session_initialized={self.session_initialized} "
-                f"session_healthy={self.session_healthy} "
-                "operator_action_required=False"
-            )
-            try:
-                logger.warning(
-                    "SESSION_CLOSE_RECONNECT_ATTEMPT | "
-                    f"reason={reason_label}"
-                )
-                self.connect_ib()
-                logger.warning(
-                    "SESSION_CLOSE_RECONNECT_SUCCESS | "
-                    f"reason={reason_label}"
-                )
-                logger.warning(
-                    "SESSION_CLOSE_POST_RECONNECT_SWEEP | "
-                    f"reason={reason_label}"
-                )
-            except Exception as exc:
-                logger.critical(
-                    "SESSION_CLOSE_FLATTEN_FAILED | "
-                    "severity=critical "
-                    f"symbols={symbols} "
-                    f"reason=broker_disconnected_reconnect_failed:{exc} "
-                    "operator_action_required=True "
-                    "lifecycle_state=EOD_FLATTEN_FAILED"
-                )
-                return 0
-
-        actions_taken = 0
-        for symbol in symbols:
-            state = self.get_session_close_state(symbol)
-            if not state.get("enabled") or not (
-                state.get("no_entry_active")
-                or state.get("flatten_window_active")
-                or state.get("hard_close_active")
-            ):
-                continue
-
-            self.session_close_symbol_states[symbol] = "SESSION_CLOSING"
-            snapshot = self.read_session_close_broker_snapshot(reason_label, symbol=symbol)
-            if state.get("no_entry_active"):
-                actions_taken += self.cancel_working_entries_for_session_close(
-                    symbol,
-                    state,
-                    snapshot,
-                    reason_label,
-                )
-
-            current_position_qty = self.get_position_quantity_from_positions(snapshot.get("positions"), symbol)
-            if current_position_qty != 0.0:
-                logger.critical(
-                    "SESSION_CLOSE_POSITION_DETECTED | "
-                    f"symbol={symbol} "
-                    f"position_qty={current_position_qty} "
-                    f"minutes_to_close={state.get('minutes_to_close')} "
-                    f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                    f"timezone={state.get('timezone')} "
-                    f"reason={reason_label} "
-                    "lifecycle_state=SESSION_CLOSING"
-                )
-
-            if state.get("hard_close_active") and current_position_qty != 0.0:
-                logger.critical(
-                    "SESSION_CLOSE_HARD_FLATTEN_REQUIRED | "
-                    f"symbol={symbol} "
-                    f"position={current_position_qty} "
-                    f"minutes_to_close={state.get('minutes_to_close')} "
-                    f"configured_flat_by_time={state.get('configured_flat_by_time')} "
-                    f"timezone={state.get('timezone')} "
-                    "operator_action_required=False "
-                    "reason=session_flat_by_time_reached"
-                )
-
-            if (state.get("flatten_window_active") or state.get("hard_close_active")) and current_position_qty != 0.0:
-                if self.flatten_symbol_for_session_close(symbol, state, reason_label):
-                    actions_taken += 1
-
-        logger.warning(
-            "SESSION_CLOSE_SWEEP_COMPLETE | "
-            f"job_type=SESSION_CLOSE_SWEEP "
-            f"target_symbol={target_symbol} "
-            f"symbols={symbols} "
-            f"actions_taken={actions_taken} "
-            f"reason={reason_label} "
-            f"stage={BOT_STAGE}"
-        )
-        return actions_taken
 
     def log_webhook_processing_timing(self, status, start_ms, normalized=None, queued=None):
         try:
@@ -4425,293 +2313,9 @@ class ScalpingBot:
         callback_fill_time = getattr(fill, "time", None) if fill is not None else None
         return execution_time or callback_fill_time, execution_time, callback_fill_time
 
-    def is_legacy_trade_sequence(self, value):
-        text = str(value or "").strip().upper()
-        return len(text) == 7 and text.startswith("T") and text[1:].isdigit()
-
-    def format_trade_sequence(self, sequence):
-        if self.is_legacy_trade_sequence(sequence):
-            return str(sequence).strip().upper()
-        return f"T{int(sequence):06d}"
-
-    def build_trade_id(self, trade_sequence):
-        return f"{self.run_id}-{self.format_trade_sequence(trade_sequence)}"
-
-    def parse_run_unique_trade_id(self, trade_id):
-        text = str(trade_id or "").strip()
-        run_id, separator, sequence_number = text.rpartition("-T")
-        if not separator or not run_id:
-            return None, None
-        trade_seq = f"T{sequence_number}"
-        if not self.is_legacy_trade_sequence(trade_seq):
-            return None, None
-        return run_id, trade_seq
-
-    def parse_order_ref(self, order_ref):
-        result = {
-            "raw_order_ref": order_ref,
-            "is_valid": False,
-            "is_legacy": False,
-            "run_id": None,
-            "trade_seq": None,
-            "trade_id": None,
-            "symbol": None,
-            "leg_role": None,
-            "parse_error": None,
-        }
-        if order_ref is None:
-            result["parse_error"] = "missing_order_ref"
-            return result
-
-        order_ref_text = str(order_ref).strip()
-        result["raw_order_ref"] = order_ref_text
-        if not order_ref_text:
-            result["parse_error"] = "empty_order_ref"
-            return result
-
-        parts = [part.strip() for part in order_ref_text.split("|")]
-        if len(parts) < 3:
-            result["parse_error"] = "order_ref_missing_parts"
-            return result
-
-        trade_identity = parts[0]
-        symbol = parts[1].upper() if parts[1] else None
-        leg_role = parts[2].upper() if parts[2] else None
-        result["symbol"] = symbol
-        result["leg_role"] = leg_role
-
-        run_id, trade_seq = self.parse_run_unique_trade_id(trade_identity)
-        if run_id and trade_seq:
-            result.update({
-                "is_valid": True,
-                "is_legacy": False,
-                "run_id": run_id,
-                "trade_seq": trade_seq,
-                "trade_id": trade_identity,
-            })
-            return result
-
-        if self.is_legacy_trade_sequence(trade_identity):
-            result.update({
-                "is_valid": True,
-                "is_legacy": True,
-                "trade_seq": trade_identity.upper(),
-                "trade_id": trade_identity.upper(),
-                "parse_error": "legacy_order_ref",
-            })
-            return result
-
-        result.update({
-            "is_legacy": True,
-            "trade_id": trade_identity or None,
-            "parse_error": "unknown_trade_identity_format",
-        })
-        return result
-
-    # P189/P212: compact broker-side correlation for missed/late fills, now run-unique.
+    # P189: compact broker-side correlation for missed/late fills.
     def build_order_ref(self, trade_id, symbol, role):
-        normalized_trade_id = str(trade_id or "").strip()
-        if self.is_legacy_trade_sequence(normalized_trade_id):
-            normalized_trade_id = self.build_trade_id(normalized_trade_id)
-        return f"{normalized_trade_id}|{str(symbol).upper()}|{str(role).upper()}"
-
-    def get_record_order_refs(self, record):
-        if not isinstance(record, dict):
-            return set()
-        return {
-            str(order_ref)
-            for order_ref in (
-                record.get("order_ref_entry"),
-                record.get("order_ref_tp"),
-                record.get("order_ref_sl"),
-                record.get("emergency_flatten_order_ref"),
-            )
-            if order_ref
-        }
-
-    def record_allows_reconstructed_broker_identity(self, record):
-        if not isinstance(record, dict):
-            return False
-        return bool(
-            record.get("reconstructed_from_startup")
-            or record.get("broker_identity_scope") in {
-                "startup_reconstructed_legacy",
-                "startup_reconstructed_foreign",
-            }
-        )
-
-    def get_expected_order_ref_roles_for_execution(self, record, execution):
-        order_id = getattr(execution, "orderId", None)
-        perm_id = getattr(execution, "permId", None)
-        roles = set()
-        if order_id == record.get("parent_order_id") or (
-            perm_id not in (None, 0) and perm_id == record.get("parent_perm_id")
-        ):
-            roles.add("ENTRY")
-        if order_id == record.get("tp_order_id") or (
-            perm_id not in (None, 0) and perm_id == record.get("tp_perm_id")
-        ):
-            roles.add("TP")
-        if order_id == record.get("sl_order_id") or (
-            perm_id not in (None, 0) and perm_id == record.get("sl_perm_id")
-        ):
-            roles.add("SL")
-        if order_id == record.get("emergency_flatten_order_id") or (
-            perm_id not in (None, 0) and perm_id == record.get("emergency_flatten_perm_id")
-        ):
-            roles.add("PROTECTIVE_EMERGENCY_FLATTEN")
-        return roles
-
-    def log_order_ref_match_decision(self, label, record, parsed, reason, execution=None, decision=None):
-        try:
-            logger.warning(
-                f"{label} | "
-                f"trade_id={(record or {}).get('trade_id')} "
-                f"record_run_id={(record or {}).get('run_id')} "
-                f"current_run_id={self.run_id} "
-                f"raw_order_ref={parsed.get('raw_order_ref') if isinstance(parsed, dict) else None} "
-                f"parsed_run_id={parsed.get('run_id') if isinstance(parsed, dict) else None} "
-                f"parsed_trade_id={parsed.get('trade_id') if isinstance(parsed, dict) else None} "
-                f"parsed_symbol={parsed.get('symbol') if isinstance(parsed, dict) else None} "
-                f"parsed_leg_role={parsed.get('leg_role') if isinstance(parsed, dict) else None} "
-                f"order_id={getattr(execution, 'orderId', None)} "
-                f"perm_id={getattr(execution, 'permId', None)} "
-                f"reason={reason} "
-                f"decision={decision}"
-            )
-        except Exception:
-            logger.exception("ORDER_REF_MATCH_DECISION_LOG_FAILED")
-
-    def execution_order_ref_matches_record(self, record, execution):
-        order_ref = self.get_order_ref(execution=execution)
-        parsed = self.parse_order_ref(order_ref)
-        expected_roles = self.get_expected_order_ref_roles_for_execution(record, execution)
-        reconstructed_identity = self.record_allows_reconstructed_broker_identity(record)
-        known_record_order_refs = self.get_record_order_refs(record)
-        raw_order_ref = str(order_ref).strip() if order_ref is not None else None
-
-        if not raw_order_ref:
-            if reconstructed_identity and expected_roles:
-                return True, "missing_order_ref_allowed_for_startup_reconstructed_exact_match", parsed
-            self.log_order_ref_match_decision(
-                "BROKER_FILL_WITH_MISSING_ORDER_REF",
-                record,
-                parsed,
-                "missing_order_ref",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "missing_order_ref", parsed
-
-        if reconstructed_identity and (
-            raw_order_ref in known_record_order_refs
-            or (expected_roles and (parsed.get("is_legacy") or parsed.get("run_id") != self.run_id))
-        ):
-            self.log_order_ref_match_decision(
-                "LEGACY_ORDER_REF_DETECTED",
-                record,
-                parsed,
-                parsed.get("parse_error") or "startup_reconstructed_broker_identity",
-                execution=execution,
-                decision="allow_startup_reconstructed_exact_match",
-            )
-            return True, "startup_reconstructed_broker_identity", parsed
-
-        if not parsed.get("is_valid"):
-            self.log_order_ref_match_decision(
-                "LEGACY_ORDER_REF_DETECTED",
-                record,
-                parsed,
-                parsed.get("parse_error") or "invalid_order_ref",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, parsed.get("parse_error") or "invalid_order_ref", parsed
-
-        if parsed.get("is_legacy"):
-            self.log_order_ref_match_decision(
-                "LEGACY_ORDER_REF_DETECTED",
-                record,
-                parsed,
-                "legacy_order_ref_current_run_rejected",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "legacy_order_ref_current_run_rejected", parsed
-
-        if parsed.get("run_id") != self.run_id:
-            self.log_order_ref_match_decision(
-                "ORDER_REF_RUN_ID_MISMATCH",
-                record,
-                parsed,
-                "foreign_run_id",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "foreign_run_id", parsed
-
-        if parsed.get("trade_id") != record.get("trade_id"):
-            self.log_order_ref_match_decision(
-                "ORDER_REF_TRADE_ID_MISMATCH",
-                record,
-                parsed,
-                "trade_id_mismatch",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "trade_id_mismatch", parsed
-
-        record_symbol = str(record.get("symbol") or "").upper()
-        if parsed.get("symbol") != record_symbol:
-            self.log_order_ref_match_decision(
-                "ORDER_REF_TRADE_ID_MISMATCH",
-                record,
-                parsed,
-                "symbol_mismatch",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "symbol_mismatch", parsed
-
-        if expected_roles and parsed.get("leg_role") not in expected_roles:
-            self.log_order_ref_match_decision(
-                "ORDER_REF_TRADE_ID_MISMATCH",
-                record,
-                parsed,
-                f"leg_role_mismatch expected_roles={sorted(expected_roles)}",
-                execution=execution,
-                decision="reject_current_lifecycle_match",
-            )
-            return False, "leg_role_mismatch", parsed
-
-        logger.info(
-            "ORDER_REF_PARSED | "
-            f"trade_id={record.get('trade_id')} "
-            f"run_id={record.get('run_id')} "
-            f"current_run_id={self.run_id} "
-            f"raw_order_ref={parsed.get('raw_order_ref')} "
-            f"parsed_run_id={parsed.get('run_id')} "
-            f"parsed_trade_id={parsed.get('trade_id')} "
-            f"symbol={parsed.get('symbol')} "
-            f"leg_role={parsed.get('leg_role')} "
-            "decision=accept_current_run_match"
-        )
-        return True, "current_run_order_ref_match", parsed
-
-    def broker_order_ref_matches_record(self, record, order_ref):
-        if not order_ref or not isinstance(record, dict):
-            return False
-        raw_order_ref = str(order_ref).strip()
-        if raw_order_ref in self.get_record_order_refs(record):
-            return True
-        parsed = self.parse_order_ref(raw_order_ref)
-        return bool(
-            parsed.get("is_valid")
-            and not parsed.get("is_legacy")
-            and parsed.get("run_id") == self.run_id
-            and parsed.get("trade_id") == record.get("trade_id")
-            and parsed.get("symbol") == str(record.get("symbol") or "").upper()
-        )
+        return f"{trade_id}|{symbol}|{role}"
 
     def get_order_ref(self, order=None, execution=None):
         order_ref = getattr(order, "orderRef", None) if order is not None else None
@@ -4835,9 +2439,7 @@ class ScalpingBot:
             f"price={price} "
             f"blocker={blocker}"
         )
-        logger.info(
-            f"DIAGNOSTIC PAYLOAD | {json.dumps(redact_sensitive_payload(data), sort_keys=True)}"
-        )
+        logger.info(f"DIAGNOSTIC PAYLOAD | {json.dumps(data, sort_keys=True)}")
 
     def calculate_expected_gross_pnl(self, record):
         multiplier = self.get_point_value(record["symbol"])
@@ -4914,10 +2516,6 @@ class ScalpingBot:
             return "TAKE_PROFIT"
         if order_id == record.get("sl_order_id"):
             return "STOP_LOSS"
-        if order_id == record.get("emergency_flatten_order_id"):
-            if record.get("time_exit_order_id") == order_id or record.get("emergency_flatten_reason") == TIME_EXIT_REASON:
-                return "TIME_EXIT"
-            return "EMERGENCY_FLATTEN_EXIT"
         return "UNKNOWN"
 
     # P175-A/P175-B/P175-C/P175-D/P175-E/P175-F/P176: observability-only helpers; these do not change lifecycle behavior.
@@ -4932,16 +2530,6 @@ class ScalpingBot:
                 return "TP"
             if order_id == record.get("sl_order_id"):
                 return "SL"
-            if (
-                order_id == record.get("emergency_flatten_order_id")
-                or (
-                    perm_id not in (None, 0)
-                    and perm_id == record.get("emergency_flatten_perm_id")
-                )
-            ):
-                if record.get("time_exit_order_id") == order_id or record.get("emergency_flatten_reason") == TIME_EXIT_REASON:
-                    return "TIME_EXIT"
-                return "EMERGENCY_FLATTEN_EXIT"
 
         if perm_id not in (None, 0):
             if perm_id == record.get("parent_perm_id"):
@@ -4950,10 +2538,6 @@ class ScalpingBot:
                 return "TP"
             if perm_id == record.get("sl_perm_id"):
                 return "SL"
-            if perm_id == record.get("emergency_flatten_perm_id"):
-                if record.get("emergency_flatten_reason") == TIME_EXIT_REASON:
-                    return "TIME_EXIT"
-                return "EMERGENCY_FLATTEN_EXIT"
 
         return "UNKNOWN"
 
@@ -5121,8 +2705,6 @@ class ScalpingBot:
             return record.get("tp_perm_id")
         if order_id == record.get("sl_order_id"):
             return record.get("sl_perm_id")
-        if order_id == record.get("emergency_flatten_order_id"):
-            return record.get("emergency_flatten_perm_id")
         return None
 
     def log_fill_event(
@@ -5352,12 +2934,9 @@ class ScalpingBot:
         if symbol not in self.symbol_stats:
             self.symbol_stats[symbol] = {
                 "total_trades": 0,
-                "dry_run_planned_count": 0,
-                "dry_run_not_transmitted_count": 0,
                 "filled_trades": 0,
                 "tp_count": 0,
                 "sl_count": 0,
-                "emergency_flatten_count": 0,
                 "gross_pnl": 0.0,
                 "commission": 0.0,
                 "net_pnl": 0.0,
@@ -5480,7 +3059,6 @@ class ScalpingBot:
                 stats["filled_trades"] > 0 or
                 stats["tp_count"] > 0 or
                 stats["sl_count"] > 0 or
-                stats.get("emergency_flatten_count", 0) > 0 or
                 stats["gross_pnl"] != 0.0 or
                 stats["commission"] != 0.0 or
                 stats["net_pnl"] != 0.0
@@ -5490,7 +3068,6 @@ class ScalpingBot:
                     "filled": stats["filled_trades"],
                     "tp": stats["tp_count"],
                     "sl": stats["sl_count"],
-                    "emergency_flatten": stats.get("emergency_flatten_count", 0),
                     "gross": round(stats["gross_pnl"], 2),
                     "commission": round(stats["commission"], 2),
                     "net": round(stats["net_pnl"], 2),
@@ -5512,19 +3089,9 @@ class ScalpingBot:
         sl_id
     ):
         self.trade_seq += 1
-        trade_seq = self.format_trade_sequence(self.trade_seq)
-        trade_id = self.build_trade_id(trade_seq)
-        logger.info(
-            "TRADE_ID_ALLOCATED | "
-            f"run_id={self.run_id} "
-            f"trade_seq={trade_seq} "
-            f"trade_id={trade_id} "
-            f"symbol={job.get('symbol')}"
-        )
+        trade_id = f"T{self.trade_seq:06d}"
 
         record = {
-            "run_id": self.run_id,
-            "trade_seq": trade_seq,
             "trade_id": trade_id,
             "bot_stage": job.get("bot_stage", BOT_STAGE),
             "state": "SUBMITTING",
@@ -5540,7 +3107,6 @@ class ScalpingBot:
             "truth_classification": job.get("truth_classification", ""),
             "det_classification": job.get("det_classification", ""),
             "primary_reason": job.get("primary_reason", ""),
-            "signal_id": job.get("signal_id"),
             "execution_lane": job.get("execution_lane", "standard"),
             "promoted_from_shadow": bool(job.get("promoted_from_shadow", False)),
             "shadow_override_reason": job.get("shadow_override_reason", ""),
@@ -5554,25 +3120,6 @@ class ScalpingBot:
             "preflight_completed_time": job.get("preflight_completed_time"),
             "bracket_submit_start_time": None,
             "bracket_submit_end_time": None,
-            "bracket_submit_transaction_status": "not_started",
-            "bracket_submit_exception": None,
-            "bracket_submit_uncertain": False,
-            "bracket_submit_failure_handled_at": None,
-            "parent_submit_attempted": False,
-            "tp_submit_attempted": False,
-            "sl_submit_attempted": False,
-            "parent_submit_completed": False,
-            "tp_submit_completed": False,
-            "sl_submit_completed": False,
-            "parent_submit_attempted_at": None,
-            "tp_submit_attempted_at": None,
-            "sl_submit_attempted_at": None,
-            "parent_submit_completed_at": None,
-            "tp_submit_completed_at": None,
-            "sl_submit_completed_at": None,
-            "parent_submit_perm_id": None,
-            "tp_submit_perm_id": None,
-            "sl_submit_perm_id": None,
             "entry_signal_price": job["entry"],
             "entry_spread_adjusted": spread_adjusted_entry,
             "entry_price": entry,
@@ -5581,11 +3128,6 @@ class ScalpingBot:
             "parent_order_id": parent_id,
             "tp_order_id": tp_id,
             "sl_order_id": sl_id,
-            "order_ref_entry": None,
-            "order_ref_tp": None,
-            "order_ref_sl": None,
-            "emergency_flatten_order_ref": None,
-            "broker_identity_scope": "current_run",
             "parent_perm_id": None,
             "tp_perm_id": None,
             "sl_perm_id": None,
@@ -5627,9 +3169,6 @@ class ScalpingBot:
             "containment_action": job.get("containment_action"),
             "containment_reason": job.get("containment_reason"),
             "approved_size_after_containment": job.get("approved_size_after_containment"),
-            "planned_parent_quantity": job.get("planned_parent_quantity"),
-            "planned_tp_quantity": job.get("planned_tp_quantity"),
-            "planned_sl_quantity": job.get("planned_sl_quantity"),
             "intended_parent_quantity": float(
                 job.get("approved_size_after_containment") or 0.0
             ),
@@ -5681,43 +3220,12 @@ class ScalpingBot:
             "partial_entry_parent_finality_candidate_quantity": None,
             "partial_entry_parent_finality_candidate_status": None,
             "partial_entry_parent_finality_candidate_stable_pass_seen": False,
-            "entry_exposure_started_at": None,
-            "time_exit_deadline_at": None,
-            "time_exit_status": None,
-            "time_exit_reason": None,
-            "time_exit_order_id": None,
-            "time_exit_attempt_count": 0,
-            "time_exit_last_attempt_at": None,
-            "time_exit_completed_at": None,
             "parent_last_status": None,
             "execution_validation_status": "submitted_to_ib",
-            "dry_run": False,
-            "transmitted": True,
-            "transmission_mode": "live",
-            "transmission_block_reason": None,
-            "broker_order_ids_transmitted": [],
             "broker_acknowledged_at": None,
             "broker_live_at": None,
             "exit_cleanup_last_snapshot": None,
             "timeout_retained_replacement_parentless_allowed": False,
-            "protective_emergency_active": False,
-            "protective_emergency_reason": None,
-            "protective_emergency_status": None,
-            "protective_emergency_started_at": None,
-            "emergency_flatten_submit_reserved_at": None,
-            "emergency_flatten_submit_reservation_id": None,
-            "emergency_flatten_submitted_at": None,
-            "emergency_flatten_last_status": None,
-            "emergency_flatten_terminal_status": None,
-            "emergency_flatten_order_id": None,
-            "emergency_flatten_perm_id": None,
-            "emergency_flatten_action": None,
-            "emergency_flatten_quantity": None,
-            "emergency_flatten_attempt": None,
-            "emergency_flatten_reason": None,
-            "emergency_flatten_exit_quantity": 0.0,
-            "emergency_flatten_exit_notional": 0.0,
-            "emergency_flatten_exit_fill_price": None,
             "submitted_counted": False,
             "broker_acknowledged_counted": False,
             "broker_live_counted": False,
@@ -5731,293 +3239,6 @@ class ScalpingBot:
             if record is None:
                 return
             record["events"].append(f"{self.utc_now_iso()} | {message}")
-
-    def update_bracket_submit_transaction(self, trade_id, **fields):
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is None:
-                return None
-            record.update(fields)
-            return dict(record)
-
-    def mark_bracket_submit_leg_attempted(self, trade_id, leg_name):
-        if leg_name not in {"parent", "tp", "sl"}:
-            return None
-        attempted_at = datetime.now(timezone.utc)
-        snapshot = self.update_bracket_submit_transaction(
-            trade_id,
-            bracket_submit_transaction_status="in_progress",
-            **{
-                f"{leg_name}_submit_attempted": True,
-                f"{leg_name}_submit_attempted_at": attempted_at,
-            },
-        )
-        self.append_trade_event(
-            trade_id,
-            f"BRACKET SUBMIT LEG ATTEMPTED leg={leg_name}",
-        )
-        return snapshot
-
-    def mark_bracket_submit_leg_completed(self, trade_id, leg_name, trade=None):
-        if leg_name not in {"parent", "tp", "sl"}:
-            return None
-
-        order = getattr(trade, "order", None)
-        status = getattr(trade, "orderStatus", None)
-        perm_id = getattr(status, "permId", None) or getattr(order, "permId", None)
-        completed_at = datetime.now(timezone.utc)
-        snapshot = self.update_bracket_submit_transaction(
-            trade_id,
-            **{
-                f"{leg_name}_submit_completed": True,
-                f"{leg_name}_submit_completed_at": completed_at,
-                f"{leg_name}_submit_perm_id": perm_id,
-            },
-        )
-        if order is not None:
-            self.update_trade_perm_id(getattr(order, "orderId", None), perm_id)
-        self.append_trade_event(
-            trade_id,
-            f"BRACKET SUBMIT LEG COMPLETED leg={leg_name} perm_id={perm_id}",
-        )
-        return snapshot
-
-    def get_bracket_submit_context_from_record(self, record):
-        return {
-            "parent_order_id": record.get("parent_order_id"),
-            "tp_order_id": record.get("tp_order_id"),
-            "sl_order_id": record.get("sl_order_id"),
-            "parent_submit_attempted": record.get("parent_submit_attempted"),
-            "tp_submit_attempted": record.get("tp_submit_attempted"),
-            "sl_submit_attempted": record.get("sl_submit_attempted"),
-            "parent_submit_completed": record.get("parent_submit_completed"),
-            "tp_submit_completed": record.get("tp_submit_completed"),
-            "sl_submit_completed": record.get("sl_submit_completed"),
-        }
-
-    def handle_bracket_submission_failure(self, trade_id, record_snapshot, submit_context, exc):
-        symbol = (record_snapshot or {}).get("symbol")
-        failure_text = str(exc)
-        now_dt = datetime.now(timezone.utc)
-
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is not None:
-                previous_state = record.get("state")
-                record["state"] = "BRACKET_SUBMIT_FAILED_UNCERTAIN"
-                record["bracket_submit_transaction_status"] = "failed_uncertain"
-                record["bracket_submit_exception"] = failure_text
-                record["bracket_submit_uncertain"] = True
-                record["bracket_submit_failure_handled_at"] = now_dt
-                record["broker_ack_pending_since"] = record.get("broker_ack_pending_since") or now_dt
-                record["broker_ack_pending_last_check"] = now_dt
-                record["broker_ack_pending_reason"] = "bracket_submit_failed_uncertain"
-                record["broker_ack_pending_category"] = "SUBMISSION_UNCERTAIN"
-                record["execution_validation_status"] = "validation_incomplete"
-                if "BRACKET_SUBMIT_PARTIAL_FAILURE" not in record["anomalies"]:
-                    record["anomalies"].append("BRACKET_SUBMIT_PARTIAL_FAILURE")
-                self.append_trade_event(
-                    trade_id,
-                    f"BRACKET SUBMIT FAILED UNCERTAIN previous_state={previous_state} exception={failure_text}",
-                )
-                record_snapshot = dict(record)
-
-        self.external_entries_blocked_reason = "bracket_submit_failed_uncertain"
-        context = submit_context or self.get_bracket_submit_context_from_record(record_snapshot or {})
-        logger.critical(
-            "BRACKET_SUBMISSION_FAILED_UNCERTAIN | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"parent_order_id={context.get('parent_order_id')} "
-            f"tp_order_id={context.get('tp_order_id')} "
-            f"sl_order_id={context.get('sl_order_id')} "
-            f"parent_submit_attempted={context.get('parent_submit_attempted')} "
-            f"tp_submit_attempted={context.get('tp_submit_attempted')} "
-            f"sl_submit_attempted={context.get('sl_submit_attempted')} "
-            f"parent_submit_completed={context.get('parent_submit_completed')} "
-            f"tp_submit_completed={context.get('tp_submit_completed')} "
-            f"sl_submit_completed={context.get('sl_submit_completed')} "
-            f"exception={failure_text} "
-            "decision=inspect_broker_reality_fail_closed"
-        )
-
-        broker_reality = None
-        try:
-            broker_reality = self.get_trade_broker_reality(
-                record_snapshot,
-                trade_analysis_lock_context="not_locked",
-            )
-        except Exception as reality_exc:
-            logger.exception(
-                "BRACKET_SUBMISSION_FAILURE_REALITY_CHECK_EXCEPTION | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"failure={reality_exc}"
-            )
-
-        confirmation = self.assess_broker_bracket_confirmation(
-            record_snapshot.get("parent_order_id"),
-            record_snapshot.get("tp_order_id"),
-            record_snapshot.get("sl_order_id"),
-            trade_analysis_lock_context="not_locked",
-        )
-
-        all_three_visible_or_confirmed = bool(
-            confirmation
-            and (
-                confirmation.get("confirmed")
-                or confirmation.get("pending_broker_ack")
-            )
-            and confirmation.get("parent_visible")
-            and confirmation.get("tp_visible")
-            and confirmation.get("sl_visible")
-            and confirmation.get("parent_link_ok")
-            and confirmation.get("tp_link_ok")
-            and confirmation.get("sl_link_ok")
-        )
-        quantity_coverage = self.assess_bracket_quantity_coverage(
-            record_snapshot,
-            broker_confirmation=confirmation,
-            broker_reality=broker_reality,
-        )
-        self.log_bracket_quantity_coverage(record_snapshot, quantity_coverage)
-        quantity_safe_for_ack = self.is_bracket_quantity_safe_for_ack(quantity_coverage)
-        all_three_visible_or_confirmed = bool(
-            all_three_visible_or_confirmed
-            and (
-                quantity_safe_for_ack
-                or quantity_coverage.get("quantity_state") == "NO_OPEN_EXPOSURE_QUANTITY_UNKNOWN"
-            )
-        )
-
-        if all_three_visible_or_confirmed:
-            self.external_entries_blocked_reason = None
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    previous_state = record.get("state")
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["bracket_submit_transaction_status"] = "broker_confirmed_after_exception"
-                    record["bracket_submit_uncertain"] = False
-                    record["broker_ack_pending_reason"] = (
-                        "broker_confirmed_complete_after_submit_exception"
-                        if quantity_safe_for_ack
-                        else quantity_coverage.get("quantity_state")
-                    )
-                    record["broker_ack_pending_category"] = confirmation.get("broker_state_category")
-                    record["broker_ack_pending_visible_order_ids"] = confirmation.get("visible_order_ids", [])
-                    self.append_trade_event(
-                        trade_id,
-                        f"BRACKET SUBMIT FAILURE RECOVERED previous_state={previous_state} "
-                        f"broker_state_category={confirmation.get('broker_state_category')} "
-                        f"visible_order_ids={confirmation.get('visible_order_ids')}",
-                    )
-            if quantity_safe_for_ack and confirmation.get("all_broker_live"):
-                self.set_execution_validation_status(
-                    trade_id,
-                    "broker_live",
-                    "broker_confirmed_complete_after_submit_exception",
-                )
-            elif quantity_safe_for_ack and confirmation.get("confirmed"):
-                self.set_execution_validation_status(
-                    trade_id,
-                    "broker_acknowledged",
-                    "broker_confirmed_complete_after_submit_exception",
-                )
-            logger.warning(
-                "BRACKET_SUBMISSION_FAILURE_RECOVERED_BY_BROKER_CONFIRMATION | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"broker_state_category={confirmation.get('broker_state_category')} "
-                f"visible_order_ids={confirmation.get('visible_order_ids')} "
-                "decision=broker_ack_pending"
-            )
-            return {
-                "ok": True,
-                "reason": "broker_confirmed_complete_after_submit_exception",
-                "broker_reality": broker_reality,
-                "broker_confirmation": confirmation,
-            }
-
-        open_position_estimate = quantity_coverage.get("open_position_estimate")
-        if (
-            open_position_estimate is not None
-            and open_position_estimate > 0
-            and not quantity_safe_for_ack
-        ):
-            protection_context = self.classify_position_protection_context(
-                record_snapshot,
-                broker_reality,
-                confirmation,
-            )
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["broker_ack_pending_reason"] = quantity_coverage.get("quantity_state")
-                    self.append_trade_event(
-                        trade_id,
-                        f"BRACKET SUBMIT FAILURE QUANTITY FAIL CLOSED "
-                        f"quantity_state={quantity_coverage.get('quantity_state')} "
-                        f"open_position_estimate={open_position_estimate} "
-                        f"protective_sl_coverage={quantity_coverage.get('protective_sl_coverage')}"
-                    )
-            self.emergency_flatten_unprotected_position(
-                trade_id,
-                symbol,
-                quantity_coverage.get("quantity_state"),
-                protection_context=protection_context,
-                broker_reality=broker_reality,
-            )
-            return {
-                "ok": False,
-                "reason": quantity_coverage.get("quantity_state"),
-                "broker_reality": broker_reality,
-                "broker_confirmation": confirmation,
-            }
-
-        cleanup_result = self.cancel_unacknowledged_bracket_legs(
-            trade_id,
-            "bracket_submit_failed_uncertain",
-            broker_reality=broker_reality,
-        )
-        logger.critical(
-            "BRACKET_SUBMISSION_FAILURE_CLEANUP_RESULT | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"cleanup_ok={cleanup_result.get('ok')} "
-            f"cleanup_reason={cleanup_result.get('reason')} "
-            f"cancel_requested_count={cleanup_result.get('cancel_requested_count')} "
-            f"cancel_failed_count={cleanup_result.get('cancel_failed_count')} "
-            f"visible_order_ids={cleanup_result.get('visible_order_ids')} "
-            "decision=preserve_failed_uncertain_lock"
-        )
-        return {
-            "ok": False,
-            "reason": "bracket_submit_failed_uncertain",
-            "broker_reality": broker_reality,
-            "broker_confirmation": confirmation,
-            "cleanup_result": cleanup_result,
-        }
-
-    def handle_post_submit_uncertainty(self, trade_id, reason_label, exc):
-        with self.trade_analysis_lock:
-            record_snapshot = dict(self.trade_analysis.get(trade_id) or {})
-        submit_context = self.get_bracket_submit_context_from_record(record_snapshot)
-        logger.critical(
-            "BRACKET_POST_SUBMIT_UNCERTAIN | "
-            f"trade_id={trade_id} "
-            f"symbol={record_snapshot.get('symbol')} "
-            f"reason_label={reason_label} "
-            f"exception={exc} "
-            "decision=route_to_bracket_submit_failure_handler"
-        )
-        return self.handle_bracket_submission_failure(
-            trade_id,
-            record_snapshot,
-            submit_context,
-            RuntimeError(f"{reason_label}:{exc}"),
-        )
 
     def register_trade_analysis(
         self,
@@ -6093,131 +3314,6 @@ class ScalpingBot:
 
             return trade_id
 
-    def register_dry_run_trade_analysis(
-        self,
-        job,
-        signal_time,
-        enqueue_time,
-        execution_start_time,
-        spread_adjusted_entry,
-        entry,
-        stop,
-        target,
-    ):
-        with self.trade_analysis_lock:
-            record = self.build_trade_record(
-                job,
-                signal_time,
-                enqueue_time,
-                execution_start_time,
-                spread_adjusted_entry,
-                entry,
-                stop,
-                target,
-                None,
-                None,
-                None,
-            )
-            trade_id = record["trade_id"]
-            record.update({
-                "state": "DRY_RUN_NOT_TRANSMITTED",
-                "dry_run": True,
-                "transmitted": False,
-                "transmission_mode": "dry_run",
-                "transmission_block_reason": "prd_dry_run_no_order_transmission",
-                "broker_order_ids_transmitted": [],
-                "execution_validation_status": "dry_run_not_transmitted",
-                "bracket_submit_start_time": execution_start_time,
-                "bracket_submit_end_time": datetime.now(timezone.utc),
-                "bracket_submit_transaction_status": "dry_run_not_transmitted",
-                "parent_submit_attempted": False,
-                "tp_submit_attempted": False,
-                "sl_submit_attempted": False,
-                "parent_submit_completed": False,
-                "tp_submit_completed": False,
-                "sl_submit_completed": False,
-                "closed": True,
-            })
-
-            self.trade_analysis[trade_id] = record
-            self.aggregate_stats["dry_run_planned_count"] = (
-                self.aggregate_stats.get("dry_run_planned_count", 0) + 1
-            )
-            self.aggregate_stats["dry_run_not_transmitted_count"] = (
-                self.aggregate_stats.get("dry_run_not_transmitted_count", 0) + 1
-            )
-            symbol_bucket = self.get_symbol_stats_bucket(record["symbol"])
-            symbol_bucket["dry_run_planned_count"] = (
-                symbol_bucket.get("dry_run_planned_count", 0) + 1
-            )
-            symbol_bucket["dry_run_not_transmitted_count"] = (
-                symbol_bucket.get("dry_run_not_transmitted_count", 0) + 1
-            )
-
-            self.append_trade_event(
-                trade_id,
-                "DRY_RUN_NOT_TRANSMITTED "
-                f"symbol={record['symbol']} side={record['side']} "
-                f"entry={record['entry_price']} stop={record['stop_price']} "
-                f"target={record['target_price']} "
-                f"size={record.get('approved_size_after_containment')} "
-                "reason=prd_dry_run_no_order_transmission",
-            )
-            if self.active_execution_trade_id == trade_id:
-                self.active_execution_trade_id = None
-            return trade_id
-
-    def finalize_prd_dry_run_order_plan(
-        self,
-        job,
-        symbol,
-        side,
-        entry,
-        stop,
-        target,
-        spread_adjusted_entry,
-        approved_size_after_containment,
-    ):
-        trade_id = self.register_dry_run_trade_analysis(
-            job=job,
-            signal_time=job.get("signal_time"),
-            enqueue_time=job.get("enqueue_time"),
-            execution_start_time=datetime.now(timezone.utc),
-            spread_adjusted_entry=spread_adjusted_entry,
-            entry=entry,
-            stop=stop,
-            target=target,
-        )
-        logger.warning(
-            "PRD_DRY_RUN_ACTIVE | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"side={side} "
-            f"entry={entry} "
-            f"stop={stop} "
-            f"target={target} "
-            f"size={approved_size_after_containment} "
-            "startup_reconciliation_completed="
-            f"{self.startup_reconciliation_completed} "
-            "reason=prd_dry_run_no_order_transmission"
-        )
-        logger.critical(
-            "ORDER_TRANSMISSION_BLOCKED_DRY_RUN | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"side={side} "
-            f"entry={entry} "
-            f"stop={stop} "
-            f"target={target} "
-            f"size={approved_size_after_containment} "
-            "broker_order_ids_transmitted=[] "
-            "parent_order_transmitted=false "
-            "tp_order_transmitted=false "
-            "sl_order_transmitted=false "
-            "reason=prd_dry_run_no_order_transmission"
-        )
-        return trade_id
-
     def get_trade_by_order_id(self, order_id):
         if order_id is None:
             return None, None
@@ -6227,15 +3323,6 @@ class ScalpingBot:
             if trade_id is None:
                 return None, None
             return trade_id, self.trade_analysis.get(trade_id)
-
-    def get_trade_by_emergency_flatten_perm_id(self, perm_id):
-        if perm_id in (None, 0):
-            return None, None
-        with self.trade_analysis_lock:
-            for trade_id, record in self.trade_analysis.items():
-                if perm_id == record.get("emergency_flatten_perm_id"):
-                    return trade_id, record
-        return None, None
 
     def update_trade_perm_id(self, order_id, perm_id):
         if not perm_id:
@@ -6255,8 +3342,6 @@ class ScalpingBot:
                 record["tp_perm_id"] = perm_id
             elif order_id == record["sl_order_id"]:
                 record["sl_perm_id"] = perm_id
-            elif order_id == record.get("emergency_flatten_order_id"):
-                record["emergency_flatten_perm_id"] = perm_id
 
     def mark_trade_state(self, order_id, status):
         with self.trade_analysis_lock:
@@ -6281,43 +3366,6 @@ class ScalpingBot:
                     f"order_id={order_id} "
                     f"status={status} "
                     "reason=generic_status_update_does_not_exit_pending_ack"
-                )
-                return
-            if current_state == "BRACKET_SUBMIT_FAILED_UNCERTAIN":
-                self.append_trade_event(
-                    trade_id,
-                    f"BRACKET SUBMIT FAILED UNCERTAIN STATE PRESERVED orderId={order_id} status={status}"
-                )
-                logger.warning(
-                    "BRACKET_SUBMIT_FAILED_UNCERTAIN_PRESERVED | "
-                    f"trade_id={trade_id} "
-                    f"order_id={order_id} "
-                    f"status={status} "
-                    "reason=generic_status_update_does_not_exit_submission_quarantine"
-                )
-                return
-            if (
-                current_state == "SUBMITTING"
-                and record.get("bracket_submit_transaction_status") == "in_progress"
-                and not (
-                    record.get("parent_submit_completed")
-                    and record.get("tp_submit_completed")
-                    and record.get("sl_submit_completed")
-                )
-            ):
-                self.append_trade_event(
-                    trade_id,
-                    f"BRACKET SUBMIT TRANSACTION IN PROGRESS STATE PRESERVED orderId={order_id} status={status}"
-                )
-                logger.info(
-                    "BRACKET_SUBMIT_TRANSACTION_IN_PROGRESS_PRESERVED | "
-                    f"trade_id={trade_id} "
-                    f"order_id={order_id} "
-                    f"status={status} "
-                    f"parent_submit_completed={record.get('parent_submit_completed')} "
-                    f"tp_submit_completed={record.get('tp_submit_completed')} "
-                    f"sl_submit_completed={record.get('sl_submit_completed')} "
-                    "reason=do_not_promote_before_complete_bracket_submit"
                 )
                 return
             if self.is_partial_timeout_parent_finality_owner_active(record) and order_id == record["parent_order_id"]:
@@ -6469,7 +3517,6 @@ class ScalpingBot:
             record.get("parent_order_id"),
             record.get("tp_order_id"),
             record.get("sl_order_id"),
-            record.get("emergency_flatten_order_id"),
         }
         order_ids.discard(None)
 
@@ -6477,7 +3524,6 @@ class ScalpingBot:
             record.get("parent_perm_id"),
             record.get("tp_perm_id"),
             record.get("sl_perm_id"),
-            record.get("emergency_flatten_perm_id"),
         }
         perm_ids.discard(None)
         perm_ids.discard(0)
@@ -6488,7 +3534,6 @@ class ScalpingBot:
         symbol_open_trade_perm_ids = []
         open_order_ids = []
         position_sizes = []
-        broker_position_quantity = None
 
         try:
             open_trades, positions, open_orders = self.broker_read_open_trades_positions_open_orders(
@@ -6515,7 +3560,6 @@ class ScalpingBot:
                 "matching_open_trade_perm_ids": [],
                 "matching_open_order_ids": [],
                 "matching_position_sizes": [],
-                "broker_position_quantity": None,
                 "check_failed": True,
                 "failure": str(exc),
             }
@@ -6548,11 +3592,6 @@ class ScalpingBot:
                 if order_id is not None:
                     open_order_ids.append(order_id)
 
-        broker_position_quantity = self.get_position_quantity_from_positions(
-            positions,
-            record["symbol"],
-        )
-
         for position in positions:
             contract = getattr(position, "contract", None)
             position_size = getattr(position, "position", 0)
@@ -6584,7 +3623,6 @@ class ScalpingBot:
             "matching_open_trade_perm_ids": sorted(set(open_trade_perm_ids + symbol_open_trade_perm_ids)),
             "matching_open_order_ids": sorted(set(open_order_ids)),
             "matching_position_sizes": position_sizes,
-            "broker_position_quantity": broker_position_quantity,
             "check_failed": False,
         }
 
@@ -6603,8 +3641,6 @@ class ScalpingBot:
             order_leg = "tp"
         elif order_id == record.get("sl_order_id"):
             order_leg = "sl"
-        elif order_id == record.get("emergency_flatten_order_id"):
-            order_leg = "emergency_flatten_exit"
 
         perm_leg = None
         if perm_id not in (None, 0):
@@ -6614,8 +3650,6 @@ class ScalpingBot:
                 perm_leg = "tp"
             elif perm_id == record.get("sl_perm_id"):
                 perm_leg = "sl"
-            elif perm_id == record.get("emergency_flatten_perm_id"):
-                perm_leg = "emergency_flatten_exit"
 
         if order_leg and perm_leg and order_leg != perm_leg:
             return None, "order_id_perm_id_leg_conflict"
@@ -6683,7 +3717,7 @@ class ScalpingBot:
 
         if leg == "entry":
             expected_action = "BUY" if record.get("side") == "long" else "SELL"
-        elif leg in {"tp", "sl", "emergency_flatten_exit"}:
+        elif leg in {"tp", "sl"}:
             expected_action = "SELL" if record.get("side") == "long" else "BUY"
         else:
             return False
@@ -6787,73 +3821,10 @@ class ScalpingBot:
         except Exception:
             return False
 
-    def has_protective_emergency_reconstruction_context(self, record):
-        return bool(
-            record
-            and (
-                record.get("protective_emergency_active")
-                or record.get("exit_reason") == PROTECTIVE_EMERGENCY_EXIT_REASON
-                or record.get("protective_emergency_status") in {
-                    "flatten_fill_observed",
-                    "pending_position_confirmation",
-                    "flat_confirmed_exit_fill_details_incomplete",
-                    "flat_confirmed_stale_orders_cleared",
-                    "flat_confirmed_stale_child_cleanup_failed",
-                    "flat_confirmed_stale_bot_order_cleanup_failed",
-                    "reconstructed_flatten_fill_observed",
-                    "submit_failed_submission_uncertain",
-                    "broker_submission_uncertain",
-                }
-            )
-        )
-
-    def contract_exactly_matches_record_symbol(self, contract, record):
-        if contract is None or record is None:
-            return False
-        record_symbol = str(record.get("symbol") or "").upper()
-        if not record_symbol:
-            return False
-        for value in (
-            getattr(contract, "symbol", None),
-            getattr(contract, "localSymbol", None),
-            getattr(contract, "tradingClass", None),
-        ):
-            if value is not None and str(value).upper() == record_symbol:
-                return True
-        record_con_id = record.get("contract_con_id")
-        contract_con_id = getattr(contract, "conId", None)
-        return bool(
-            record_con_id not in (None, "", 0)
-            and contract_con_id not in (None, "", 0)
-            and str(record_con_id) == str(contract_con_id)
-        )
-
     def resolve_reconstructed_fill_leg_with_fallback(self, record, fill, execution):
         exact_leg, exact_source = self.resolve_reconstructed_fill_leg(record, execution)
-        identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(record, execution)
-        if not identity_ok:
-            self.log_broker_fill_without_lifecycle_event(
-                record.get("trade_id"),
-                identity_reason,
-                "reconciliation_fill_rejected_by_order_ref_identity_gate",
-                fill=fill,
-                execution=execution,
-                contract=getattr(fill, "contract", None),
-            )
-            if identity_reason == "foreign_run_id":
-                self.log_order_ref_match_decision(
-                    "BROKER_FILL_ORPHANED_BY_RUN_ID_MISMATCH",
-                    record,
-                    parsed_order_ref,
-                    identity_reason,
-                    execution=execution,
-                    decision="preserve_current_lifecycle",
-                )
-            return None, identity_reason, []
         if exact_leg is not None:
             return exact_leg, exact_source, []
-        if self.record_allows_reconstructed_broker_identity(record):
-            return None, "startup_reconstructed_requires_exact_order_or_perm_match", []
 
         contract = getattr(fill, "contract", None)
         fill_time, _, _ = self.get_effective_execution_time(fill, execution)
@@ -6892,48 +3863,6 @@ class ScalpingBot:
                 diagnostics.append(price_diagnostic)
                 continue
             candidates.append(leg)
-
-        emergency_candidates = []
-        if (
-            not candidates
-            and self.has_protective_emergency_reconstruction_context(record)
-            and self.contract_exactly_matches_record_symbol(contract, record)
-            and self.execution_side_matches_leg(record, execution, "emergency_flatten_exit")
-            and self.quantity_matches_expected_leg(record, "emergency_flatten_exit", quantity)
-            and not self.price_matches_expected_leg(record, "tp", price)
-            and not self.price_matches_expected_leg(record, "sl", price)
-        ):
-            emergency_candidates.append("emergency_flatten_exit")
-
-        if len(emergency_candidates) == 1:
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_RECONSTRUCTED_FILL | "
-                f"trade_id={record.get('trade_id')} "
-                f"symbol={record.get('symbol')} "
-                f"exec_id={getattr(execution, 'execId', None)} "
-                f"order_id={getattr(execution, 'orderId', None)} "
-                f"perm_id={getattr(execution, 'permId', None)} "
-                f"side={getattr(execution, 'side', None)} "
-                f"quantity={quantity} "
-                f"price={price} "
-                "match_source=fallback_protective_emergency_symbol_side_time_quantity "
-                f"fallback_candidates={emergency_candidates} "
-                "decision=map_unique_emergency_fallback_as_exit"
-            )
-            return (
-                "emergency_flatten_exit",
-                "fallback_protective_emergency_symbol_side_time_quantity",
-                emergency_candidates,
-            )
-        if len(emergency_candidates) > 1:
-            logger.warning(
-                "PROTECTIVE_EMERGENCY_FLATTEN_RECONSTRUCTION_AMBIGUOUS | "
-                f"trade_id={record.get('trade_id')} "
-                f"symbol={record.get('symbol')} "
-                f"fallback_candidates={emergency_candidates} "
-                "decision=preserve_current_lifecycle"
-            )
-            return None, "fallback_protective_emergency_ambiguous", emergency_candidates
 
         if len(candidates) == 1:
             return candidates[0], "fallback_symbol_side_time_quantity_price", candidates
@@ -7068,7 +3997,6 @@ class ScalpingBot:
             "entry": {"quantity": 0.0, "notional": 0.0, "price": None, "first_time": None, "last_time": None},
             "tp": {"quantity": 0.0, "notional": 0.0, "price": None, "first_time": None, "last_time": None},
             "sl": {"quantity": 0.0, "notional": 0.0, "price": None, "first_time": None, "last_time": None},
-            "emergency_flatten_exit": {"quantity": 0.0, "notional": 0.0, "price": None, "first_time": None, "last_time": None},
         }
         matched_identities = set()
         match_sources = {
@@ -7246,12 +4174,9 @@ class ScalpingBot:
         entry_quantity = round(buckets["entry"]["quantity"], 10)
         tp_quantity = round(buckets["tp"]["quantity"], 10)
         sl_quantity = round(buckets["sl"]["quantity"], 10)
-        emergency_exit_quantity = round(buckets["emergency_flatten_exit"]["quantity"], 10)
-        exit_quantity = round(tp_quantity + sl_quantity + emergency_exit_quantity, 10)
+        exit_quantity = round(tp_quantity + sl_quantity, 10)
         exit_reason = None
-        if emergency_exit_quantity > 0:
-            exit_reason = PROTECTIVE_EMERGENCY_EXIT_REASON
-        elif tp_quantity > 0 and sl_quantity > 0:
+        if tp_quantity > 0 and sl_quantity > 0:
             exit_reason = "MIXED_EXIT"
         elif tp_quantity > 0:
             exit_reason = "TP"
@@ -7280,17 +4205,8 @@ class ScalpingBot:
             "sl_fill_price": buckets["sl"]["price"],
             "sl_first_time": buckets["sl"]["first_time"],
             "sl_last_time": buckets["sl"]["last_time"],
-            "emergency_flatten_exit_quantity": emergency_exit_quantity,
-            "emergency_flatten_exit_notional": buckets["emergency_flatten_exit"]["notional"],
-            "emergency_flatten_exit_fill_price": buckets["emergency_flatten_exit"]["price"],
-            "emergency_flatten_exit_first_time": buckets["emergency_flatten_exit"]["first_time"],
-            "emergency_flatten_exit_last_time": buckets["emergency_flatten_exit"]["last_time"],
             "exit_quantity": exit_quantity,
-            "exit_notional": (
-                buckets["tp"]["notional"]
-                + buckets["sl"]["notional"]
-                + buckets["emergency_flatten_exit"]["notional"]
-            ),
+            "exit_notional": buckets["tp"]["notional"] + buckets["sl"]["notional"],
             "exit_fill_price": None,
             "exit_last_time": None,
             "exit_reason": exit_reason,
@@ -7298,11 +4214,7 @@ class ScalpingBot:
         if exit_quantity > 0:
             candidate["exit_fill_price"] = round(candidate["exit_notional"] / exit_quantity, 10)
             exit_times = [
-                value for value in (
-                    buckets["tp"]["last_time"],
-                    buckets["sl"]["last_time"],
-                    buckets["emergency_flatten_exit"]["last_time"],
-                )
+                value for value in (buckets["tp"]["last_time"], buckets["sl"]["last_time"])
                 if value is not None
             ]
             if exit_times:
@@ -7315,7 +4227,6 @@ class ScalpingBot:
             f"entry_quantity={entry_quantity} "
             f"tp_quantity={tp_quantity} "
             f"sl_quantity={sl_quantity} "
-            f"emergency_flatten_exit_quantity={emergency_exit_quantity} "
             f"exit_quantity={exit_quantity} "
             f"exit_reason={exit_reason} "
             f"match_sources={json.dumps(match_sources, sort_keys=True)}"
@@ -7352,7 +4263,7 @@ class ScalpingBot:
             return False, "reconstructed_exit_missing", None
         if abs(entry_quantity - exit_quantity) > 1e-9:
             return False, "reconstructed_entry_exit_quantity_mismatch", None
-        if exit_reason not in {"TP", "SL", "MIXED_EXIT", PROTECTIVE_EMERGENCY_EXIT_REASON}:
+        if exit_reason not in {"TP", "SL", "MIXED_EXIT"}:
             return False, "reconstructed_exit_reason_missing", None
 
         if broker_reality is None:
@@ -7414,8 +4325,6 @@ class ScalpingBot:
             "parent_order_id",
             "tp_order_id",
             "sl_order_id",
-            "emergency_flatten_order_id",
-            "emergency_flatten_perm_id",
             "parent_perm_id",
             "tp_perm_id",
             "sl_perm_id",
@@ -7496,19 +4405,12 @@ class ScalpingBot:
             record["sl_exit_quantity"] = candidate["sl_quantity"]
             record["sl_exit_notional"] = candidate["sl_notional"]
             record["sl_exit_fill_price"] = candidate["sl_fill_price"]
-            record["emergency_flatten_exit_quantity"] = candidate.get("emergency_flatten_exit_quantity", 0.0)
-            record["emergency_flatten_exit_notional"] = candidate.get("emergency_flatten_exit_notional", 0.0)
-            record["emergency_flatten_exit_fill_price"] = candidate.get("emergency_flatten_exit_fill_price")
             record["exit_reason"] = candidate["exit_reason"]
             record["execution_validation_status"] = "broker_reconciled_flat"
             if candidate["exit_reason"] == "TP":
                 computed_next_state = "TP_FILLED"
             elif candidate["exit_reason"] == "SL":
                 computed_next_state = "SL_FILLED"
-            elif candidate["exit_reason"] == PROTECTIVE_EMERGENCY_EXIT_REASON:
-                computed_next_state = "CLOSED"
-                record["protective_emergency_status"] = "flat_confirmed_stale_orders_cleared"
-                record["protective_emergency_active"] = False
             else:
                 computed_next_state = "CLOSED"
             self.log_lifecycle_mutation_context(
@@ -7534,16 +4436,6 @@ class ScalpingBot:
                 f"exit_quantity={candidate['exit_quantity']} "
                 f"exit_reason={candidate['exit_reason']}"
             )
-            if candidate["exit_reason"] == PROTECTIVE_EMERGENCY_EXIT_REASON:
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_RECONSTRUCTED_FILL | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record.get('symbol')} "
-                    f"exit_quantity={candidate['exit_quantity']} "
-                    f"exit_fill_price={candidate['exit_fill_price']} "
-                    "exit_reason=EMERGENCY_FLATTEN_SL_MISSING "
-                    "protective_emergency_status=flat_confirmed_stale_orders_cleared"
-                )
             applied_log = {
                 "trade_id": trade_id,
                 "symbol": record.get("symbol"),
@@ -7982,33 +4874,25 @@ class ScalpingBot:
             )
 
         if self.should_suppress_unacknowledged_cleanup_for_protection(record_snapshot, broker_reality):
-            visible_parent = leg_order_ids["parent"] in visible_order_ids
             visible_tp = leg_order_ids["tp"] in visible_order_ids
             visible_sl = leg_order_ids["sl"] in visible_order_ids
-            if visible_sl:
-                log_label = "PROTECTIVE_EXIT_CLEANUP_SUPPRESSED"
-            elif visible_tp:
-                log_label = "PROTECTIVE_SL_MISSING_WITH_POSITION"
-            else:
-                log_label = "URGENT_RISK_STATE_UNPROTECTED_POSITION"
+            log_label = (
+                "PROTECTIVE_EXIT_CLEANUP_SUPPRESSED"
+                if visible_sl
+                else "PROTECTIVE_SL_MISSING_WITH_POSITION"
+            )
             log_message = (
                 f"{log_label} | "
                 f"trade_id={trade_id} "
                 f"symbol={record_snapshot.get('symbol')} "
-                f"parent_order_id={record_snapshot.get('parent_order_id')} "
-                f"tp_order_id={record_snapshot.get('tp_order_id')} "
-                f"sl_order_id={record_snapshot.get('sl_order_id')} "
                 f"entry_filled={record_snapshot.get('entry_filled')} "
                 f"realized_entry_quantity={record_snapshot.get('realized_entry_quantity')} "
                 f"cumulative_entry_quantity={record_snapshot.get('cumulative_entry_quantity')} "
                 f"position_match={broker_reality.get('has_position_match')} "
-                f"parent_visible={visible_parent} "
                 f"tp_visible={visible_tp} "
                 f"sl_visible={visible_sl} "
                 f"visible_order_ids={sorted(visible_order_ids)} "
                 f"matching_position_sizes={broker_reality.get('matching_position_sizes')} "
-                "protective_context=True "
-                "cleanup_forbidden=True "
                 "decision=preserve_exits_no_generic_cleanup "
                 f"reason={reason_label}"
             )
@@ -8022,23 +4906,6 @@ class ScalpingBot:
                 f"tp_visible={visible_tp} sl_visible={visible_sl} "
                 f"visible_order_ids={sorted(visible_order_ids)} reason={reason_label}"
             )
-            if not visible_sl and PROTECTIVE_SL_MISSING_POLICY == "EMERGENCY_FLATTEN":
-                self.emergency_flatten_unprotected_position(
-                    trade_id,
-                    record_snapshot.get("symbol"),
-                    f"cleanup_suppression_sl_missing:{reason_label}",
-                    protection_context={
-                        "protection_class": (
-                            "URGENT_RISK_STATE_SL_MISSING"
-                            if visible_tp
-                            else "URGENT_RISK_STATE_UNPROTECTED_POSITION"
-                        ),
-                        "parent_visible": visible_parent,
-                        "tp_visible": visible_tp,
-                        "sl_visible": visible_sl,
-                    },
-                    broker_reality=broker_reality,
-                )
             return {
                 "ok": True,
                 "reason": "protective_exit_cleanup_suppressed",
@@ -8047,7 +4914,6 @@ class ScalpingBot:
                 "visible_order_ids": sorted(visible_order_ids),
                 "failed_order_ids": [],
                 "protective_cleanup_suppressed": True,
-                "parent_visible": visible_parent,
                 "tp_visible": visible_tp,
                 "sl_visible": visible_sl,
             }
@@ -8079,7 +4945,6 @@ class ScalpingBot:
                     reason_label=reason_label,
                     trade_id=trade_id,
                     symbol=record_snapshot.get("symbol"),
-                    real_broker_exposure=True,
                 )
                 cancel_requested_count += 1
                 logger.warning(
@@ -8134,166 +4999,8 @@ class ScalpingBot:
                 record_snapshot["sl_order_id"],
                 trade_analysis_lock_context="not_locked",
             )
-            protection_context = self.classify_position_protection_context(
-                record_snapshot,
-                broker_reality,
-                confirmation,
-            )
-            quantity_coverage = self.assess_bracket_quantity_coverage(
-                record_snapshot,
-                broker_confirmation=confirmation,
-                broker_reality=broker_reality,
-            )
-            self.log_bracket_quantity_coverage(record_snapshot, quantity_coverage)
-            broker_state_category = confirmation.get("broker_state_category", "BROKEN_OR_TERMINAL")
-            if (
-                broker_reality.get("check_failed")
-                and (record_snapshot.get("entry_filled") or self.has_realized_parent_entry(record_snapshot))
-            ):
-                self.emergency_flatten_unprotected_position(
-                    trade_id,
-                    record_snapshot["symbol"],
-                    "protective_emergency_post_reconnect_required_broker_read_failed",
-                    protection_context=protection_context,
-                    broker_reality=broker_reality,
-                )
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_POST_RECONNECT_REQUIRED | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record_snapshot['symbol']} "
-                    f"reason={reason_label} "
-                    "operator_action_required=True "
-                    "decision=preserve_active_lock_until_broker_reality_available"
-                )
-                return True
-
-            if protection_context["protection_class"] in {
-                "IN_POSITION_WITH_PROTECTIVE_EXITS",
-                "IN_POSITION_WITH_PRIMARY_SL_PROTECTION",
-            }:
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is None or record["summary_logged"] or record["state"] != "BROKER_ACK_PENDING":
-                        return False
-                    previous_state = record["state"]
-                    record["state"] = "EXIT_WORKING"
-                    record["broker_ack_pending_last_check"] = now_dt
-                    record["broker_ack_pending_reason"] = protection_context["reason"]
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        f"BROKER ACK PENDING RECOVERED TO EXIT WORKING previous_state={previous_state} "
-                        f"broker_state_category={broker_state_category} "
-                        f"protection_class={protection_context['protection_class']} "
-                        f"reason={protection_context['reason']} "
-                        f"visible_order_ids={confirmation['visible_order_ids']}"
-                    )
-                self.set_execution_validation_status(
-                    trade_id,
-                    "broker_live" if confirmation.get("all_broker_live") else "broker_acknowledged",
-                    protection_context["reason"],
-                )
-                logger.warning(
-                    "BROKER_ACK_PENDING_RECOVERED_TO_EXIT_WORKING | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record_snapshot['symbol']} "
-                    f"parent_order_id={record_snapshot.get('parent_order_id')} "
-                    f"tp_order_id={record_snapshot.get('tp_order_id')} "
-                    f"sl_order_id={record_snapshot.get('sl_order_id')} "
-                    f"parent_visible={protection_context['parent_visible']} "
-                    f"tp_visible={protection_context['tp_visible']} "
-                    f"sl_visible={protection_context['sl_visible']} "
-                    f"entry_filled={record_snapshot.get('entry_filled')} "
-                    f"cumulative_entry_quantity={record_snapshot.get('cumulative_entry_quantity')} "
-                    f"realized_entry_quantity={record_snapshot.get('realized_entry_quantity')} "
-                    f"position_match={protection_context['position_match']} "
-                    f"position_sizes={broker_reality.get('matching_position_sizes')} "
-                    f"visible_order_ids={confirmation['visible_order_ids']} "
-                    f"broker_state_category={broker_state_category} "
-                    f"protection_class={protection_context['protection_class']} "
-                    "decision=preserve_protective_exits "
-                    f"reason={protection_context['reason']}"
-                )
-                if not protection_context["parent_visible"]:
-                    logger.info(
-                        "PARENT_MISSING_AFTER_FULL_FILL_NORMAL | "
-                        f"trade_id={trade_id} "
-                        f"symbol={record_snapshot['symbol']} "
-                        f"parent_order_id={record_snapshot.get('parent_order_id')} "
-                        f"tp_order_id={record_snapshot.get('tp_order_id')} "
-                        f"sl_order_id={record_snapshot.get('sl_order_id')} "
-                        f"visible_order_ids={confirmation['visible_order_ids']} "
-                        "decision=parent_absence_accepted_after_realized_entry"
-                    )
-                return True
-
-            if protection_context["protection_class"] in {
-                "URGENT_RISK_STATE_SL_MISSING",
-                "URGENT_RISK_STATE_UNPROTECTED_POSITION",
-            }:
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is None or record["summary_logged"] or record["state"] != "BROKER_ACK_PENDING":
-                        return False
-                    previous_state = record["state"]
-                    record["state"] = protection_context["target_state"] or record["state"]
-                    record["broker_ack_pending_last_check"] = now_dt
-                    record["broker_ack_pending_reason"] = protection_context["reason"]
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        f"{protection_context['protection_class']} previous_state={previous_state} "
-                        f"new_state={record['state']} broker_state_category={broker_state_category} "
-                        f"visible_order_ids={confirmation['visible_order_ids']} "
-                        f"reason={protection_context['reason']}"
-                    )
-                self.set_execution_validation_status(
-                    trade_id,
-                    "validation_incomplete",
-                    protection_context["reason"],
-                )
-                log_label = (
-                    "PROTECTIVE_SL_MISSING_WITH_POSITION"
-                    if protection_context["protection_class"] == "URGENT_RISK_STATE_SL_MISSING"
-                    else "URGENT_RISK_STATE_UNPROTECTED_POSITION"
-                )
-                logger.critical(
-                    f"{log_label} | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record_snapshot['symbol']} "
-                    f"parent_order_id={record_snapshot.get('parent_order_id')} "
-                    f"tp_order_id={record_snapshot.get('tp_order_id')} "
-                    f"sl_order_id={record_snapshot.get('sl_order_id')} "
-                    f"parent_visible={protection_context['parent_visible']} "
-                    f"tp_visible={protection_context['tp_visible']} "
-                    f"sl_visible={protection_context['sl_visible']} "
-                    f"entry_filled={record_snapshot.get('entry_filled')} "
-                    f"cumulative_entry_quantity={record_snapshot.get('cumulative_entry_quantity')} "
-                    f"realized_entry_quantity={record_snapshot.get('realized_entry_quantity')} "
-                    f"position_match={protection_context['position_match']} "
-                    f"position_sizes={broker_reality.get('matching_position_sizes')} "
-                    f"visible_order_ids={confirmation['visible_order_ids']} "
-                    f"broker_state_category={broker_state_category} "
-                    f"protection_class={protection_context['protection_class']} "
-                    "decision=preserve_active_unresolved_no_generic_cleanup "
-                    "operator_action_required=True "
-                    f"reason={protection_context['reason']}"
-                )
-                self.emergency_flatten_unprotected_position(
-                    trade_id,
-                    record_snapshot["symbol"],
-                    protection_context["reason"],
-                    protection_context=protection_context,
-                    broker_reality=broker_reality,
-                )
-                return True
-
             broken_or_terminal_fail_closed = False
             broken_or_terminal_previous_state = None
-            quantity_gate_emergency_required = False
-            quantity_gate_hold = False
             with self.trade_analysis_lock:
                 record = self.trade_analysis.get(trade_id)
                 if record is None or record["summary_logged"] or record["state"] != "BROKER_ACK_PENDING":
@@ -8302,27 +5009,8 @@ class ScalpingBot:
                 record["broker_ack_pending_reason"] = confirmation["reason"]
                 record["broker_ack_pending_category"] = confirmation.get("broker_state_category")
                 record["broker_ack_pending_visible_order_ids"] = confirmation["visible_order_ids"]
-                if broker_state_category == "ACKNOWLEDGED" and not self.is_bracket_quantity_safe_for_ack(quantity_coverage):
-                    open_position_estimate = quantity_coverage.get("open_position_estimate")
-                    previous_state = record["state"]
-                    record["broker_ack_pending_last_check"] = now_dt
-                    record["broker_ack_pending_reason"] = quantity_coverage.get("quantity_state")
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        f"BROKER ACK PENDING QUANTITY GATE HOLDS previous_state={previous_state} "
-                        f"quantity_state={quantity_coverage.get('quantity_state')} "
-                        f"open_position_estimate={open_position_estimate} "
-                        f"protective_sl_coverage={quantity_coverage.get('protective_sl_coverage')}"
-                    )
-                    if open_position_estimate is not None and open_position_estimate > 0:
-                        quantity_gate_emergency_required = True
-                    else:
-                        quantity_gate_hold = True
-                if quantity_gate_emergency_required or quantity_gate_hold:
-                    pass
-                elif broker_state_category == "ACKNOWLEDGED":
+                broker_state_category = confirmation.get("broker_state_category", "BROKEN_OR_TERMINAL")
+                if broker_state_category == "ACKNOWLEDGED":
                     previous_state = record["state"]
                     self.log_lifecycle_mutation_context(
                         mutation_point="broker_ack_pending_recovery_exit",
@@ -8360,7 +5048,7 @@ class ScalpingBot:
                             trade_id,
                             "broker_acknowledged",
                             f"{confirmation.get('outcome')}:{confirmation['reason']}"
-                    )
+                        )
                     return True
                 if broker_state_category == "BROKEN_OR_TERMINAL":
                     broken_or_terminal_previous_state = record["state"]
@@ -8380,23 +5068,6 @@ class ScalpingBot:
                         f"reason={confirmation['reason']}"
                     )
                     broken_or_terminal_fail_closed = True
-
-            if quantity_gate_emergency_required:
-                self.set_execution_validation_status(
-                    trade_id,
-                    "validation_incomplete",
-                    quantity_coverage.get("quantity_state"),
-                )
-                self.emergency_flatten_unprotected_position(
-                    trade_id,
-                    record_snapshot["symbol"],
-                    quantity_coverage.get("quantity_state"),
-                    protection_context=protection_context,
-                    broker_reality=broker_reality,
-                )
-                return True
-            if quantity_gate_hold:
-                return False
 
             if broken_or_terminal_fail_closed:
                 self.append_anomaly(trade_id, "BROKER_ACK_PENDING_BROKEN_OR_TERMINAL")
@@ -8471,7 +5142,7 @@ class ScalpingBot:
                         record = self.trade_analysis.get(trade_id)
                         if record is not None and not record["summary_logged"] and record["state"] == "BROKER_ACK_PENDING":
                             previous_state = record["state"]
-                            if cancel_result.get("sl_visible"):
+                            if cancel_result.get("tp_visible") or cancel_result.get("sl_visible"):
                                 record["state"] = "EXIT_WORKING"
                             record["broker_ack_pending_last_check"] = now_dt
                             record["broker_ack_pending_reason"] = cancel_result["reason"]
@@ -9177,57 +5848,17 @@ class ScalpingBot:
 
             trade_id, record = self.get_trade_by_order_id(order_id)
             if record is None:
-                trade_id, record = self.get_trade_by_emergency_flatten_perm_id(perm_id)
-            if record is None:
                 self.log_broker_fill_without_lifecycle_event(
                     "UNKNOWN",
                     "no_trade_analysis_order_id_match",
-                    "update_trade_from_status_skipped_record_missing",
-                    fill=None,
-                    execution=None,
-                    contract=getattr(trade, "contract", None),
-                    order=order,
+                    "update_trade_from_fill_skipped_record_missing",
+                    fill=fill,
+                    execution=execution,
+                    contract=getattr(fill, "contract", None),
                 )
                 return
 
             self.update_trade_perm_id(order_id, perm_id)
-            if order_id == record.get("emergency_flatten_order_id"):
-                with self.trade_analysis_lock:
-                    live_record = self.trade_analysis.get(trade_id)
-                    if live_record is not None:
-                        live_record["emergency_flatten_last_status"] = state
-                        emergency_already_resolved = bool(
-                            live_record.get("closed")
-                            and live_record.get("protective_emergency_status") == "flat_confirmed_stale_orders_cleared"
-                        )
-                        if state in PROTECTIVE_EMERGENCY_TERMINAL_STATUSES:
-                            live_record["emergency_flatten_terminal_status"] = state
-                            if not emergency_already_resolved:
-                                live_record["protective_emergency_status"] = "flatten_order_terminal_not_flat_confirmed"
-                        elif state in {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted", "PendingCancel"}:
-                            if not emergency_already_resolved:
-                                live_record["protective_emergency_status"] = "in_flight"
-                        elif state == "Filled":
-                            if not emergency_already_resolved:
-                                live_record["protective_emergency_status"] = "pending_position_confirmation"
-                        if not emergency_already_resolved:
-                            live_record["state"] = "BROKER_ACK_PENDING"
-                        self.append_trade_event(
-                            trade_id,
-                            f"PROTECTIVE EMERGENCY FLATTEN STATUS orderId={order_id} status={state}"
-                        )
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_ORDER_STATUS | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record.get('symbol')} "
-                    f"emergency_flatten_order_id={order_id} "
-                    f"emergency_flatten_perm_id={perm_id} "
-                    f"emergency_flatten_last_status={state} "
-                    f"protective_emergency_status={(self.trade_analysis.get(trade_id) or {}).get('protective_emergency_status')} "
-                    f"protective_emergency_active={(self.trade_analysis.get(trade_id) or {}).get('protective_emergency_active')} "
-                    "reason=order_status_event "
-                    "operator_action_required=False"
-                )
             self.mark_trade_state(order_id, state)
             leg = self.map_order_leg(record, order_id)
             self.log_order_status_correlation(
@@ -9338,7 +5969,6 @@ class ScalpingBot:
         for exit_price_field, exit_quantity_field in (
             ("tp_exit_fill_price", "tp_exit_quantity"),
             ("sl_exit_fill_price", "sl_exit_quantity"),
-            ("emergency_flatten_exit_fill_price", "emergency_flatten_exit_quantity"),
         ):
             exit_fill_price = record.get(exit_price_field)
             exit_quantity = float(record.get(exit_quantity_field) or 0.0)
@@ -9363,235 +5993,6 @@ class ScalpingBot:
             return quantity
         except Exception:
             return None
-
-    def normalize_broker_quantity_or_none(self, value):
-        try:
-            if value is None:
-                return None
-            quantity = abs(float(value))
-            if quantity < 1e-9:
-                return 0.0
-            return quantity
-        except Exception:
-            return None
-
-    def subtract_known_quantities(self, first, *others):
-        if first is None or any(value is None for value in others):
-            return None
-        result = float(first)
-        for value in others:
-            result -= float(value)
-        return max(result, 0.0)
-
-    def get_broker_confirmation_leg_quantity(self, broker_confirmation, leg_name, quantity_name):
-        if not isinstance(broker_confirmation, dict):
-            return None
-        leg_data = (broker_confirmation.get("broker_orders") or {}).get(leg_name) or {}
-        return self.normalize_broker_quantity_or_none(leg_data.get(quantity_name))
-
-    def get_broker_confirmation_leg_value(self, broker_confirmation, leg_name, value_name):
-        if not isinstance(broker_confirmation, dict):
-            return None
-        leg_data = (broker_confirmation.get("broker_orders") or {}).get(leg_name) or {}
-        return leg_data.get(value_name)
-
-    def build_quantity_coverage_log_fields(self, record, coverage):
-        fields = {
-            "trade_id": (record or {}).get("trade_id"),
-            "symbol": (record or {}).get("symbol"),
-        }
-        for key in (
-            "quantity_state",
-            "open_position_estimate",
-            "protective_sl_coverage",
-            "planned_parent_quantity",
-            "planned_tp_quantity",
-            "planned_sl_quantity",
-            "parent_total_quantity",
-            "parent_filled_quantity",
-            "parent_remaining_quantity",
-            "tp_total_quantity",
-            "tp_filled_quantity",
-            "tp_remaining_quantity",
-            "sl_total_quantity",
-            "sl_filled_quantity",
-            "sl_remaining_quantity",
-            "quantity_mismatch_reason",
-        ):
-            fields[key] = (coverage or {}).get(key)
-        return fields
-
-    def log_bracket_quantity_coverage(self, record, coverage):
-        quantity_state = (coverage or {}).get("quantity_state")
-        if quantity_state in {"FULL_FILL_COVERAGE_OK", "NO_OPEN_EXPOSURE_QUANTITY_OK"}:
-            label = "BRACKET_QUANTITY_COVERAGE_OK"
-            log_fn = logger.info
-        elif quantity_state == "TRANSIENT_PARTIAL_FILL_COVERED":
-            label = "BRACKET_QUANTITY_COVERAGE_TRANSIENT_PARTIAL_FILL"
-            log_fn = logger.warning
-        elif quantity_state == "NO_OPEN_EXPOSURE_QUANTITY_UNKNOWN":
-            label = "BRACKET_QUANTITY_UNKNOWN_WAITING"
-            log_fn = logger.warning
-        elif quantity_state == "BROKER_QUANTITY_UNKNOWN_FAIL_CLOSED":
-            label = "BRACKET_QUANTITY_UNKNOWN_FAIL_CLOSED"
-            log_fn = logger.critical
-        elif quantity_state == "PROTECTIVE_COVERAGE_INSUFFICIENT":
-            label = "PROTECTIVE_COVERAGE_INSUFFICIENT"
-            log_fn = logger.critical
-        elif quantity_state == "BRACKET_QUANTITY_MISMATCH":
-            label = "BRACKET_QUANTITY_MISMATCH"
-            log_fn = logger.critical
-        else:
-            label = "BRACKET_QUANTITY_MISMATCH"
-            log_fn = logger.warning
-
-        log_fn(f"{label} | {json.dumps(self.build_quantity_coverage_log_fields(record, coverage), sort_keys=True)}")
-
-    def assess_bracket_quantity_coverage(self, record, broker_confirmation=None, broker_reality=None):
-        record = record or {}
-        planned_parent_quantity = self.normalize_broker_quantity_or_none(record.get("planned_parent_quantity"))
-        planned_tp_quantity = self.normalize_broker_quantity_or_none(record.get("planned_tp_quantity"))
-        planned_sl_quantity = self.normalize_broker_quantity_or_none(record.get("planned_sl_quantity"))
-
-        parent_total_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "parent", "totalQuantity")
-        parent_filled_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "parent", "filled")
-        parent_remaining_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "parent", "remaining")
-        tp_total_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "tp", "totalQuantity")
-        tp_filled_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "tp", "filled")
-        tp_remaining_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "tp", "remaining")
-        sl_total_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "sl", "totalQuantity")
-        sl_filled_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "sl", "filled")
-        sl_remaining_quantity = self.get_broker_confirmation_leg_quantity(broker_confirmation, "sl", "remaining")
-
-        cumulative_entry_quantity = self.normalize_broker_quantity_or_none(record.get("cumulative_entry_quantity"))
-        cumulative_exit_quantity = self.normalize_broker_quantity_or_none(record.get("cumulative_exit_quantity"))
-        broker_position_quantity = None
-        if isinstance(broker_reality, dict) and broker_reality.get("broker_position_quantity") is not None:
-            broker_position_quantity = abs(float(broker_reality.get("broker_position_quantity")))
-
-        exposure_candidates = []
-        if broker_position_quantity is not None:
-            exposure_candidates.append(broker_position_quantity)
-        record_exposure = self.subtract_known_quantities(cumulative_entry_quantity, cumulative_exit_quantity)
-        if record_exposure is not None:
-            exposure_candidates.append(record_exposure)
-        broker_fill_exposure = self.subtract_known_quantities(
-            parent_filled_quantity,
-            tp_filled_quantity,
-            sl_filled_quantity,
-        )
-        if broker_fill_exposure is not None:
-            exposure_candidates.append(broker_fill_exposure)
-
-        open_position_estimate = max(exposure_candidates) if exposure_candidates else None
-        if open_position_estimate is not None and open_position_estimate < 1e-9:
-            open_position_estimate = 0.0
-
-        protective_sl_coverage = sl_remaining_quantity
-        if protective_sl_coverage is None:
-            protective_sl_coverage = self.subtract_known_quantities(sl_total_quantity, sl_filled_quantity)
-
-        mismatch_reasons = []
-        for leg_name, planned_quantity, total_quantity in (
-            ("parent", planned_parent_quantity, parent_total_quantity),
-            ("tp", planned_tp_quantity, tp_total_quantity),
-            ("sl", planned_sl_quantity, sl_total_quantity),
-        ):
-            if planned_quantity is not None and total_quantity is not None and abs(planned_quantity - total_quantity) > 1e-9:
-                mismatch_reasons.append(f"{leg_name}_planned_total_mismatch")
-
-        child_quantities_known = (
-            (tp_total_quantity is not None or tp_remaining_quantity is not None) and
-            (sl_total_quantity is not None or sl_remaining_quantity is not None)
-        )
-        child_quantities_consistent = not any(
-            reason.endswith("_planned_total_mismatch")
-            for reason in mismatch_reasons
-            if reason.startswith("tp_") or reason.startswith("sl_")
-        )
-
-        broker_has_real_signal = bool(
-            broker_reality and (
-                broker_reality.get("broker_real")
-                or broker_reality.get("has_position_match")
-                or broker_reality.get("has_open_trade_match")
-                or broker_reality.get("has_open_order_match")
-            )
-        ) or bool(broker_confirmation and broker_confirmation.get("any_visible"))
-
-        quantity_state = "BROKER_QUANTITY_UNKNOWN_FAIL_CLOSED"
-        quantity_coverage_ok = False
-        protective_sl_coverage_ok = False
-        quantity_mismatch_reason = ",".join(mismatch_reasons) if mismatch_reasons else None
-
-        if open_position_estimate is None:
-            if broker_has_real_signal:
-                quantity_state = "BROKER_QUANTITY_UNKNOWN_FAIL_CLOSED"
-                quantity_mismatch_reason = quantity_mismatch_reason or "open_exposure_unknown_with_broker_visibility"
-            else:
-                quantity_state = "NO_OPEN_EXPOSURE_QUANTITY_UNKNOWN"
-                quantity_mismatch_reason = quantity_mismatch_reason or "open_exposure_unknown_no_broker_visibility"
-        elif open_position_estimate == 0.0:
-            if mismatch_reasons:
-                quantity_state = "BRACKET_QUANTITY_MISMATCH"
-                quantity_mismatch_reason = ",".join(mismatch_reasons)
-            elif child_quantities_known and child_quantities_consistent:
-                quantity_state = "NO_OPEN_EXPOSURE_QUANTITY_OK"
-                quantity_coverage_ok = True
-                protective_sl_coverage_ok = True
-            else:
-                quantity_state = "NO_OPEN_EXPOSURE_QUANTITY_UNKNOWN"
-                quantity_mismatch_reason = quantity_mismatch_reason or "no_open_exposure_child_quantities_unknown"
-        elif protective_sl_coverage is None:
-            quantity_state = "BROKER_QUANTITY_UNKNOWN_FAIL_CLOSED"
-            quantity_mismatch_reason = quantity_mismatch_reason or "open_exposure_sl_coverage_unknown"
-        elif protective_sl_coverage + 1e-9 >= open_position_estimate:
-            protective_sl_coverage_ok = True
-            quantity_coverage_ok = True
-            parent_total_known = parent_total_quantity if parent_total_quantity is not None else planned_parent_quantity
-            if parent_total_known is not None and parent_filled_quantity is not None and parent_filled_quantity + 1e-9 < parent_total_known:
-                quantity_state = "TRANSIENT_PARTIAL_FILL_COVERED"
-            else:
-                quantity_state = "FULL_FILL_COVERAGE_OK"
-        else:
-            quantity_state = "PROTECTIVE_COVERAGE_INSUFFICIENT"
-            quantity_mismatch_reason = quantity_mismatch_reason or "sl_coverage_below_open_exposure"
-
-        return {
-            "quantity_state": quantity_state,
-            "quantity_coverage_ok": quantity_coverage_ok,
-            "protective_sl_coverage_ok": protective_sl_coverage_ok,
-            "quantity_mismatch_reason": quantity_mismatch_reason,
-            "planned_parent_quantity": planned_parent_quantity,
-            "planned_tp_quantity": planned_tp_quantity,
-            "planned_sl_quantity": planned_sl_quantity,
-            "parent_total_quantity": parent_total_quantity,
-            "parent_filled_quantity": parent_filled_quantity,
-            "parent_remaining_quantity": parent_remaining_quantity,
-            "tp_total_quantity": tp_total_quantity,
-            "tp_filled_quantity": tp_filled_quantity,
-            "tp_remaining_quantity": tp_remaining_quantity,
-            "sl_total_quantity": sl_total_quantity,
-            "sl_filled_quantity": sl_filled_quantity,
-            "sl_remaining_quantity": sl_remaining_quantity,
-            "cumulative_entry_quantity": cumulative_entry_quantity,
-            "cumulative_exit_quantity": cumulative_exit_quantity,
-            "broker_position_quantity": broker_position_quantity,
-            "open_position_estimate": open_position_estimate,
-            "protective_sl_coverage": protective_sl_coverage,
-        }
-
-    def is_bracket_quantity_safe_for_ack(self, coverage):
-        return bool(
-            coverage and (
-                coverage.get("quantity_coverage_ok")
-                or coverage.get("quantity_state") in {
-                    "NO_OPEN_EXPOSURE_QUANTITY_OK",
-                    "TRANSIENT_PARTIAL_FILL_COVERED",
-                    "FULL_FILL_COVERAGE_OK",
-                }
-            )
-        )
 
     def accumulate_quantity_and_notional(self, record, quantity_field, notional_field, price_field, quantity, price):
         if quantity is None or price is None or quantity <= 0:
@@ -9640,1611 +6041,6 @@ class ScalpingBot:
     def should_suppress_unacknowledged_cleanup_for_protection(self, record, broker_reality):
         return self.is_position_with_protective_exit_context(record, broker_reality)
 
-    def get_datetime_age_seconds(self, value, now_value=None):
-        if not isinstance(value, datetime):
-            return None
-        if now_value is None:
-            now_value = datetime.now(timezone.utc)
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        else:
-            value = value.astimezone(timezone.utc)
-        if now_value.tzinfo is None:
-            now_value = now_value.replace(tzinfo=timezone.utc)
-        else:
-            now_value = now_value.astimezone(timezone.utc)
-        return max(0.0, round((now_value - value).total_seconds(), 3))
-
-    def get_emergency_order_ref(self, record):
-        if not record:
-            return None
-        trade_id = record.get("trade_id")
-        symbol = record.get("symbol")
-        if not trade_id or not symbol:
-            return None
-        return self.build_order_ref(trade_id, symbol, "PROTECTIVE_EMERGENCY_FLATTEN")
-
-    def get_emergency_order_status_from_snapshot(self, record, broker_snapshot=None):
-        if not record or not broker_snapshot:
-            return None, False
-
-        emergency_order_id = record.get("emergency_flatten_order_id")
-        emergency_perm_id = record.get("emergency_flatten_perm_id")
-        emergency_order_ref = self.get_emergency_order_ref(record)
-
-        for trade in broker_snapshot.get("open_trades") or []:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            if order is None and status is None:
-                continue
-            order_id = getattr(order, "orderId", None)
-            perm_id = getattr(status, "permId", None) or getattr(order, "permId", None)
-            order_ref = self.get_order_ref(order=order)
-            if (
-                (emergency_order_id is not None and order_id == emergency_order_id)
-                or (emergency_perm_id not in (None, 0) and perm_id == emergency_perm_id)
-                or (emergency_order_ref and order_ref == emergency_order_ref)
-            ):
-                return getattr(status, "status", None), True
-
-        for order in broker_snapshot.get("open_orders") or []:
-            order_id = getattr(order, "orderId", None)
-            perm_id = getattr(order, "permId", None)
-            order_ref = self.get_order_ref(order=order)
-            if (
-                (emergency_order_id is not None and order_id == emergency_order_id)
-                or (emergency_perm_id not in (None, 0) and perm_id == emergency_perm_id)
-                or (emergency_order_ref and order_ref == emergency_order_ref)
-            ):
-                return getattr(order, "status", None), True
-
-        return None, False
-
-    def get_emergency_flatten_inflight_state(self, record, broker_snapshot=None, now_value=None):
-        now_value = now_value or datetime.now(timezone.utc)
-        if record is None:
-            return {
-                "has_existing_emergency_order": False,
-                "emergency_order_id": None,
-                "emergency_perm_id": None,
-                "emergency_status": None,
-                "order_inflight": False,
-                "order_terminal": False,
-                "flat_confirmed": False,
-                "safe_to_submit_new_flatten": False,
-                "submitted_age_sec": None,
-                "reserved_age_sec": None,
-                "reason": "record_missing",
-            }
-
-        emergency_order_id = record.get("emergency_flatten_order_id")
-        emergency_perm_id = record.get("emergency_flatten_perm_id")
-        record_status = record.get("emergency_flatten_last_status") or record.get("protective_emergency_status")
-        broker_status, broker_visible = self.get_emergency_order_status_from_snapshot(record, broker_snapshot)
-        emergency_status = broker_status if broker_visible else record_status
-        submitted_age_sec = self.get_datetime_age_seconds(record.get("emergency_flatten_submitted_at"), now_value)
-        reserved_age_sec = self.get_datetime_age_seconds(record.get("emergency_flatten_submit_reserved_at"), now_value)
-        recent_submit = (
-            (submitted_age_sec is not None and submitted_age_sec <= PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS)
-            or (reserved_age_sec is not None and reserved_age_sec <= PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS)
-        )
-        has_existing_emergency_order = emergency_order_id is not None or emergency_perm_id not in (None, 0)
-        order_terminal = emergency_status in PROTECTIVE_EMERGENCY_TERMINAL_STATUSES
-        flat_confirmed = record.get("protective_emergency_status") == "flat_confirmed_stale_orders_cleared"
-
-        order_inflight = False
-        reason = "no_existing_emergency_order"
-        if flat_confirmed:
-            reason = "flat_confirmed_stale_orders_cleared"
-        elif emergency_status in PROTECTIVE_EMERGENCY_INFLIGHT_STATUSES:
-            order_inflight = True
-            reason = f"inflight_status:{emergency_status}"
-        elif broker_visible and not order_terminal:
-            order_inflight = True
-            reason = f"broker_visible_non_terminal:{emergency_status}"
-        elif recent_submit and not order_terminal:
-            order_inflight = True
-            reason = "unknown_recent"
-            emergency_status = emergency_status or "unknown_recent"
-        elif emergency_status in {"submit_failed", "submit_failed_submission_uncertain", "broker_submission_uncertain"}:
-            order_inflight = True
-            reason = f"broker_submission_uncertain:{emergency_status}"
-        elif emergency_status == "Filled":
-            reason = "filled_requires_broker_flat_and_stale_child_confirmation"
-        elif has_existing_emergency_order and not order_terminal:
-            order_inflight = True
-            reason = f"existing_emergency_order_non_terminal:{emergency_status}"
-        elif order_terminal:
-            reason = f"terminal_status:{emergency_status}"
-
-        return {
-            "has_existing_emergency_order": has_existing_emergency_order,
-            "emergency_order_id": emergency_order_id,
-            "emergency_perm_id": emergency_perm_id,
-            "emergency_status": emergency_status,
-            "order_inflight": order_inflight,
-            "order_terminal": order_terminal,
-            "flat_confirmed": flat_confirmed,
-            "safe_to_submit_new_flatten": not order_inflight and not flat_confirmed,
-            "submitted_age_sec": submitted_age_sec,
-            "reserved_age_sec": reserved_age_sec,
-            "reason": reason,
-        }
-
-    def get_symbol_emergency_flatten_inflight_state(self, symbol, exclude_trade_id=None, broker_snapshot=None):
-        with self.trade_analysis_lock:
-            records = [
-                dict(record)
-                for record in self.trade_analysis.values()
-                if (
-                    record.get("symbol") == symbol
-                    and record.get("trade_id") != exclude_trade_id
-                    and not record.get("summary_logged")
-                    and (
-                        record.get("protective_emergency_active")
-                        or record.get("emergency_flatten_order_id") is not None
-                        or record.get("emergency_flatten_perm_id") not in (None, 0)
-                    )
-                )
-            ]
-
-        for record in records:
-            state = self.get_emergency_flatten_inflight_state(record, broker_snapshot)
-            status = record.get("protective_emergency_status")
-            active_unresolved = bool(
-                record.get("protective_emergency_active")
-                and status in {
-                    "submit_in_progress",
-                    "flatten_order_submitted",
-                    "in_flight",
-                    "pending_position_confirmation",
-                    "blocked_broker_read_failed",
-            "failed_position_still_open",
-            "flat_confirmed_stale_child_cleanup_failed",
-            "flat_confirmed_stale_bot_order_cleanup_failed",
-            "submit_failed_submission_uncertain",
-            "broker_submission_uncertain",
-        }
-            )
-            if state.get("order_inflight") or active_unresolved:
-                return {
-                    "symbol_has_inflight_emergency": True,
-                    "blocking_trade_id": record.get("trade_id"),
-                    "blocking_order_id": record.get("emergency_flatten_order_id"),
-                    "blocking_perm_id": record.get("emergency_flatten_perm_id"),
-                    "blocking_status": state.get("emergency_status") or status,
-                    "reason": state.get("reason") if state.get("order_inflight") else f"same_symbol_active:{status}",
-                }
-
-        return {
-            "symbol_has_inflight_emergency": False,
-            "blocking_trade_id": None,
-            "blocking_order_id": None,
-            "blocking_perm_id": None,
-            "blocking_status": None,
-            "reason": "no_symbol_emergency_inflight",
-        }
-
-    def read_protective_emergency_broker_snapshot(self, symbol, reason_label, trade_id=None):
-        open_trades, positions, open_orders = self.broker_read_open_trades_positions_open_orders(
-            caller="protective_emergency_flatten",
-            reason_label=reason_label,
-            trade_id=trade_id,
-            symbol=symbol,
-            trade_analysis_lock_context="not_locked",
-        )
-        return {
-            "open_trades": open_trades,
-            "positions": positions,
-            "open_orders": open_orders,
-        }
-
-    def get_stale_bot_owned_child_orders(self, record, broker_snapshot):
-        return self.get_stale_bot_owned_orders_for_trade(
-            record,
-            broker_snapshot,
-            include_parent=False,
-            include_children=True,
-        ).get("orders", {})
-
-    def get_stale_bot_owned_orders_for_trade(
-        self,
-        record,
-        broker_snapshot,
-        include_parent=True,
-        include_children=True,
-    ):
-        empty_result = {
-            "orders": {},
-            "order_ids": [],
-            "parent_order_ids": [],
-            "child_order_ids": [],
-            "order_refs": [],
-            "perm_ids": [],
-            "scan_scope": "none",
-        }
-        if not record or not broker_snapshot:
-            return empty_result
-
-        trade_id = record.get("trade_id")
-        symbol = record.get("symbol")
-        parent_order_ids = {record.get("parent_order_id")} if include_parent else set()
-        child_order_ids = (
-            {record.get("tp_order_id"), record.get("sl_order_id")}
-            if include_children
-            else set()
-        )
-        emergency_order_ids = {record.get("emergency_flatten_order_id")}
-        candidate_order_ids = set()
-        candidate_order_ids.update(parent_order_ids)
-        candidate_order_ids.update(child_order_ids)
-        candidate_order_ids.update(emergency_order_ids)
-        candidate_order_ids.discard(None)
-
-        candidate_perm_ids = {
-            record.get("parent_perm_id") if include_parent else None,
-            record.get("tp_perm_id") if include_children else None,
-            record.get("sl_perm_id") if include_children else None,
-            record.get("emergency_flatten_perm_id"),
-        }
-        candidate_perm_ids.discard(None)
-        candidate_perm_ids.discard(0)
-
-        with self.trade_analysis_lock:
-            order_to_trade_snapshot = dict(self.order_to_trade)
-
-        stale_orders = {}
-        stale_parent_order_ids = set()
-        stale_child_order_ids = set()
-        stale_order_refs = set()
-        stale_perm_ids = set()
-
-        def contract_symbol_ok(contract):
-            if contract is None:
-                return True
-            return self.contract_matches_symbol(contract, symbol)
-
-        def bot_owned_order_match(order, status=None, contract=None):
-            if order is None:
-                return False, "order_missing"
-            if not contract_symbol_ok(contract):
-                return False, "symbol_mismatch"
-            order_id = getattr(order, "orderId", None)
-            perm_id = (
-                getattr(status, "permId", None)
-                if status is not None
-                else None
-            ) or getattr(order, "permId", None)
-            order_ref = self.get_order_ref(order=order)
-
-            if order_id in candidate_order_ids:
-                return True, "order_id"
-            if perm_id in candidate_perm_ids:
-                return True, "perm_id"
-            if order_id is not None and order_to_trade_snapshot.get(order_id) == trade_id:
-                return True, "order_to_trade"
-            if self.broker_order_ref_matches_record(record, order_ref):
-                return True, "order_ref_trade_id"
-            return False, "no_bot_ownership_evidence"
-
-        for trade in broker_snapshot.get("open_trades") or []:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            contract = getattr(trade, "contract", None)
-            if not self.order_is_open_for_session_close(order, status):
-                continue
-            order_id = getattr(order, "orderId", None)
-            matched, _ = bot_owned_order_match(order, status=status, contract=contract)
-            if matched:
-                stale_orders[order_id] = order
-                if order_id in parent_order_ids:
-                    stale_parent_order_ids.add(order_id)
-                if order_id in child_order_ids:
-                    stale_child_order_ids.add(order_id)
-                order_ref = self.get_order_ref(order=order)
-                perm_id = getattr(status, "permId", None) or getattr(order, "permId", None)
-                if order_ref:
-                    stale_order_refs.add(order_ref)
-                if perm_id not in (None, 0):
-                    stale_perm_ids.add(perm_id)
-
-        for order in broker_snapshot.get("open_orders") or []:
-            order_id = getattr(order, "orderId", None)
-            matched, _ = bot_owned_order_match(order)
-            if matched:
-                stale_orders[order_id] = order
-                if order_id in parent_order_ids:
-                    stale_parent_order_ids.add(order_id)
-                if order_id in child_order_ids:
-                    stale_child_order_ids.add(order_id)
-                order_ref = self.get_order_ref(order=order)
-                perm_id = getattr(order, "permId", None)
-                if order_ref:
-                    stale_order_refs.add(order_ref)
-                if perm_id not in (None, 0):
-                    stale_perm_ids.add(perm_id)
-
-        result = {
-            "orders": stale_orders,
-            "order_ids": sorted(order_id for order_id in stale_orders.keys() if order_id is not None),
-            "parent_order_ids": sorted(stale_parent_order_ids),
-            "child_order_ids": sorted(stale_child_order_ids),
-            "order_refs": sorted(stale_order_refs),
-            "perm_ids": sorted(stale_perm_ids),
-            "scan_scope": (
-                f"include_parent={include_parent};"
-                f"include_children={include_children};"
-                "ownership=order_id|perm_id|order_to_trade|orderRef_exact_trade_id"
-            ),
-        }
-        logger.critical(
-            "PROTECTIVE_EMERGENCY_STALE_BOT_ORDER_SCAN | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"stale_bot_owned_order_ids={result['order_ids']} "
-            f"stale_parent_order_ids={result['parent_order_ids']} "
-            f"stale_child_order_ids={result['child_order_ids']} "
-            f"stale_order_refs={result['order_refs']} "
-            f"stale_perm_ids={result['perm_ids']} "
-            f"stale_scan_scope={result['scan_scope']} "
-            "decision=scan_known_bot_owned_orders_only"
-        )
-        return result
-
-    def get_emergency_flatten_broker_fill_evidence(self, record, reason_label):
-        result = {
-            "broker_fill_visible": False,
-            "fill_read_attempted": True,
-            "fill_read_failed": False,
-            "failure": None,
-            "matched_exec_ids": [],
-        }
-        try:
-            fills = self.broker_read_fills(
-                caller="protective_emergency_flatten",
-                reason_label=reason_label,
-                trade_id=record.get("trade_id") if isinstance(record, dict) else None,
-                symbol=record.get("symbol") if isinstance(record, dict) else None,
-                trade_analysis_lock_context="not_locked",
-            )
-        except Exception as exc:
-            result["fill_read_failed"] = True
-            result["failure"] = str(exc)
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_FILL_EVIDENCE_READ_FAILED | "
-                f"trade_id={record.get('trade_id')} "
-                f"symbol={record.get('symbol')} "
-                f"failure={exc} "
-                "fill_read_attempted=True "
-                "decision=allow_only_if_other_broker_flat_evidence_is_clean"
-            )
-            return result
-
-        emergency_order_id = record.get("emergency_flatten_order_id")
-        emergency_perm_id = record.get("emergency_flatten_perm_id")
-        emergency_order_ref = self.get_emergency_order_ref(record)
-        for fill in fills or []:
-            execution = getattr(fill, "execution", None)
-            if execution is None:
-                continue
-            order_id = getattr(execution, "orderId", None)
-            perm_id = getattr(execution, "permId", None)
-            order_ref = self.get_order_ref(execution=execution)
-            if (
-                (emergency_order_id is not None and order_id == emergency_order_id)
-                or (emergency_perm_id not in (None, 0) and perm_id == emergency_perm_id)
-                or (emergency_order_ref and order_ref == emergency_order_ref)
-            ):
-                result["broker_fill_visible"] = True
-                result["matched_exec_ids"].append(getattr(execution, "execId", None))
-
-        logger.critical(
-            "PROTECTIVE_EMERGENCY_FLATTEN_FILL_EVIDENCE_CHECK | "
-            f"trade_id={record.get('trade_id')} "
-            f"symbol={record.get('symbol')} "
-            f"broker_fill_visible={result['broker_fill_visible']} "
-            f"matched_exec_ids={result['matched_exec_ids']} "
-            "fill_read_attempted=True"
-        )
-        return result
-
-    def can_finalize_emergency_flat_fill_details_incomplete(
-        self,
-        record,
-        broker_snapshot,
-        emergency_state,
-        symbol_state,
-        stale_scan_result,
-        fill_evidence,
-        position_qty,
-    ):
-        missing_details = []
-        broker_status, broker_visible = self.get_emergency_order_status_from_snapshot(record, broker_snapshot)
-        stale_orders_clear = not stale_scan_result.get("orders")
-        submitted_age_sec = emergency_state.get("submitted_age_sec")
-        reserved_age_sec = emergency_state.get("reserved_age_sec")
-        age_candidates = [
-            value for value in (submitted_age_sec, reserved_age_sec)
-            if value is not None
-        ]
-        age_past_grace = bool(
-            age_candidates
-            and max(age_candidates) > PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS
-        )
-        broker_position_flat = position_qty == 0.0
-        symbol_inflight = bool(symbol_state.get("symbol_has_inflight_emergency"))
-        broker_fill_visible = bool(fill_evidence.get("broker_fill_visible"))
-        fill_read_attempted = bool(fill_evidence.get("fill_read_attempted"))
-
-        checks = {
-            "broker_position_flat": broker_position_flat,
-            "stale_orders_clear": stale_orders_clear,
-            "broker_order_visible": broker_visible,
-            "symbol_level_inflight": symbol_inflight,
-            "age_past_grace": age_past_grace,
-            "fill_read_attempted": fill_read_attempted,
-            "broker_fill_visible": broker_fill_visible,
-        }
-        for key, value in checks.items():
-            if key in {"broker_order_visible", "symbol_level_inflight", "broker_fill_visible"}:
-                if value:
-                    missing_details.append(key)
-            elif not value:
-                missing_details.append(key)
-
-        can_finalize = not missing_details
-        reason = (
-            "broker_flat_stale_clean_order_not_visible_grace_elapsed_fill_details_incomplete"
-            if can_finalize
-            else f"missing_required_evidence:{','.join(missing_details)}"
-        )
-        return {
-            "can_finalize": can_finalize,
-            "reason": reason,
-            "missing_details": missing_details,
-            "required_evidence": {
-                "broker_position_qty": position_qty,
-                "broker_status": broker_status,
-                "broker_order_visible": broker_visible,
-                "submitted_age_sec": submitted_age_sec,
-                "reserved_age_sec": reserved_age_sec,
-                "inflight_grace_seconds": PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS,
-                "stale_bot_owned_order_ids": stale_scan_result.get("order_ids"),
-                "symbol_level_inflight": symbol_inflight,
-                "broker_fill_visible": broker_fill_visible,
-                "fill_read_failed": fill_evidence.get("fill_read_failed"),
-            },
-        }
-
-    def confirm_protective_emergency_flat_with_stale_child_gate(self, trade_id, symbol, reason_label, position_qty, confirm_reason, protection_context=None):
-        try:
-            snapshot = self.read_protective_emergency_broker_snapshot(
-                symbol,
-                f"protective_emergency_flat_confirmed:{confirm_reason}",
-                trade_id=trade_id,
-            )
-        except Exception as exc:
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_active"] = True
-                    record["protective_emergency_status"] = "flat_confirmed_stale_child_cleanup_failed"
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["closed"] = False
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_STALE_CHILD_ORDER_AFTER_FLATTEN | "
-                f"trade_id={trade_id} symbol={symbol} reason={confirm_reason} "
-                f"failure={exc} stale_child_order_ids=[] stale_child_cleanup_result=broker_read_failed "
-                "operator_action_required=True"
-            )
-            return {
-                "ok": False,
-                "reason": f"stale_child_cleanup_broker_read_failed:{exc}",
-                "flat_confirmed": True,
-                "stale_child_cleanup_result": "broker_read_failed",
-            }
-
-        with self.trade_analysis_lock:
-            record_snapshot = dict(self.trade_analysis.get(trade_id) or {})
-
-        emergency_state = self.get_emergency_flatten_inflight_state(record_snapshot, snapshot)
-        symbol_state = self.get_symbol_emergency_flatten_inflight_state(
-            symbol,
-            exclude_trade_id=trade_id,
-            broker_snapshot=snapshot,
-        )
-        stale_scan_result = self.get_stale_bot_owned_orders_for_trade(
-            record_snapshot,
-            snapshot,
-            include_parent=True,
-            include_children=True,
-        )
-        fill_evidence = self.get_emergency_flatten_broker_fill_evidence(
-            record_snapshot,
-            f"protective_emergency_fill_details_incomplete_check:{confirm_reason}",
-        )
-        incomplete_finalize = self.can_finalize_emergency_flat_fill_details_incomplete(
-            record_snapshot,
-            snapshot,
-            emergency_state,
-            symbol_state,
-            stale_scan_result,
-            fill_evidence,
-            position_qty,
-        )
-        if (
-            emergency_state.get("order_inflight")
-            and position_qty != 0.0
-            and not incomplete_finalize.get("can_finalize")
-        ):
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_active"] = True
-                    record["protective_emergency_status"] = "pending_position_confirmation"
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["closed"] = False
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_BLOCKED_INFLIGHT | "
-                f"trade_id={trade_id} symbol={symbol} "
-                f"emergency_flatten_order_id={emergency_state.get('emergency_order_id')} "
-                f"emergency_flatten_perm_id={emergency_state.get('emergency_perm_id')} "
-                f"emergency_flatten_last_status={emergency_state.get('emergency_status')} "
-                f"position_qty_after={position_qty} "
-                f"submitted_age_sec={emergency_state.get('submitted_age_sec')} "
-                f"reserved_age_sec={emergency_state.get('reserved_age_sec')} "
-                f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                f"broker_order_visible={self.get_emergency_order_status_from_snapshot(record_snapshot, snapshot)[1]} "
-                f"broker_fill_visible={fill_evidence.get('broker_fill_visible')} "
-                f"stale_bot_owned_order_ids={stale_scan_result.get('order_ids')} "
-                "safe_to_submit_new_flatten=False "
-                "idempotency_decision=block_flat_release_existing_order_inflight "
-                f"reason={incomplete_finalize.get('reason') or emergency_state.get('reason')} "
-                "operator_action_required=False"
-            )
-            return {
-                "ok": True,
-                "reason": "pending_position_confirmation",
-                "flat_confirmed": True,
-                "pending": True,
-            }
-
-        stale_orders = stale_scan_result.get("orders", {})
-        stale_child_order_ids = stale_scan_result.get("child_order_ids", [])
-        stale_parent_order_ids = stale_scan_result.get("parent_order_ids", [])
-        stale_bot_owned_order_ids = stale_scan_result.get("order_ids", [])
-        cancel_failed = False
-        for order_id, order in list(stale_orders.items()):
-            try:
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_STALE_CHILD_CANCEL_REQUESTED | "
-                    f"trade_id={trade_id} symbol={symbol} order_id={order_id} "
-                    f"reason={confirm_reason} "
-                    f"stale_bot_owned_order_ids={stale_bot_owned_order_ids} "
-                    f"stale_parent_order_ids={stale_parent_order_ids} "
-                    f"stale_child_order_ids={stale_child_order_ids} "
-                    f"stale_order_refs={stale_scan_result.get('order_refs')} "
-                    f"stale_perm_ids={stale_scan_result.get('perm_ids')} "
-                    f"stale_scan_scope={stale_scan_result.get('scan_scope')} "
-                    "decision=cancel_known_bot_owned_order_after_flat"
-                )
-                self.broker_write_cancel_order(
-                    order,
-                    caller="protective_emergency_flatten",
-                    reason_label=f"protective_emergency_stale_child_cleanup:{confirm_reason}",
-                    trade_id=trade_id,
-                    symbol=symbol,
-                    real_broker_exposure=True,
-                )
-            except Exception as exc:
-                cancel_failed = True
-                logger.exception(
-                    "PROTECTIVE_EMERGENCY_STALE_CHILD_CANCEL_FAILED | "
-                    f"trade_id={trade_id} symbol={symbol} order_id={order_id} reason={confirm_reason} failure={exc}"
-                )
-
-        if stale_orders:
-            self.broker_write_sleep(
-                PROTECTIVE_SL_MISSING_RECHECK_SECONDS,
-                caller="protective_emergency_flatten",
-                reason_label=f"protective_emergency_stale_child_cleanup_recheck:{confirm_reason}",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-
-        try:
-            recheck_snapshot = self.read_protective_emergency_broker_snapshot(
-                symbol,
-                f"protective_emergency_stale_child_cleanup_recheck:{confirm_reason}",
-                trade_id=trade_id,
-            )
-            with self.trade_analysis_lock:
-                record_snapshot = dict(self.trade_analysis.get(trade_id) or {})
-            remaining_stale_scan_result = self.get_stale_bot_owned_orders_for_trade(
-                record_snapshot,
-                recheck_snapshot,
-                include_parent=True,
-                include_children=True,
-            )
-            remaining_stale_orders = remaining_stale_scan_result.get("orders", {})
-        except Exception as exc:
-            cancel_failed = True
-            remaining_stale_orders = stale_orders
-            remaining_stale_scan_result = stale_scan_result
-            logger.exception(
-                "PROTECTIVE_EMERGENCY_STALE_CHILD_RECHECK_FAILED | "
-                f"trade_id={trade_id} symbol={symbol} reason={confirm_reason} failure={exc}"
-            )
-
-        remaining_stale_child_order_ids = remaining_stale_scan_result.get("child_order_ids", [])
-        remaining_stale_parent_order_ids = remaining_stale_scan_result.get("parent_order_ids", [])
-        remaining_stale_bot_owned_order_ids = remaining_stale_scan_result.get("order_ids", [])
-        if cancel_failed or remaining_stale_orders:
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_active"] = True
-                    record["protective_emergency_status"] = "flat_confirmed_stale_bot_order_cleanup_failed"
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["closed"] = False
-                    record["exit_reason"] = self.get_time_exit_effective_exit_reason(record)
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_STALE_BOT_ORDER_AFTER_FLATTEN | "
-                f"trade_id={trade_id} symbol={symbol} reason={confirm_reason} "
-                f"stale_bot_owned_order_ids={remaining_stale_bot_owned_order_ids} "
-                f"stale_parent_order_ids={remaining_stale_parent_order_ids} "
-                f"stale_child_order_ids={remaining_stale_child_order_ids} "
-                f"stale_order_refs={remaining_stale_scan_result.get('order_refs')} "
-                f"stale_perm_ids={remaining_stale_scan_result.get('perm_ids')} "
-                f"stale_scan_scope={remaining_stale_scan_result.get('scan_scope')} "
-                "stale_bot_order_cleanup_result=failed "
-                "operator_action_required=True "
-                "decision=preserve_active_lock_reversal_risk"
-            )
-            return {
-                "ok": False,
-                "reason": "stale_child_cleanup_failed",
-                "flat_confirmed": True,
-                "stale_child_cleanup_result": "failed",
-                "stale_child_order_ids": remaining_stale_child_order_ids,
-                "stale_parent_order_ids": remaining_stale_parent_order_ids,
-                "stale_bot_owned_order_ids": remaining_stale_bot_owned_order_ids,
-            }
-
-        if record_snapshot.get("exit_fill_price") is None:
-            post_cleanup_emergency_state = self.get_emergency_flatten_inflight_state(
-                record_snapshot,
-                recheck_snapshot,
-            )
-            post_cleanup_symbol_state = self.get_symbol_emergency_flatten_inflight_state(
-                symbol,
-                exclude_trade_id=trade_id,
-                broker_snapshot=recheck_snapshot,
-            )
-            post_cleanup_fill_evidence = self.get_emergency_flatten_broker_fill_evidence(
-                record_snapshot,
-                f"protective_emergency_post_cleanup_fill_details_incomplete_check:{confirm_reason}",
-            )
-            post_cleanup_finalize = self.can_finalize_emergency_flat_fill_details_incomplete(
-                record_snapshot,
-                recheck_snapshot,
-                post_cleanup_emergency_state,
-                post_cleanup_symbol_state,
-                remaining_stale_scan_result,
-                post_cleanup_fill_evidence,
-                position_qty,
-            )
-            if not post_cleanup_finalize.get("can_finalize"):
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is not None:
-                        record["protective_emergency_active"] = True
-                        record["protective_emergency_status"] = "pending_position_confirmation"
-                        record["state"] = "BROKER_ACK_PENDING"
-                        record["closed"] = False
-                        record["exit_reason"] = self.get_time_exit_effective_exit_reason(record)
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_EVIDENCE_MISSING | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"emergency_flatten_order_id={post_cleanup_emergency_state.get('emergency_order_id')} "
-                    f"emergency_flatten_perm_id={post_cleanup_emergency_state.get('emergency_perm_id')} "
-                    f"emergency_flatten_last_status={post_cleanup_emergency_state.get('emergency_status')} "
-                    f"protective_emergency_status=pending_position_confirmation "
-                    "protective_emergency_active=True "
-                    f"submitted_age_sec={post_cleanup_emergency_state.get('submitted_age_sec')} "
-                    f"reserved_age_sec={post_cleanup_emergency_state.get('reserved_age_sec')} "
-                    f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                    f"broker_position_qty={position_qty} "
-                    f"stale_bot_owned_order_ids={remaining_stale_scan_result.get('order_ids')} "
-                    "retry_allowed=False "
-                    "retry_evidence=missing_flat_fill_details_incomplete_release_evidence "
-                    f"reason={post_cleanup_finalize.get('reason')} "
-                    "operator_action_required=False "
-                    "decision=preserve_active_lock_after_stale_cleanup"
-                )
-                return {
-                    "ok": True,
-                    "reason": post_cleanup_finalize.get("reason"),
-                    "flat_confirmed": True,
-                    "pending": True,
-                }
-
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is not None:
-                record["protective_emergency_active"] = False
-                record["protective_emergency_status"] = (
-                    "flat_confirmed_exit_fill_details_incomplete"
-                    if record.get("exit_fill_price") is None
-                    else "flat_confirmed_stale_orders_cleared"
-                )
-                record["protective_emergency_reason"] = reason_label
-                record["state"] = "CLOSED"
-                record["closed"] = True
-                record["exit_reason"] = self.get_time_exit_effective_exit_reason(record)
-                if record["exit_reason"] == TIME_EXIT_REASON:
-                    record["time_exit_status"] = "TIME_EXIT_COMPLETED"
-                    record["time_exit_completed_at"] = datetime.now(timezone.utc)
-                    record["time_exit_order_id"] = record.get("emergency_flatten_order_id")
-                if record.get("realized_exit_quantity") is None:
-                    record["realized_exit_quantity"] = float(record.get("cumulative_exit_quantity") or 0.0)
-                if record.get("exit_fill_price") is None:
-                    record["execution_validation_status"] = "broker_flat_confirmed_exit_fill_details_incomplete"
-                    logger.critical(
-                        "PROTECTIVE_EMERGENCY_FLATTEN_CONFIRMED_FILL_DETAILS_INCOMPLETE | "
-                        f"trade_id={trade_id} "
-                        f"symbol={symbol} "
-                        f"emergency_flatten_order_id={record.get('emergency_flatten_order_id')} "
-                        f"emergency_flatten_perm_id={record.get('emergency_flatten_perm_id')} "
-                        f"emergency_flatten_last_status={record.get('emergency_flatten_last_status')} "
-                        f"protective_emergency_status={record.get('protective_emergency_status')} "
-                        "protective_emergency_active=False "
-                        f"submitted_age_sec={emergency_state.get('submitted_age_sec')} "
-                        f"reserved_age_sec={emergency_state.get('reserved_age_sec')} "
-                        f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                        f"broker_position_qty={position_qty} "
-                        f"stale_bot_owned_order_ids={remaining_stale_scan_result.get('order_ids')} "
-                        f"broker_order_visible={self.get_emergency_order_status_from_snapshot(record_snapshot, recheck_snapshot)[1]} "
-                        f"broker_fill_visible={fill_evidence.get('broker_fill_visible')} "
-                        "fill_details_complete=False "
-                        "broker_flat_confirmed=True "
-                        "stale_bot_orders_cleared=True "
-                        "execution_validation_status=broker_flat_confirmed_exit_fill_details_incomplete "
-                        f"reason={confirm_reason} "
-                        "operator_action_required=False "
-                        "decision=close_on_broker_flat_evidence_without_fill_details"
-                    )
-                self.append_trade_event(
-                    trade_id,
-                    f"PROTECTIVE EMERGENCY FLATTEN CONFIRMED position_qty={position_qty} "
-                    f"reason={confirm_reason} stale_child_cleanup=cleared"
-                )
-        logger.critical(
-            "PROTECTIVE_EMERGENCY_FLATTEN_CONFIRMED | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"protection_class={(protection_context or {}).get('protection_class')} "
-            f"reason={reason_label} "
-            f"broker_position_qty={position_qty} "
-            f"position_qty_after={position_qty} "
-            "protective_emergency_active=False "
-            f"protective_emergency_status={(self.trade_analysis.get(trade_id) or {}).get('protective_emergency_status')} "
-            "stale_bot_order_cleanup_result=cleared "
-            f"stale_bot_owned_order_ids={remaining_stale_scan_result.get('order_ids')} "
-            f"stale_parent_order_ids={remaining_stale_scan_result.get('parent_order_ids')} "
-            f"stale_child_order_ids={remaining_stale_scan_result.get('child_order_ids')} "
-            f"fill_details_complete={(self.trade_analysis.get(trade_id) or {}).get('exit_fill_price') is not None} "
-            "broker_flat_confirmed=True "
-            "stale_bot_orders_cleared=True "
-            "operator_action_required=False "
-            "decision=broker_flat_confirmed_stale_bot_orders_cleared"
-        )
-        return {
-            "ok": True,
-            "reason": confirm_reason,
-            "flat_confirmed": True,
-            "stale_child_cleanup_result": "cleared",
-        }
-
-    def emergency_flatten_unprotected_position(
-        self,
-        trade_id,
-        symbol,
-        reason_label,
-        protection_context=None,
-        broker_reality=None,
-    ):
-        now_dt = datetime.now(timezone.utc)
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is None:
-                return {
-                    "ok": False,
-                    "reason": "trade_record_missing",
-                    "flat_confirmed": False,
-                }
-            previous_status = record.get("protective_emergency_status")
-            record["protective_emergency_active"] = True
-            record["protective_emergency_reason"] = reason_label
-            if previous_status not in {
-                "submit_in_progress",
-                "flatten_order_submitted",
-                "in_flight",
-                "pending_position_confirmation",
-                "flat_confirmed_stale_child_cleanup_failed",
-            }:
-                record["protective_emergency_status"] = "started"
-            record["protective_emergency_started_at"] = record.get("protective_emergency_started_at") or now_dt
-            record["state"] = "BROKER_ACK_PENDING"
-            record_snapshot = dict(record)
-            self.append_trade_event(
-                trade_id,
-                f"PROTECTIVE EMERGENCY FLATTEN STARTED reason={reason_label}"
-            )
-
-        logger.critical(
-            "PROTECTIVE_EMERGENCY_FLATTEN_STARTED | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"protection_class={(protection_context or {}).get('protection_class')} "
-            f"reason={reason_label} "
-            f"parent_order_id={record_snapshot.get('parent_order_id')} "
-            f"tp_order_id={record_snapshot.get('tp_order_id')} "
-            f"sl_order_id={record_snapshot.get('sl_order_id')} "
-            f"parent_visible={(protection_context or {}).get('parent_visible')} "
-            f"tp_visible={(protection_context or {}).get('tp_visible')} "
-            f"sl_visible={(protection_context or {}).get('sl_visible')} "
-            f"entry_filled={record_snapshot.get('entry_filled')} "
-            f"cumulative_entry_quantity={record_snapshot.get('cumulative_entry_quantity')} "
-            f"realized_entry_quantity={record_snapshot.get('realized_entry_quantity')} "
-            "protective_emergency_active=True "
-            "protective_emergency_status=started "
-            "decision=emergency_flatten_actual_broker_position"
-        )
-
-        def read_position_qty_from_snapshot(snapshot):
-            return self.get_position_quantity_from_positions(snapshot.get("positions"), symbol)
-
-        def log_idempotency_check(trade_state, symbol_state, position_qty=None, decision="inspect"):
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_IDEMPOTENCY_CHECK | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"blocking_trade_id={symbol_state.get('blocking_trade_id')} "
-                f"emergency_flatten_order_id={trade_state.get('emergency_order_id')} "
-                f"emergency_flatten_perm_id={trade_state.get('emergency_perm_id')} "
-                f"emergency_flatten_last_status={trade_state.get('emergency_status')} "
-                f"protective_emergency_status={record_snapshot.get('protective_emergency_status')} "
-                f"protective_emergency_active={record_snapshot.get('protective_emergency_active')} "
-                f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                f"submitted_age_sec={trade_state.get('submitted_age_sec')} "
-                f"reserved_age_sec={trade_state.get('reserved_age_sec')} "
-                f"position_qty_before={position_qty} "
-                f"safe_to_submit_new_flatten={trade_state.get('safe_to_submit_new_flatten')} "
-                f"symbol_level_inflight={symbol_state.get('symbol_has_inflight_emergency')} "
-                f"idempotency_decision={decision} "
-                f"reason={trade_state.get('reason')} "
-                "operator_action_required=False"
-            )
-
-        def handle_inflight_block(trade_state, symbol_state, snapshot, block_reason):
-            position_qty = read_position_qty_from_snapshot(snapshot) if snapshot else None
-            log_label = (
-                "PROTECTIVE_EMERGENCY_FLATTEN_SYMBOL_INFLIGHT_BLOCK"
-                if symbol_state.get("symbol_has_inflight_emergency")
-                else "PROTECTIVE_EMERGENCY_FLATTEN_ALREADY_IN_FLIGHT"
-            )
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_active"] = True
-                    if record.get("protective_emergency_status") not in {"flat_confirmed_stale_child_cleanup_failed"}:
-                        record["protective_emergency_status"] = "pending_position_confirmation"
-                    record["state"] = "BROKER_ACK_PENDING"
-            logger.critical(
-                f"{log_label} | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"blocking_trade_id={symbol_state.get('blocking_trade_id')} "
-                f"blocking_order_id={symbol_state.get('blocking_order_id')} "
-                f"blocking_perm_id={symbol_state.get('blocking_perm_id')} "
-                f"blocking_status={symbol_state.get('blocking_status')} "
-                f"emergency_flatten_order_id={trade_state.get('emergency_order_id')} "
-                f"emergency_flatten_perm_id={trade_state.get('emergency_perm_id')} "
-                f"emergency_flatten_last_status={trade_state.get('emergency_status')} "
-                "protective_emergency_active=True "
-                "protective_emergency_status=pending_position_confirmation "
-                f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                f"submitted_age_sec={trade_state.get('submitted_age_sec')} "
-                f"reserved_age_sec={trade_state.get('reserved_age_sec')} "
-                f"position_qty_after={position_qty} "
-                "safe_to_submit_new_flatten=False "
-                f"symbol_level_inflight={symbol_state.get('symbol_has_inflight_emergency')} "
-                f"idempotency_decision=block_new_order "
-                f"reason={block_reason} "
-                "operator_action_required=False"
-            )
-            if position_qty == 0.0:
-                return self.confirm_protective_emergency_flat_with_stale_child_gate(
-                    trade_id,
-                    symbol,
-                    reason_label,
-                    position_qty,
-                    "flat_confirmed_while_existing_emergency_inflight",
-                    protection_context=protection_context,
-                )
-            return {
-                "ok": True,
-                "reason": block_reason,
-                "flat_confirmed": False,
-                "pending": True,
-            }
-
-        if broker_reality and broker_reality.get("check_failed"):
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_status"] = "blocked_broker_read_failed"
-                    record["protective_emergency_reason"] = reason_label
-                    record["state"] = "BROKER_ACK_PENDING"
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_BLOCKED_BROKER_READ_FAILED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"reason={reason_label} "
-                f"failure={broker_reality.get('failure')} "
-                "operator_action_required=True "
-                "decision=preserve_active_lock_no_blind_flatten"
-            )
-            return {
-                "ok": False,
-                "reason": "broker_reality_check_failed",
-                "flat_confirmed": False,
-            }
-
-        def read_position_qty(reason_suffix):
-            positions = self.broker_read_positions(
-                caller="protective_emergency_flatten",
-                reason_label=f"{reason_label}:{reason_suffix}",
-                trade_id=trade_id,
-                symbol=symbol,
-                trade_analysis_lock_context="not_locked",
-            )
-            return self.get_position_quantity_from_positions(positions, symbol)
-
-        def mark_broker_read_failed(exc):
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_status"] = "blocked_broker_read_failed"
-                    record["protective_emergency_reason"] = reason_label
-                    record["state"] = "BROKER_ACK_PENDING"
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_BLOCKED_BROKER_READ_FAILED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"reason={reason_label} "
-                f"failure={exc} "
-                "operator_action_required=True "
-                "decision=preserve_active_lock_no_blind_flatten"
-            )
-            return {
-                "ok": False,
-                "reason": f"broker_position_read_failed:{exc}",
-                "flat_confirmed": False,
-            }
-
-        def confirm_flat(position_qty, confirm_reason):
-            return self.confirm_protective_emergency_flat_with_stale_child_gate(
-                trade_id,
-                symbol,
-                reason_label,
-                position_qty,
-                confirm_reason,
-                protection_context=protection_context,
-            )
-
-        for attempt in range(1, PROTECTIVE_SL_MISSING_MAX_ATTEMPTS + 1):
-            try:
-                broker_snapshot = self.read_protective_emergency_broker_snapshot(
-                    symbol,
-                    f"{reason_label}:attempt_{attempt}:idempotency_snapshot",
-                    trade_id=trade_id,
-                )
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-
-            with self.trade_analysis_lock:
-                live_record = dict(self.trade_analysis.get(trade_id) or {})
-            trade_inflight_state = self.get_emergency_flatten_inflight_state(
-                live_record,
-                broker_snapshot,
-            )
-            symbol_inflight_state = self.get_symbol_emergency_flatten_inflight_state(
-                symbol,
-                exclude_trade_id=trade_id,
-                broker_snapshot=broker_snapshot,
-            )
-            initial_position_qty = read_position_qty_from_snapshot(broker_snapshot)
-            log_idempotency_check(
-                trade_inflight_state,
-                symbol_inflight_state,
-                position_qty=initial_position_qty,
-                decision="pre_attempt_check",
-            )
-            if (
-                trade_inflight_state.get("order_inflight")
-                or (
-                    trade_inflight_state.get("emergency_status") == "Filled"
-                    and initial_position_qty != 0.0
-                )
-                or symbol_inflight_state.get("symbol_has_inflight_emergency")
-            ):
-                return handle_inflight_block(
-                    trade_inflight_state,
-                    symbol_inflight_state,
-                    broker_snapshot,
-                    "emergency_flatten_already_inflight",
-                )
-
-            try:
-                position_qty_before = read_position_qty(f"attempt_{attempt}:initial_position_read")
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_POSITION_RECHECK | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"broker_position_qty={position_qty_before} "
-                f"position_qty_before={position_qty_before} "
-                f"protection_class={(protection_context or {}).get('protection_class')} "
-                f"reason={reason_label} "
-                "decision=position_authority_before_emergency_flatten"
-            )
-
-            if position_qty_before == 0.0:
-                return confirm_flat(position_qty_before, "already_flat_after_recheck")
-
-            conflicting_order_ids = []
-            if PROTECTIVE_SL_MISSING_CANCEL_CONFLICTING_ORDERS:
-                try:
-                    open_trades, positions, open_orders = self.broker_read_open_trades_positions_open_orders(
-                        caller="protective_emergency_flatten",
-                        reason_label=f"protective_emergency_conflicting_order_scan:{reason_label}",
-                        symbol=symbol,
-                        trade_analysis_lock_context="not_locked",
-                    )
-                    snapshot = {
-                        "open_trades": open_trades,
-                        "positions": positions,
-                        "open_orders": open_orders,
-                    }
-                    working_entries, child_orders, _ = self.collect_session_close_orders_for_symbol(symbol, snapshot)
-                    current_bot_order_ids = {
-                        record_snapshot.get("parent_order_id"),
-                        record_snapshot.get("tp_order_id"),
-                        record_snapshot.get("sl_order_id"),
-                    }
-                    orders_to_cancel = {}
-                    orders_to_cancel.update({
-                        order_id: order
-                        for order_id, order in working_entries.items()
-                        if order_id in current_bot_order_ids
-                    })
-                    orders_to_cancel.update({
-                        order_id: order
-                        for order_id, order in child_orders.items()
-                        if order_id in current_bot_order_ids
-                    })
-                    for order_id, order in list(orders_to_cancel.items()):
-                        if order is None:
-                            continue
-                        conflicting_order_ids.append(order_id)
-                        logger.critical(
-                            "PROTECTIVE_EMERGENCY_CONFLICTING_ORDER_CANCEL_REQUESTED | "
-                            f"trade_id={trade_id} "
-                            f"symbol={symbol} "
-                            f"order_id={order_id} "
-                            f"attempt={attempt} "
-                            f"reason={reason_label} "
-                            "decision=cancel_known_bot_owned_order_before_mkt_flatten"
-                        )
-                        self.broker_write_cancel_order(
-                            order,
-                            caller="protective_emergency_flatten",
-                            reason_label=reason_label,
-                            trade_id=trade_id,
-                            symbol=symbol,
-                            real_broker_exposure=True,
-                        )
-                except Exception as exc:
-                    logger.exception(
-                        "PROTECTIVE_EMERGENCY_CONFLICTING_ORDER_CANCEL_FAILED | "
-                        f"trade_id={trade_id} symbol={symbol} attempt={attempt} reason={reason_label} failure={exc}"
-                    )
-
-            self.broker_write_sleep(
-                PROTECTIVE_SL_MISSING_RECHECK_SECONDS,
-                caller="protective_emergency_flatten",
-                reason_label=f"{reason_label}:post_cancel_recheck_wait",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-
-            try:
-                position_qty = read_position_qty(f"attempt_{attempt}:pre_mkt_position_recheck")
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_POSITION_RECHECK | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"broker_position_qty={position_qty} "
-                f"position_qty_before={position_qty_before} "
-                f"conflicting_order_ids_cancel_requested={conflicting_order_ids} "
-                f"protection_class={(protection_context or {}).get('protection_class')} "
-                f"reason={reason_label} "
-                "decision=position_authority_immediately_before_mkt_flatten"
-            )
-
-            if position_qty == 0.0:
-                return confirm_flat(position_qty, "flat_after_conflicting_order_cancel_recheck")
-
-            try:
-                pre_submit_snapshot = self.read_protective_emergency_broker_snapshot(
-                    symbol,
-                    f"{reason_label}:attempt_{attempt}:pre_submit_idempotency_snapshot",
-                    trade_id=trade_id,
-                )
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-            with self.trade_analysis_lock:
-                live_record = dict(self.trade_analysis.get(trade_id) or {})
-            trade_inflight_state = self.get_emergency_flatten_inflight_state(
-                live_record,
-                pre_submit_snapshot,
-            )
-            symbol_inflight_state = self.get_symbol_emergency_flatten_inflight_state(
-                symbol,
-                exclude_trade_id=trade_id,
-                broker_snapshot=pre_submit_snapshot,
-            )
-            log_idempotency_check(
-                trade_inflight_state,
-                symbol_inflight_state,
-                position_qty=position_qty,
-                decision="pre_submit_check",
-            )
-            if (
-                trade_inflight_state.get("order_inflight")
-                or (
-                    trade_inflight_state.get("emergency_status") == "Filled"
-                    and position_qty != 0.0
-                )
-                or symbol_inflight_state.get("symbol_has_inflight_emergency")
-            ):
-                return handle_inflight_block(
-                    trade_inflight_state,
-                    symbol_inflight_state,
-                    pre_submit_snapshot,
-                    "emergency_flatten_already_inflight_pre_submit",
-                )
-
-            if not self.ensure_symbol_contract_ready(symbol):
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is not None:
-                        record["protective_emergency_status"] = "blocked_contract_not_ready"
-                        record["state"] = "BROKER_ACK_PENDING"
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_FAILED | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"attempt={attempt} "
-                    f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                    "reason=contract_not_ready "
-                    "operator_action_required=True "
-                    "decision=preserve_active_lock"
-                )
-                return {
-                    "ok": False,
-                    "reason": "contract_not_ready",
-                    "flat_confirmed": False,
-                }
-
-            action = "SELL" if position_qty > 0 else "BUY"
-            quantity = abs(position_qty)
-            if self.is_prd_dry_run_enabled():
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_BLOCKED_DRY_RUN | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"attempt={attempt} "
-                    f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                    f"flatten_action={action} "
-                    f"flatten_quantity={quantity} "
-                    f"position_qty_before={position_qty} "
-                    f"reason={reason_label} "
-                    "operator_action_required=True "
-                    "decision=preserve_active_lock_no_dry_run_flatten"
-                )
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is not None:
-                        record["protective_emergency_active"] = True
-                        record["protective_emergency_status"] = "blocked_prd_dry_run"
-                        record["protective_emergency_reason"] = reason_label
-                return {
-                    "ok": False,
-                    "reason": "prd_dry_run_no_emergency_flatten_transmission",
-                    "flat_confirmed": False,
-                    "operator_action_required": True,
-                }
-            contract = self.get_contract(symbol)
-            order = MarketOrder(action, quantity)
-            with self.order_id_lock:
-                if self.next_order_id is None:
-                    self.next_order_id = self.broker_get_req_id(
-                        caller="protective_emergency_flatten",
-                        reason_label=reason_label,
-                        trade_id=trade_id,
-                        symbol=symbol,
-                    )
-                order.orderId = self.next_order_id
-                self.next_order_id += 1
-            order.tif = self.get_order_tif(symbol, "protective_emergency_flatten") or "DAY"
-            order.orderRef = self.build_order_ref(trade_id, symbol, "PROTECTIVE_EMERGENCY_FLATTEN")
-            logger.info(
-                "ORDER_REF_ASSIGNED | "
-                f"run_id={self.run_id} "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                "role=PROTECTIVE_EMERGENCY_FLATTEN "
-                f"order_id={getattr(order, 'orderId', None)} "
-                f"orderRef={getattr(order, 'orderRef', None)}"
-            )
-
-            reservation_id = f"{trade_id}:{symbol}:{order.orderId}:{time.time_ns()}"
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is None:
-                    return {
-                        "ok": False,
-                        "reason": "trade_record_missing_before_submit",
-                        "flat_confirmed": False,
-                    }
-                atomic_trade_state = self.get_emergency_flatten_inflight_state(record)
-                atomic_symbol_state = self.get_symbol_emergency_flatten_inflight_state(
-                    symbol,
-                    exclude_trade_id=trade_id,
-                )
-                if (
-                    atomic_trade_state.get("order_inflight")
-                    or atomic_symbol_state.get("symbol_has_inflight_emergency")
-                ):
-                    logger.critical(
-                        "PROTECTIVE_EMERGENCY_FLATTEN_ALREADY_IN_FLIGHT | "
-                        f"trade_id={trade_id} "
-                        f"symbol={symbol} "
-                        f"blocking_trade_id={atomic_symbol_state.get('blocking_trade_id')} "
-                        f"emergency_flatten_order_id={atomic_trade_state.get('emergency_order_id')} "
-                        f"emergency_flatten_perm_id={atomic_trade_state.get('emergency_perm_id')} "
-                        f"emergency_flatten_last_status={atomic_trade_state.get('emergency_status')} "
-                        "safe_to_submit_new_flatten=False "
-                        f"symbol_level_inflight={atomic_symbol_state.get('symbol_has_inflight_emergency')} "
-                        "idempotency_decision=atomic_reservation_block "
-                        "operator_action_required=False"
-                    )
-                    return {
-                        "ok": True,
-                        "reason": "atomic_reservation_blocked_existing_inflight",
-                        "flat_confirmed": False,
-                        "pending": True,
-                    }
-
-                previous_emergency_order_id = record.get("emergency_flatten_order_id")
-                self.order_to_trade[order.orderId] = trade_id
-                record["protective_emergency_active"] = True
-                record["protective_emergency_status"] = "submit_in_progress"
-                record["emergency_flatten_submit_reserved_at"] = datetime.now(timezone.utc)
-                record["emergency_flatten_submit_reservation_id"] = reservation_id
-                record["emergency_flatten_order_id"] = order.orderId
-                record["emergency_flatten_order_ref"] = order.orderRef
-                record["emergency_flatten_action"] = action
-                record["emergency_flatten_quantity"] = quantity
-                record["emergency_flatten_attempt"] = attempt
-                record["emergency_flatten_reason"] = reason_label
-                record["emergency_flatten_last_status"] = "submit_in_progress"
-                record["state"] = "BROKER_ACK_PENDING"
-
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_SUBMIT_RESERVED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"emergency_flatten_order_id={order.orderId} "
-                f"previous_emergency_order_id={previous_emergency_order_id} "
-                f"flatten_action={action} "
-                f"flatten_quantity={quantity} "
-                f"position_qty_before={position_qty} "
-                f"reservation_id={reservation_id} "
-                "protective_emergency_status=submit_in_progress "
-                "idempotency_decision=reserve_submit_slot "
-                "operator_action_required=False"
-            )
-
-            try:
-                self.broker_write_place_order(
-                    contract,
-                    order,
-                    caller="protective_emergency_flatten",
-                    reason_label=reason_label,
-                    trade_id=trade_id,
-                    symbol=symbol,
-                )
-            except Exception as exc:
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is not None:
-                        record["protective_emergency_status"] = "submit_failed_submission_uncertain"
-                        record["emergency_flatten_last_status"] = "submit_failed_submission_uncertain"
-                        record["state"] = "BROKER_ACK_PENDING"
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_SUBMIT_UNCERTAIN | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"attempt={attempt} "
-                    f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                    f"flatten_action={action} "
-                    f"flatten_quantity={quantity} "
-                    f"emergency_flatten_order_id={order.orderId} "
-                    f"submit_reservation_id={reservation_id} "
-                    f"reserved_order_id={order.orderId} "
-                    f"broker_write_exception={exc} "
-                    "broker_submission_uncertain=True "
-                    "retry_allowed=False "
-                    "retry_evidence=missing "
-                    f"reason=flatten_order_submit_uncertain:{exc} "
-                    "operator_action_required=True "
-                    "decision=preserve_active_lock"
-                )
-                return {
-                    "ok": False,
-                    "reason": f"flatten_order_submit_failed:{exc}",
-                    "flat_confirmed": False,
-                }
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    record["protective_emergency_status"] = "flatten_order_submitted"
-                    record["emergency_flatten_last_status"] = "Submitted"
-                    record["emergency_flatten_submitted_at"] = datetime.now(timezone.utc)
-                    record["state"] = "BROKER_ACK_PENDING"
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_ORDER_SUBMITTED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"flatten_action={action} "
-                f"flatten_quantity={quantity} "
-                f"emergency_flatten_order_id={order.orderId} "
-                f"position_qty_before={position_qty} "
-                f"previous_emergency_order_id={previous_emergency_order_id} "
-                f"conflicting_order_ids_cancel_requested={conflicting_order_ids} "
-                f"reason={reason_label} "
-                "protective_emergency_active=True "
-                "protective_emergency_status=flatten_order_submitted "
-                "idempotency_decision=submit_new_order "
-                "decision=offset_actual_broker_position_with_mkt_order"
-            )
-
-            self.broker_write_sleep(
-                PROTECTIVE_SL_MISSING_RECHECK_SECONDS,
-                caller="protective_emergency_flatten",
-                reason_label=f"{reason_label}:post_mkt_recheck_wait",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-
-            try:
-                post_qty = read_position_qty(f"attempt_{attempt}:post_mkt_position_recheck")
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_POSITION_RECHECK | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"broker_position_qty={post_qty} "
-                f"position_qty_before={position_qty} "
-                f"position_qty_after={post_qty} "
-                f"flatten_action={action} "
-                f"flatten_quantity={quantity} "
-                f"emergency_flatten_order_id={order.orderId} "
-                f"reason={reason_label} "
-                "decision=post_mkt_flatten_position_check"
-            )
-
-            if post_qty == 0.0:
-                return confirm_flat(post_qty, "flat_confirmed_after_mkt_flatten")
-
-            try:
-                post_submit_snapshot = self.read_protective_emergency_broker_snapshot(
-                    symbol,
-                    f"{reason_label}:attempt_{attempt}:post_submit_inflight_snapshot",
-                    trade_id=trade_id,
-                )
-            except Exception as exc:
-                return mark_broker_read_failed(exc)
-            with self.trade_analysis_lock:
-                live_record = dict(self.trade_analysis.get(trade_id) or {})
-            post_submit_state = self.get_emergency_flatten_inflight_state(
-                live_record,
-                post_submit_snapshot,
-            )
-            if post_submit_state.get("order_inflight") or not post_submit_state.get("order_terminal"):
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is not None:
-                        record["protective_emergency_active"] = True
-                        record["protective_emergency_status"] = "pending_position_confirmation"
-                        record["state"] = "BROKER_ACK_PENDING"
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_BLOCKED_INFLIGHT | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"attempt={attempt} "
-                    f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                    f"emergency_flatten_order_id={post_submit_state.get('emergency_order_id')} "
-                    f"emergency_flatten_perm_id={post_submit_state.get('emergency_perm_id')} "
-                    f"emergency_flatten_last_status={post_submit_state.get('emergency_status')} "
-                    f"position_qty_after={post_qty} "
-                    f"inflight_grace_seconds={PROTECTIVE_EMERGENCY_FLATTEN_INFLIGHT_GRACE_SECONDS} "
-                    f"submitted_age_sec={post_submit_state.get('submitted_age_sec')} "
-                    f"reserved_age_sec={post_submit_state.get('reserved_age_sec')} "
-                    "safe_to_submit_new_flatten=False "
-                    "idempotency_decision=block_retry_existing_order_inflight "
-                    f"reason={post_submit_state.get('reason')} "
-                    "operator_action_required=False"
-                )
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_EVIDENCE_MISSING | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"emergency_flatten_order_id={post_submit_state.get('emergency_order_id')} "
-                    f"emergency_flatten_last_status={post_submit_state.get('emergency_status')} "
-                    f"broker_position_qty={post_qty} "
-                    "retry_allowed=False "
-                    "retry_evidence=missing_terminal_non_fill_or_reconciliation "
-                    f"reason={post_submit_state.get('reason')} "
-                    "operator_action_required=False"
-                )
-                return {
-                    "ok": True,
-                    "reason": "pending_position_confirmation",
-                    "flat_confirmed": False,
-                    "pending": True,
-                }
-
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_ALLOWED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"attempt={attempt} "
-                f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-                f"emergency_flatten_order_id={post_submit_state.get('emergency_order_id')} "
-                f"emergency_flatten_last_status={post_submit_state.get('emergency_status')} "
-                f"position_qty_after={post_qty} "
-                "safe_to_submit_new_flatten=True "
-                "reason=previous_emergency_order_terminal_position_still_open"
-            )
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_RETRY_EVIDENCE_ACCEPTED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"emergency_flatten_order_id={post_submit_state.get('emergency_order_id')} "
-                f"emergency_flatten_last_status={post_submit_state.get('emergency_status')} "
-                f"broker_position_qty={post_qty} "
-                "retry_allowed=True "
-                "retry_evidence=terminal_non_fill_status "
-                "operator_action_required=False"
-            )
-
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is not None:
-                record["protective_emergency_active"] = True
-                record["protective_emergency_status"] = "failed_position_still_open"
-                record["protective_emergency_reason"] = reason_label
-                record["state"] = "BROKER_ACK_PENDING"
-
-        logger.critical(
-            "PROTECTIVE_EMERGENCY_FLATTEN_FAILED | "
-            f"trade_id={trade_id} "
-            f"symbol={symbol} "
-            f"reason={reason_label} "
-            f"max_attempts={PROTECTIVE_SL_MISSING_MAX_ATTEMPTS} "
-            "protective_emergency_active=True "
-            "protective_emergency_status=failed_position_still_open "
-            "operator_action_required=True "
-            "decision=preserve_active_lock_position_still_open"
-        )
-        return {
-            "ok": False,
-            "reason": "failed_position_still_open",
-            "flat_confirmed": False,
-        }
-
-    def classify_position_protection_context(self, record, broker_reality, broker_confirmation):
-        entry_realized = bool(
-            record and
-            (record.get("entry_filled") or self.has_realized_parent_entry(record))
-        )
-        position_match = bool(broker_reality and broker_reality.get("has_position_match"))
-        parent_visible = bool(broker_confirmation and broker_confirmation.get("parent_visible"))
-        tp_visible = bool(broker_confirmation and broker_confirmation.get("tp_visible"))
-        sl_visible = bool(broker_confirmation and broker_confirmation.get("sl_visible"))
-        quantity_coverage = self.assess_bracket_quantity_coverage(
-            record,
-            broker_confirmation=broker_confirmation,
-            broker_reality=broker_reality,
-        )
-        sl_coverage_ok = bool(quantity_coverage.get("protective_sl_coverage_ok"))
-
-        protection_class = "NO_POSITION_PROTECTION_CONTEXT"
-        target_state = None
-        reason = "no_realized_entry_or_no_position_match"
-
-        if entry_realized and position_match:
-            if sl_visible and tp_visible and sl_coverage_ok:
-                protection_class = "IN_POSITION_WITH_PROTECTIVE_EXITS"
-                target_state = "EXIT_WORKING"
-                reason = "parent_filled_position_open_tp_sl_visible"
-            elif sl_visible and sl_coverage_ok:
-                protection_class = "IN_POSITION_WITH_PRIMARY_SL_PROTECTION"
-                target_state = "EXIT_WORKING"
-                reason = "parent_filled_position_open_sl_visible_tp_missing"
-            elif sl_visible:
-                protection_class = "URGENT_RISK_STATE_SL_MISSING"
-                target_state = "BROKER_ACK_PENDING"
-                reason = quantity_coverage.get("quantity_mismatch_reason") or quantity_coverage.get("quantity_state")
-            elif tp_visible:
-                protection_class = "URGENT_RISK_STATE_SL_MISSING"
-                target_state = "BROKER_ACK_PENDING"
-                reason = "position_open_sl_missing_tp_visible"
-            else:
-                protection_class = "URGENT_RISK_STATE_UNPROTECTED_POSITION"
-                target_state = "BROKER_ACK_PENDING"
-                reason = "position_open_no_protective_exits_visible"
-
-        return {
-            "has_position_protection_context": entry_realized and position_match,
-            "entry_realized": entry_realized,
-            "position_match": position_match,
-            "parent_visible": parent_visible,
-            "tp_visible": tp_visible,
-            "sl_visible": sl_visible,
-            "sl_coverage_ok": sl_coverage_ok,
-            "sl_coverage_quantity": quantity_coverage.get("protective_sl_coverage"),
-            "required_sl_coverage": quantity_coverage.get("open_position_estimate"),
-            "quantity_state": quantity_coverage.get("quantity_state"),
-            "quantity_mismatch_reason": quantity_coverage.get("quantity_mismatch_reason"),
-            "protection_class": protection_class,
-            "target_state": target_state,
-            "reason": reason,
-        }
-
     def has_partial_entry_fill(self, record):
         cumulative_entry_quantity = float(record.get("cumulative_entry_quantity") or 0.0)
         intended_parent_quantity = self.get_original_parent_quantity(record)
@@ -11277,305 +6073,6 @@ class ScalpingBot:
             f"remaining_quantity={self.get_parent_remaining_quantity(record)} "
             f"timeout_sec={PARTIAL_ENTRY_TIMEOUT_SECONDS}"
         )
-
-    def get_time_exit_effective_exit_reason(self, record):
-        if (
-            record
-            and (
-                record.get("time_exit_reason") == TIME_EXIT_REASON
-                or record.get("emergency_flatten_reason") == TIME_EXIT_REASON
-            )
-        ):
-            return TIME_EXIT_REASON
-        return PROTECTIVE_EMERGENCY_EXIT_REASON
-
-    def arm_time_exit_on_entry_exposure(self, trade_id, record, fill_time=None):
-        if not TIME_EXIT_ENABLED or record.get("entry_exposure_started_at") is not None:
-            return
-
-        started_at = fill_time if isinstance(fill_time, datetime) else datetime.now(timezone.utc)
-        deadline_epoch = started_at.timestamp() + TIME_EXIT_AFTER_SECONDS
-        record["entry_exposure_started_at"] = started_at
-        record["time_exit_deadline_at"] = deadline_epoch
-        record["time_exit_status"] = "TIME_EXIT_ARMED"
-        record["time_exit_reason"] = TIME_EXIT_REASON
-
-        self.append_trade_event(
-            trade_id,
-            f"TIME EXIT ARMED timeout_sec={TIME_EXIT_AFTER_SECONDS} "
-            f"deadline_epoch={round(deadline_epoch, 3)}"
-        )
-        logger.warning(
-            "TIME_EXIT_ARMED | "
-            f"trade_id={trade_id} "
-            f"symbol={record.get('symbol')} "
-            f"side={record.get('side')} "
-            f"signal_id={record.get('signal_id')} "
-            f"entry_exposure_started_at={self.to_iso(started_at)} "
-            f"deadline_epoch={round(deadline_epoch, 3)} "
-            f"reason={TIME_EXIT_REASON}"
-        )
-
-    def process_time_exit_deadlines(self):
-        if not TIME_EXIT_ENABLED:
-            return
-
-        now_epoch = time.time()
-        now_dt = datetime.now(timezone.utc)
-        with self.trade_analysis_lock:
-            candidates = [
-                dict(record)
-                for record in self.trade_analysis.values()
-                if (
-                    not record.get("summary_logged")
-                    and not record.get("closed")
-                    and record.get("entry_exposure_started_at") is not None
-                    and record.get("time_exit_deadline_at") is not None
-                    and record.get("time_exit_status") in {
-                        "TIME_EXIT_ARMED",
-                        "TIME_EXIT_DUE",
-                        "TIME_EXIT_SUBMITTED",
-                        "TIME_EXIT_PENDING_CONFIRMATION",
-                    }
-                    and float(record.get("cumulative_entry_quantity") or 0.0) > float(record.get("cumulative_exit_quantity") or 0.0)
-                    and float(record.get("time_exit_deadline_at") or 0.0) <= now_epoch
-                )
-            ]
-
-        for record_snapshot in candidates:
-            trade_id = record_snapshot["trade_id"]
-            symbol = record_snapshot["symbol"]
-            side = record_snapshot.get("side")
-            signal_id = record_snapshot.get("signal_id")
-
-            with self.trade_analysis_lock:
-                live_record = self.trade_analysis.get(trade_id)
-                if live_record is None or live_record.get("summary_logged") or live_record.get("closed"):
-                    continue
-                if live_record.get("time_exit_status") == "TIME_EXIT_ARMED":
-                    live_record["time_exit_status"] = "TIME_EXIT_DUE"
-                    self.append_trade_event(
-                        trade_id,
-                        f"TIME EXIT DEADLINE REACHED deadline_epoch={live_record.get('time_exit_deadline_at')}"
-                    )
-            logger.warning(
-                "TIME_EXIT_DEADLINE_REACHED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"signal_id={signal_id} "
-                f"deadline_epoch={record_snapshot.get('time_exit_deadline_at')} "
-                f"now_epoch={round(now_epoch, 3)} "
-                f"reason={TIME_EXIT_REASON}"
-            )
-
-            try:
-                positions = self.broker_read_positions(
-                    caller="process_time_exit_deadlines",
-                    reason_label=TIME_EXIT_REASON,
-                    trade_id=trade_id,
-                    symbol=symbol,
-                    trade_analysis_lock_context="not_locked",
-                    failure_log_level="error",
-                )
-                broker_position_qty = self.get_position_quantity_from_positions(positions, symbol)
-            except Exception as exc:
-                with self.trade_analysis_lock:
-                    live_record = self.trade_analysis.get(trade_id)
-                    if live_record is not None:
-                        live_record["time_exit_status"] = "TIME_EXIT_FAILED_UNCERTAIN"
-                        live_record["time_exit_last_attempt_at"] = now_dt
-                        live_record["state"] = "BROKER_ACK_PENDING"
-                logger.critical(
-                    "TIME_EXIT_FAILED_UNCERTAIN | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"failure={exc} "
-                    "decision=preserve_active_lock_no_blind_flatten"
-                )
-                continue
-
-            logger.warning(
-                "TIME_EXIT_BROKER_REALITY | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"signal_id={signal_id} "
-                f"broker_position_qty={broker_position_qty} "
-                f"cumulative_entry_quantity={record_snapshot.get('cumulative_entry_quantity')} "
-                f"cumulative_exit_quantity={record_snapshot.get('cumulative_exit_quantity')} "
-                f"reason={TIME_EXIT_REASON}"
-            )
-
-            if broker_position_qty == 0.0:
-                finalized = False
-                with self.trade_analysis_lock:
-                    live_record = self.trade_analysis.get(trade_id)
-                    if live_record is not None:
-                        live_record["time_exit_status"] = "TIME_EXIT_BROKER_FLAT_CONFIRMED"
-                        live_record["time_exit_last_attempt_at"] = now_dt
-                logger.warning(
-                    "TIME_EXIT_FLATTEN_SUBMIT_SKIPPED | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    "broker_position_qty=0.0 "
-                    "time_exit_status=TIME_EXIT_BROKER_FLAT_CONFIRMED "
-                    "reason=broker_flat_before_time_exit_flatten"
-                )
-                self.finalize_trade_if_complete(trade_id)
-                with self.trade_analysis_lock:
-                    live_record = self.trade_analysis.get(trade_id)
-                    finalized = bool(live_record and live_record.get("summary_logged"))
-                    if live_record is not None and finalized:
-                        live_record["time_exit_status"] = "TIME_EXIT_COMPLETED"
-                        live_record["time_exit_completed_at"] = live_record.get("time_exit_completed_at") or now_dt
-                logger.warning(
-                    "TIME_EXIT_BROKER_FLAT_FINALIZE_CHECK | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"finalized={finalized} "
-                    f"time_exit_status={'TIME_EXIT_COMPLETED' if finalized else 'TIME_EXIT_BROKER_FLAT_CONFIRMED'}"
-                )
-                continue
-
-            with self.trade_analysis_lock:
-                live_record = self.trade_analysis.get(trade_id)
-                if live_record is None:
-                    continue
-                if (
-                    live_record.get("time_exit_order_id") is not None
-                    or live_record.get("emergency_flatten_order_id") is not None
-                    or live_record.get("time_exit_status") in {"TIME_EXIT_SUBMITTED", "TIME_EXIT_PENDING_CONFIRMATION"}
-                ):
-                    live_record["time_exit_status"] = "TIME_EXIT_PENDING_CONFIRMATION"
-                    live_record["state"] = "BROKER_ACK_PENDING"
-                    existing_order_id = live_record.get("time_exit_order_id") or live_record.get("emergency_flatten_order_id")
-                    logger.warning(
-                        "TIME_EXIT_FLATTEN_SUBMIT_SKIPPED | "
-                        f"trade_id={trade_id} "
-                        f"symbol={symbol} "
-                        f"side={side} "
-                        f"signal_id={signal_id} "
-                        f"existing_time_exit_order_id={existing_order_id} "
-                        "reason=time_exit_flatten_already_inflight"
-                    )
-                    continue
-                if int(live_record.get("time_exit_attempt_count") or 0) >= TIME_EXIT_MAX_ATTEMPTS:
-                    live_record["time_exit_status"] = "TIME_EXIT_FAILED_UNCERTAIN"
-                    live_record["state"] = "BROKER_ACK_PENDING"
-                    logger.critical(
-                        "TIME_EXIT_FAILED_UNCERTAIN | "
-                        f"trade_id={trade_id} "
-                        f"symbol={symbol} "
-                        f"side={side} "
-                        f"signal_id={signal_id} "
-                        f"attempt_count={live_record.get('time_exit_attempt_count')} "
-                        f"max_attempts={TIME_EXIT_MAX_ATTEMPTS} "
-                        "decision=preserve_active_lock_max_attempts_reached"
-                    )
-                    continue
-                live_record["time_exit_attempt_count"] = int(live_record.get("time_exit_attempt_count") or 0) + 1
-                live_record["time_exit_last_attempt_at"] = now_dt
-                live_record["time_exit_status"] = "TIME_EXIT_SUBMITTED"
-                attempt_count = live_record["time_exit_attempt_count"]
-
-            logger.warning(
-                "TIME_EXIT_CHILD_CANCEL_REQUESTED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"signal_id={signal_id} "
-                f"attempt={attempt_count} "
-                "policy=reuse_protective_emergency_flatten_cleanup "
-                "sequence=cancel_known_bot_owned_orders_then_recheck_then_market_flatten "
-                f"reason={TIME_EXIT_REASON}"
-            )
-            result = self.emergency_flatten_unprotected_position(
-                trade_id,
-                symbol,
-                TIME_EXIT_REASON,
-                protection_context={
-                    "protection_class": "TIME_EXIT_MAX_DURATION",
-                    "time_exit": True,
-                },
-            )
-
-            with self.trade_analysis_lock:
-                live_record = self.trade_analysis.get(trade_id)
-                time_exit_order_id = None
-                if live_record is not None:
-                    live_record["time_exit_order_id"] = live_record.get("emergency_flatten_order_id")
-                    time_exit_order_id = live_record.get("time_exit_order_id")
-                    if result.get("flat_confirmed"):
-                        live_record["time_exit_status"] = "TIME_EXIT_BROKER_FLAT_CONFIRMED"
-                    elif result.get("pending") or result.get("ok"):
-                        live_record["time_exit_status"] = "TIME_EXIT_PENDING_CONFIRMATION"
-                    else:
-                        live_record["time_exit_status"] = "TIME_EXIT_FAILED_UNCERTAIN"
-                        live_record["state"] = "BROKER_ACK_PENDING"
-
-            if result.get("flat_confirmed"):
-                logger.warning(
-                    "TIME_EXIT_BROKER_FLAT_CONFIRMED | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"broker_position_qty={broker_position_qty} "
-                    f"reason={result.get('reason')}"
-                )
-                self.finalize_trade_if_complete(trade_id)
-                with self.trade_analysis_lock:
-                    live_record = self.trade_analysis.get(trade_id)
-                    finalized = bool(live_record and live_record.get("summary_logged"))
-                    if live_record is not None and finalized:
-                        live_record["time_exit_status"] = "TIME_EXIT_COMPLETED"
-                        live_record["time_exit_completed_at"] = live_record.get("time_exit_completed_at") or datetime.now(timezone.utc)
-                logger.warning(
-                    "TIME_EXIT_FINALIZE_CHECK | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"finalized={finalized} "
-                    f"time_exit_status={'TIME_EXIT_COMPLETED' if finalized else 'TIME_EXIT_BROKER_FLAT_CONFIRMED'}"
-                )
-            elif result.get("pending") or result.get("ok"):
-                logger.warning(
-                    "TIME_EXIT_FLATTEN_SUBMITTED | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"time_exit_order_id={time_exit_order_id} "
-                    f"broker_position_qty_before={broker_position_qty} "
-                    f"reason={TIME_EXIT_REASON}"
-                )
-                logger.warning(
-                    "TIME_EXIT_PENDING_CONFIRMATION | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"time_exit_order_id={time_exit_order_id} "
-                    f"reason={result.get('reason')}"
-                )
-            else:
-                logger.critical(
-                    "TIME_EXIT_FAILED_UNCERTAIN | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"side={side} "
-                    f"signal_id={signal_id} "
-                    f"reason={result.get('reason')} "
-                    "decision=preserve_active_lock"
-                )
 
     def clear_partial_entry_timeout(self, record):
         record["partial_entry_timeout_started_at"] = None
@@ -12035,16 +6532,9 @@ class ScalpingBot:
             if self.is_exit_fully_filled(record) and record["exit_fill_price"] is not None:
                 if record["realized_entry_quantity"] is None:
                     record["realized_entry_quantity"] = self.get_lifecycle_entry_quantity(record)
-                if record.get("exit_reason") not in {PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON}:
-                    record["exit_reason"] = self.derive_completed_exit_reason(record)
-                ready = record["exit_reason"] in ("TP", "SL", "MIXED_EXIT", PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON)
-            elif record["entry_filled"] and record["exit_fill_price"] is not None and record["exit_reason"] in ("TP", "SL", "MIXED_EXIT", PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON):
-                ready = True
-            elif (
-                record.get("closed")
-                and record.get("exit_reason") in {PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON}
-                and record.get("execution_validation_status") == "broker_flat_confirmed_exit_fill_details_incomplete"
-            ):
+                record["exit_reason"] = self.derive_completed_exit_reason(record)
+                ready = record["exit_reason"] in ("TP", "SL", "MIXED_EXIT")
+            elif record["entry_filled"] and record["exit_fill_price"] is not None and record["exit_reason"] in ("TP", "SL", "MIXED_EXIT"):
                 ready = True
             elif record["state"] == "INCOMPLETE":
                 ready = True
@@ -12235,20 +6725,11 @@ class ScalpingBot:
             )
 
             exit_complete = self.is_exit_fully_filled(record) and record["exit_fill_price"] is not None
-            emergency_flat_incomplete_details = bool(
-                record.get("closed")
-                and record.get("exit_reason") in {PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON}
-                and record.get("execution_validation_status") == "broker_flat_confirmed_exit_fill_details_incomplete"
-            )
 
-            if exit_complete or emergency_flat_incomplete_details:
+            if exit_complete:
                 if not record["entry_filled"]:
                     self.append_anomaly(trade_id, "ENTRY_PARTIAL_LIFECYCLE_CLOSED")
-                if (
-                    exit_complete
-                    and record.get("execution_validation_status") != "broker_reconciled_flat"
-                    and record.get("execution_validation_status") != "broker_flat_confirmed_exit_fill_details_incomplete"
-                ):
+                if record.get("execution_validation_status") != "broker_reconciled_flat":
                     self.set_execution_validation_status(
                         trade_id,
                         "exit_complete",
@@ -12258,16 +6739,6 @@ class ScalpingBot:
                     (trade_id, dict(record), "FINALIZE_EXIT_COMPLETE")
                 )
                 record["closed"] = True
-                if record.get("exit_reason") in {PROTECTIVE_EMERGENCY_EXIT_REASON, TIME_EXIT_REASON}:
-                    record["protective_emergency_active"] = False
-                    record["protective_emergency_status"] = (
-                        "flat_confirmed_exit_fill_details_incomplete"
-                        if emergency_flat_incomplete_details
-                        else "flat_confirmed_stale_orders_cleared"
-                    )
-                    if record.get("exit_reason") == TIME_EXIT_REASON:
-                        record["time_exit_status"] = "TIME_EXIT_COMPLETED"
-                        record["time_exit_completed_at"] = record.get("time_exit_completed_at") or datetime.now(timezone.utc)
                 self.log_lifecycle_mutation_context(
                     mutation_point="finalize_trade_close",
                     reason_label="exit_complete",
@@ -12277,7 +6748,7 @@ class ScalpingBot:
                     next_state="CLOSED",
                 )
                 record["state"] = "CLOSED"
-                record["gross_pnl"] = 0.0 if emergency_flat_incomplete_details else self.calculate_gross_pnl(record)
+                record["gross_pnl"] = self.calculate_gross_pnl(record)
                 record["net_pnl"] = round(record["gross_pnl"] - record["commission"], 2)
                 self.aggregate_stats["closed_trades"] += 1
                 self.aggregate_stats["gross_pnl"] = round(self.aggregate_stats["gross_pnl"] + record["gross_pnl"], 2)
@@ -12306,20 +6777,6 @@ class ScalpingBot:
                         )
                 elif record["exit_reason"] == "MIXED_EXIT":
                     self.aggregate_stats["mixed_exit_count"] += 1
-                elif record["exit_reason"] == PROTECTIVE_EMERGENCY_EXIT_REASON:
-                    self.aggregate_stats["emergency_flatten_count"] = (
-                        self.aggregate_stats.get("emergency_flatten_count", 0) + 1
-                    )
-                    symbol_bucket["emergency_flatten_count"] = (
-                        symbol_bucket.get("emergency_flatten_count", 0) + 1
-                    )
-                elif record["exit_reason"] == TIME_EXIT_REASON:
-                    self.aggregate_stats["time_exit_count"] = (
-                        self.aggregate_stats.get("time_exit_count", 0) + 1
-                    )
-                    symbol_bucket["time_exit_count"] = (
-                        symbol_bucket.get("time_exit_count", 0) + 1
-                    )
 
                 paper_sl_component_present = (
                     record["exit_reason"] == "SL"
@@ -12362,8 +6819,6 @@ class ScalpingBot:
 
             if exit_complete:
                 finalize_decision = "summarize_exit_complete"
-            elif emergency_flat_incomplete_details:
-                finalize_decision = "summarize_emergency_flat_fill_details_incomplete"
             elif record["state"] == "INCOMPLETE":
                 finalize_decision = "summarize_incomplete"
             elif record["state"] in {"CANCELLED", "REJECTED"}:
@@ -12378,10 +6833,6 @@ class ScalpingBot:
                 f"state_before_finalize={record.get('state')} "
                 f"ready={ready} "
                 f"exit_complete={exit_complete} "
-                f"emergency_flatten={record.get('exit_reason') == PROTECTIVE_EMERGENCY_EXIT_REASON} "
-                f"fill_details_complete={record.get('exit_fill_price') is not None} "
-                f"broker_flat_confirmed={record.get('closed') and record.get('exit_reason') == PROTECTIVE_EMERGENCY_EXIT_REASON} "
-                f"stale_bot_orders_cleared={record.get('protective_emergency_status') in {'flat_confirmed_stale_orders_cleared', 'flat_confirmed_exit_fill_details_incomplete'}} "
                 f"broker_real={broker_reality['broker_real']} "
                 f"release_override={release_override} "
                 f"entry_filled={record.get('entry_filled')} "
@@ -12458,10 +6909,6 @@ class ScalpingBot:
                 f"target={record['target_price']} "
                 f"exit_fill={record['exit_fill_price']} "
                 f"exit_reason={record['exit_reason']} "
-                f"emergency_flatten={record.get('exit_reason') == PROTECTIVE_EMERGENCY_EXIT_REASON} "
-                f"fill_details_complete={record.get('exit_fill_price') is not None} "
-                f"broker_flat_confirmed={record.get('closed') and record.get('exit_reason') == PROTECTIVE_EMERGENCY_EXIT_REASON} "
-                f"stale_bot_orders_cleared={record.get('protective_emergency_status') in {'flat_confirmed_stale_orders_cleared', 'flat_confirmed_exit_fill_details_incomplete'}} "
                 f"gross_pnl={record['gross_pnl']} "
                 f"commission={record['commission']} "
                 f"net_pnl={record['net_pnl']} "
@@ -12531,7 +6978,6 @@ class ScalpingBot:
                 f"shadow_test_tp_count={self.aggregate_stats['shadow_test_tp_count']} "
                 f"shadow_test_sl_count={self.aggregate_stats['shadow_test_sl_count']} "
                 f"shadow_test_incomplete_count={self.aggregate_stats['shadow_test_incomplete_count']} "
-                f"emergency_flatten_count={self.aggregate_stats.get('emergency_flatten_count', 0)} "
                 f"gross_pnl={self.aggregate_stats['gross_pnl']} "
                 f"commission={self.aggregate_stats['commission']} "
                 f"net_pnl={self.aggregate_stats['net_pnl']} "
@@ -12557,29 +7003,6 @@ class ScalpingBot:
 
             trade_id, record = self.get_trade_by_order_id(order_id)
             if record is None:
-                trade_id, record = self.get_trade_by_emergency_flatten_perm_id(getattr(execution, "permId", None))
-            if record is None:
-                return
-
-            identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(record, execution)
-            if not identity_ok:
-                self.log_broker_fill_without_lifecycle_event(
-                    trade_id,
-                    identity_reason,
-                    "fill_callback_rejected_by_order_ref_identity_gate",
-                    fill=fill,
-                    execution=execution,
-                    contract=getattr(fill, "contract", None),
-                )
-                if identity_reason == "foreign_run_id":
-                    self.log_order_ref_match_decision(
-                        "BROKER_FILL_ORPHANED_BY_RUN_ID_MISMATCH",
-                        record,
-                        parsed_order_ref,
-                        identity_reason,
-                        execution=execution,
-                        decision="reject_current_lifecycle_match",
-                    )
                 return
 
             should_process, execution_identity = self.should_process_execution(execution, fill_time)
@@ -12597,15 +7020,6 @@ class ScalpingBot:
             exec_id = getattr(execution, "execId", None) or execution_identity
             leg = self.map_order_leg(record, order_id)
             perm_id = getattr(execution, "permId", None) or self.get_record_order_perm_id(record, order_id)
-            emergency_flatten_fill_match = (
-                order_id == record.get("emergency_flatten_order_id")
-                or (
-                    perm_id not in (None, 0)
-                    and perm_id == record.get("emergency_flatten_perm_id")
-                )
-            )
-            if emergency_flatten_fill_match:
-                leg = "EMERGENCY_FLATTEN_EXIT"
 
             self.append_trade_event(
                 trade_id,
@@ -12654,8 +7068,6 @@ class ScalpingBot:
                         callback_fill_time,
                     )
                     self.log_fill_timing(record, fill_time)
-                    if previous_cumulative_entry_quantity <= 0 and float(record.get("cumulative_entry_quantity") or 0.0) > 0:
-                        self.arm_time_exit_on_entry_exposure(trade_id, record, fill_time)
                     if previous_cumulative_entry_quantity <= 0:
                         logger.info(
                             "ENTRY FILL STARTED | "
@@ -13018,79 +7430,6 @@ class ScalpingBot:
                         f"tp_exit_quantity={exit_log_snapshot['tp_exit_quantity']} sl_exit_quantity={exit_log_snapshot['sl_exit_quantity']} "
                         f"exit_fill_price={exit_log_snapshot['exit_fill_price']}"
                     )
-            elif emergency_flatten_fill_match:
-                with self.trade_analysis_lock:
-                    record = self.trade_analysis.get(trade_id)
-                    if record is None:
-                        return
-
-                    record["exit_fill_time"] = fill_time
-                    self.accumulate_quantity_and_notional(
-                        record,
-                        "cumulative_exit_quantity",
-                        "cumulative_exit_notional",
-                        "exit_fill_price",
-                        realized_quantity,
-                        price,
-                    )
-                    self.accumulate_quantity_and_notional(
-                        record,
-                        "emergency_flatten_exit_quantity",
-                        "emergency_flatten_exit_notional",
-                        "emergency_flatten_exit_fill_price",
-                        realized_quantity,
-                        price,
-                    )
-                    record["realized_exit_quantity"] = float(record.get("cumulative_exit_quantity") or 0.0)
-                    record["exit_reason"] = self.get_time_exit_effective_exit_reason(record)
-                    record["protective_emergency_status"] = "flatten_fill_observed"
-                    if record["exit_reason"] == TIME_EXIT_REASON:
-                        record["time_exit_status"] = "TIME_EXIT_PENDING_CONFIRMATION"
-                        record["time_exit_order_id"] = record.get("emergency_flatten_order_id")
-                    if not record.get("closed"):
-                        record["state"] = "BROKER_ACK_PENDING"
-                    self.log_fill_event(
-                        record,
-                        order_id,
-                        perm_id,
-                        exec_id,
-                        leg,
-                        getattr(execution, "side", None),
-                        price,
-                        realized_quantity,
-                        fill_time,
-                        callback_fill_time,
-                    )
-                    self.log_fill_timing(record, fill_time)
-                    self.append_trade_event(
-                        trade_id,
-                        f"PROTECTIVE/TIME EXIT FLATTEN FILL quantity={realized_quantity} "
-                        f"price={price} cumulative_exit_quantity={record.get('cumulative_exit_quantity')}"
-                    )
-                    emergency_fill_snapshot = {
-                        "cumulative_exit_quantity": record.get("cumulative_exit_quantity"),
-                        "realized_exit_quantity": record.get("realized_exit_quantity"),
-                        "exit_fill_price": record.get("exit_fill_price"),
-                        "protective_emergency_status": record.get("protective_emergency_status"),
-                    }
-
-                logger.critical(
-                    "PROTECTIVE_EMERGENCY_FLATTEN_FILL | "
-                    f"trade_id={trade_id} "
-                    f"symbol={record.get('symbol')} "
-                    f"order_id={order_id} "
-                    f"perm_id={perm_id} "
-                    f"exec_id={exec_id} "
-                    f"leg=emergency_flatten_exit "
-                    f"quantity={realized_quantity} "
-                    f"price={price} "
-                    f"cumulative_exit_quantity={emergency_fill_snapshot['cumulative_exit_quantity']} "
-                    f"realized_exit_quantity={emergency_fill_snapshot['realized_exit_quantity']} "
-                    f"exit_fill_price={emergency_fill_snapshot['exit_fill_price']} "
-                    f"protective_emergency_status={emergency_fill_snapshot['protective_emergency_status']} "
-                        f"exit_reason={self.get_time_exit_effective_exit_reason(record)} "
-                        "decision=map_emergency_flatten_fill_as_exit"
-                )
 
             if mixed_exit_detected:
                 logger.warning(
@@ -13253,7 +7592,6 @@ class ScalpingBot:
                     reason_label="partial_entry_remainder_cancel",
                     trade_id=trade_id,
                     symbol=record_snapshot.get("symbol") if isinstance(record_snapshot, dict) else None,
-                    real_broker_exposure=True,
                 )
                 return True, "cancelled_via_open_trade"
 
@@ -13269,7 +7607,6 @@ class ScalpingBot:
                     reason_label="partial_entry_remainder_cancel",
                     trade_id=trade_id,
                     symbol=record_snapshot.get("symbol") if isinstance(record_snapshot, dict) else None,
-                    real_broker_exposure=True,
                 )
                 return True, "cancelled_via_open_order"
         except Exception as exc:
@@ -14074,16 +8411,7 @@ class ScalpingBot:
                 )
 
             if error_code == 202 and record["state"] in ACTIVE_TRADE_STATES:
-                if self.is_current_broker_io_owner_context("update_trade_from_error"):
-                    self.get_active_trade_candidates("ERROR_202_CANCEL_CLEANUP")
-                else:
-                    self.enqueue_broker_system_job(
-                        "BROKER_REALITY_RECONCILIATION",
-                        "ERROR_202_CANCEL_CLEANUP",
-                        symbol=record.get("symbol"),
-                        force=False,
-                        include_active_candidate_check=True,
-                    )
+                self.get_active_trade_candidates("ERROR_202_CANCEL_CLEANUP")
         except Exception:
             logger.exception("TRADE ERROR ANALYSIS FAILED")
 
@@ -14108,14 +8436,23 @@ class ScalpingBot:
             self.connectivity_last_error_message = error_string
             logger.warning("CONNECTIVITY RESTORED")
             if self.connectivity_reconciliation_required:
-                logger.warning("CONNECTIVITY RESTORED RECONCILIATION QUEUED")
-                self.enqueue_broker_system_job(
-                    "BROKER_REALITY_RECONCILIATION",
-                    "connectivity_restore_reconciliation",
-                    force=False,
-                    include_active_candidate_check=True,
-                    connectivity_restore_complete=True,
-                )
+                logger.warning("CONNECTIVITY RESTORED RECONCILIATION START")
+                try:
+                    self.post_reconnect_fill_reconstruction_sweep(
+                        "connectivity_restore_reconciliation",
+                        since_time=self.get_reconnect_fill_reconstruction_since(),
+                    )
+                    self.get_active_trade_candidates("CONNECTIVITY_RESTORE_RECONCILIATION")
+                except Exception:
+                    self.connectivity_uncertain = True
+                    self.connectivity_reconciliation_required = True
+                    logger.exception("CONNECTIVITY RESTORED RECONCILIATION FAILED")
+                else:
+                    self.connectivity_uncertain = False
+                    self.connectivity_reconciliation_required = False
+                    self.connectivity_reconciliation_completed_at = now_dt
+                    self.connectivity_reconstruction_anchor_since = None
+                    logger.warning("CONNECTIVITY RESTORED RECONCILIATION COMPLETE")
             return True
 
         return False
@@ -14929,10 +9266,7 @@ class ScalpingBot:
             )
         }
 
-        logger.info(
-            f"RAW PAYLOAD RECEIVED | "
-            f"{json.dumps(redact_sensitive_payload(normalized['raw_payload']), sort_keys=True)}"
-        )
+        logger.info(f"RAW PAYLOAD RECEIVED | {json.dumps(normalized['raw_payload'], sort_keys=True)}")
         logger.info(f"PINE_OBSERVATIONS | {json.dumps(normalized['bot_observations'], sort_keys=True)}")
         logger.info(f"PINE_WEAK_TRANSITION_HINTS | {json.dumps(normalized['weak_transition_hints'], sort_keys=True)}")
         logger.info(f"PINE_SEMANTIC_NON_AUTHORITY | {json.dumps(normalized['pine_semantic_non_authority'], sort_keys=True)}")
@@ -16396,11 +10730,7 @@ class ScalpingBot:
 
     def update_session_health(self):
         try:
-            socket_connected = self.broker_read_is_connected(
-                caller="update_session_health",
-                reason_label="session_health_check",
-                failure_log_level="info",
-            )
+            socket_connected = self.ib.isConnected()
             initialization_complete = (
                 socket_connected and
                 self.next_order_id is not None and
@@ -16409,15 +10739,8 @@ class ScalpingBot:
             )
 
             self.session_socket_connected = socket_connected
-            self.session_initialized = (
-                initialization_complete
-                and not self.session_initialization_failed
-            )
-            self.session_healthy = (
-                socket_connected
-                and initialization_complete
-                and not self.session_initialization_failed
-            )
+            self.session_initialized = initialization_complete
+            self.session_healthy = socket_connected and initialization_complete
         except Exception:
             self.session_socket_connected = False
             self.session_initialized = False
@@ -16429,56 +10752,16 @@ class ScalpingBot:
             f"socket_connected={self.session_socket_connected} "
             f"initialized={self.session_initialized} "
             f"healthy={self.session_healthy} "
-            f"initialization_failed={self.session_initialization_failed} "
-            f"initialization_failure_reason={self.session_initialization_failure_reason} "
             f"reconnect_count={self.session_reconnect_count} "
             f"order_id={self.next_order_id} "
             f"contract_cache_size={len(self.contract_cache)} "
             f"events_attached={self.events_attached}"
         )
 
-    def mark_session_initialization_failed(self, reason):
-        reason_text = str(reason or "session_initialization_failed")
-        self.session_initialization_failed = True
-        self.session_initialization_failure_reason = reason_text
-        self.session_initialized = False
-        self.session_healthy = False
-        self.startup_reconciliation_completed = False
-        self.startup_reconciliation_status = "blocked"
-        self.startup_reconciliation_block_reason = reason_text
-        self.external_entries_blocked_reason = reason_text
-        logger.critical(
-            "SESSION_INITIALIZATION_FAILED | "
-            f"reason={reason_text} "
-            "decision=fail_closed_external_entries_blocked"
-        )
-
-    def clear_session_initialization_failure(self, reason_label):
-        if not self.session_initialization_failed:
-            return
-        logger.warning(
-            "SESSION_INITIALIZATION_FAILURE_CLEARED | "
-            f"previous_reason={self.session_initialization_failure_reason} "
-            f"reason={reason_label}"
-        )
-        self.session_initialization_failed = False
-        self.session_initialization_failure_reason = None
-
-    def is_unresolved_contract_qualification_failure(self):
-        return (
-            self.session_initialization_failed
-            and str(self.session_initialization_failure_reason or "").startswith(
-                "contract_qualification_failed"
-            )
-        )
-
     def ensure_order_id_initialized(self):
         with self.order_id_lock:
             if self.next_order_id is None:
-                self.next_order_id = self.broker_get_req_id(
-                    caller="connect_ib",
-                    reason_label="ensure_order_id_initialized",
-                )
+                self.next_order_id = self.ib.client.getReqId()
                 logger.info(f"ORDER ID INITIALIZED | next_order_id={self.next_order_id}")
             else:
                 logger.info(f"ORDER ID AVAILABLE | next_order_id={self.next_order_id}")
@@ -16524,12 +10807,30 @@ class ScalpingBot:
             logger.info(f"FILL: {fill}")
 
             self.update_trade_from_fill(fill)
-            self.enqueue_broker_system_job(
-                "BROKER_REALITY_RECONCILIATION",
-                "post_exec_position_flat_check",
-                force=False,
-                check_flat_positions=True,
-            )
+
+            try:
+                positions = self.broker_read_positions(
+                    caller="on_exec",
+                    reason_label="post_exec_position_flat_check",
+                    trade_id=None,
+                    symbol=None,
+                    trade_analysis_lock_context="not_locked",
+                    failure_log_level="info",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "BROKER CALLBACK READ FAILED | "
+                    "caller=on_exec "
+                    "broker_call=positions "
+                    "reason_label=post_exec_position_flat_check "
+                    f"failure={exc} "
+                    "decision=defer_to_worker_reconciliation"
+                )
+                return
+            if not any(p.position != 0 for p in positions):
+                # Legacy status mirroring only; authoritative safety uses trade_analysis/broker reality.
+                self.trade_state = "IDLE"
+                logger.info("→ IDLE")
 
         def on_open_order(trade):
             self.log_open_order_event_observability(trade)
@@ -16605,7 +10906,6 @@ class ScalpingBot:
 
     def qualify_contracts(self):
         logger.info("QUALIFY CONTRACTS")
-        failed_symbols = []
 
         for sym in QUALIFIED_FUTURE_SYMBOLS:
             if sym in RUNTIME_DISABLED_SYMBOLS:
@@ -16637,18 +10937,8 @@ class ScalpingBot:
                 self.contract_min_ticks[sym] = float(getattr(detail, "minTick", spec["tick_size"]))
 
                 logger.info(f"{sym} → {contract.lastTradeDateOrContractMonth}")
-            except Exception as exc:
-                failed_symbols.append(sym)
-                logger.exception(
-                    "CONTRACT QUALIFICATION FAILED | "
-                    f"symbol={sym} "
-                    f"reason={exc}"
-                )
-
-        if failed_symbols:
-            raise RuntimeError(
-                "contract_qualification_failed:" + ",".join(failed_symbols)
-            )
+            except Exception:
+                logger.exception(f"FAILED {sym}")
 
     def ensure_contract_cache_initialized(self):
         if self.is_baseline_contract_cache_ready():
@@ -16676,29 +10966,21 @@ class ScalpingBot:
             if self.session_recovery_in_progress:
                 logger.warning(
                     "FORCED RECOVERY SKIPPED | already in progress | "
-                    f"reason={reason_label} | socket_connected={self.session_socket_connected} | "
+                    f"reason={reason_label} | socket_connected={self.ib.isConnected()} | "
                     f"session_healthy={self.session_healthy} session_initialized={self.session_initialized}"
                 )
                 return
 
             self.session_recovery_in_progress = True
             try:
-                if self.broker_read_is_connected(
-                    caller="reconnect_recovery",
-                    reason_label=f"{reason_label}:forced_recovery_socket_check",
-                    failure_log_level="info",
-                ):
+                if self.ib.isConnected():
                     self.attach_ib_events(force_reset=True)
                     self.ensure_order_id_initialized()
                     self.ensure_contract_cache_initialized()
                     self.update_session_health()
 
                     postfailure = []
-                    if not self.broker_read_is_connected(
-                        caller="reconnect_recovery",
-                        reason_label=f"{reason_label}:forced_recovery_postcheck",
-                        failure_log_level="info",
-                    ):
+                    if not self.ib.isConnected():
                         postfailure.append("socket_disconnected")
                     if self.next_order_id is None:
                         postfailure.append("missing_next_order_id")
@@ -16741,11 +11023,7 @@ class ScalpingBot:
                 self.log_session_health("CONNECT SKIPPED (SESSION_HEALTHY_RECHECK)")
                 return
 
-            socket_connected = self.broker_read_is_connected(
-                caller="connect_ib",
-                reason_label="connect_socket_precheck",
-                failure_log_level="info",
-            )
+            socket_connected = self.ib.isConnected()
 
             if not socket_connected:
                 logger.info("CONNECTING TO IBKR")
@@ -16765,11 +11043,7 @@ class ScalpingBot:
                     self.log_session_health("CONNECT FAILED")
                     raise
 
-                if not self.broker_read_is_connected(
-                    caller="connect_ib",
-                    reason_label="connect_socket_postcheck",
-                    failure_log_level="info",
-                ):
+                if not self.ib.isConnected():
                     logger.error("CONNECTION CHECK FAILED")
                     self.update_session_health()
                     self.log_session_health("CONNECT CHECK FAILED")
@@ -16790,27 +11064,15 @@ class ScalpingBot:
 
             if not self.is_baseline_contract_cache_ready():
                 logger.info("ENSURING CONTRACT QUALIFICATION")
-                try:
-                    self.qualify_contracts()
-                except Exception as exc:
-                    self.mark_session_initialization_failed(str(exc))
-                    self.update_session_health()
-                    self.log_session_health("CONNECT FAILED CONTRACT QUALIFICATION")
-                    raise
+                self.qualify_contracts()
             else:
                 logger.info(f"CONTRACT CACHE BASELINE READY | size={len(self.contract_cache)}")
 
-            self.clear_session_initialization_failure("connect_ib_contracts_ready")
             self.update_session_health()
             self.log_session_health("CONNECT COMPLETE")
 
             if not self.session_healthy:
-                reason = (
-                    self.session_initialization_failure_reason
-                    or "IBKR session initialization incomplete after connect_ib"
-                )
-                self.mark_session_initialization_failed(reason)
-                raise RuntimeError(reason)
+                raise RuntimeError("IBKR session initialization incomplete after connect_ib")
 
             logger.info("IBKR FULLY INITIALIZED")
 
@@ -16857,10 +11119,7 @@ class ScalpingBot:
     def allocate_bracket_order_ids(self):
         with self.order_id_lock:
             if self.next_order_id is None:
-                self.next_order_id = self.broker_get_req_id(
-                    caller="place_bracket_order",
-                    reason_label="allocate_bracket_order_ids",
-                )
+                self.next_order_id = self.ib.client.getReqId()
 
             parent_id = self.next_order_id
             tp_id = parent_id + 1
@@ -16872,10 +11131,7 @@ class ScalpingBot:
     def allocate_exit_order_ids(self):
         with self.order_id_lock:
             if self.next_order_id is None:
-                self.next_order_id = self.broker_get_req_id(
-                    caller="place_timeout_retained_replacement_protection",
-                    reason_label="allocate_exit_order_ids",
-                )
+                self.next_order_id = self.ib.client.getReqId()
 
             tp_id = self.next_order_id
             sl_id = tp_id + 1
@@ -17438,7 +11694,6 @@ class ScalpingBot:
                             reason_label="timeout_retained_child_cancel",
                             trade_id=trade_id,
                             symbol=record.get("symbol") if isinstance(record, dict) else None,
-                            real_broker_exposure=True,
                         )
                         order_result = {
                             "order_id": order_id,
@@ -17560,24 +11815,6 @@ class ScalpingBot:
         sl.ocaGroup = oca_group
         sl.ocaType = 1
         sl.orderRef = self.build_order_ref(trade_id, symbol, "SL")
-
-        with self.trade_analysis_lock:
-            live_record = self.trade_analysis.get(trade_id)
-            if live_record is not None:
-                live_record["order_ref_tp"] = tp.orderRef
-                live_record["order_ref_sl"] = sl.orderRef
-
-        for role, order in (("TP", tp), ("SL", sl)):
-            logger.info(
-                "ORDER_REF_ASSIGNED | "
-                f"run_id={self.run_id} "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"role={role} "
-                f"order_id={getattr(order, 'orderId', None)} "
-                f"orderRef={getattr(order, 'orderRef', None)} "
-                "context=timeout_retained_replacement"
-            )
 
         self.append_trade_event(
             trade_id,
@@ -17918,14 +12155,6 @@ class ScalpingBot:
                 "parentId": None,
                 "permId": None,
                 "status": None,
-                "totalQuantity": None,
-                "filled": None,
-                "remaining": None,
-                "action": None,
-                "orderType": None,
-                "whyHeld": None,
-                "orderRef": None,
-                "visible_source": None,
                 "visible_in_open_trades": False,
                 "visible_in_open_orders": False,
                 "link_ok": False,
@@ -17956,20 +12185,6 @@ class ScalpingBot:
                         leg_data["parentId"] = getattr(order, "parentId", None)
                         leg_data["permId"] = getattr(status, "permId", None)
                         leg_data["status"] = getattr(status, "status", None)
-                        leg_data["totalQuantity"] = self.normalize_broker_quantity_or_none(
-                            getattr(order, "totalQuantity", None)
-                        )
-                        leg_data["filled"] = self.normalize_broker_quantity_or_none(
-                            getattr(status, "filled", None)
-                        )
-                        leg_data["remaining"] = self.normalize_broker_quantity_or_none(
-                            getattr(status, "remaining", None)
-                        )
-                        leg_data["action"] = getattr(order, "action", None)
-                        leg_data["orderType"] = getattr(order, "orderType", None)
-                        leg_data["whyHeld"] = getattr(status, "whyHeld", None)
-                        leg_data["orderRef"] = self.get_order_ref(order=order)
-                        leg_data["visible_source"] = "open_trades"
                         break
 
             for order in open_orders:
@@ -17979,25 +12194,10 @@ class ScalpingBot:
                 for leg_name, leg_data in broker_orders.items():
                     if leg_data["orderId"] == order_id:
                         leg_data["visible_in_open_orders"] = True
-                        leg_data["visible_source"] = (
-                            "open_trades+open_orders"
-                            if leg_data.get("visible_source") == "open_trades"
-                            else "open_orders"
-                        )
                         if leg_data["parentId"] is None:
                             leg_data["parentId"] = getattr(order, "parentId", None)
                         if leg_data["permId"] in (None, 0):
                             leg_data["permId"] = getattr(order, "permId", None)
-                        if leg_data["totalQuantity"] is None:
-                            leg_data["totalQuantity"] = self.normalize_broker_quantity_or_none(
-                                getattr(order, "totalQuantity", None)
-                            )
-                        if leg_data["action"] is None:
-                            leg_data["action"] = getattr(order, "action", None)
-                        if leg_data["orderType"] is None:
-                            leg_data["orderType"] = getattr(order, "orderType", None)
-                        if leg_data["orderRef"] is None:
-                            leg_data["orderRef"] = self.get_order_ref(order=order)
                         break
         except Exception as exc:
             logger.exception(
@@ -18156,21 +12356,10 @@ class ScalpingBot:
         leg_validation = {
             leg_name: {
                 "orderId": leg_data["orderId"],
-                "order_id": leg_data["orderId"],
                 "parentId": leg_data["parentId"],
-                "parent_id": leg_data["parentId"],
                 "expected_parent_id": leg_data["expected_parent_id"],
                 "status": leg_data["status"],
                 "permId": leg_data["permId"],
-                "perm_id": leg_data["permId"],
-                "totalQuantity": leg_data["totalQuantity"],
-                "filled": leg_data["filled"],
-                "remaining": leg_data["remaining"],
-                "action": leg_data["action"],
-                "orderType": leg_data["orderType"],
-                "whyHeld": leg_data["whyHeld"],
-                "orderRef": leg_data["orderRef"],
-                "visible_source": leg_data["visible_source"],
                 "visible_in_open_trades": leg_data["visible_in_open_trades"],
                 "visible_in_open_orders": leg_data["visible_in_open_orders"],
                 "submitted_to_ib": leg_data["submitted_to_ib"],
@@ -18182,7 +12371,7 @@ class ScalpingBot:
         }
 
         logger.info(
-            f"BRACKET VALIDATION SUMMARY | {json.dumps({'outcome': outcome, 'reason': reason, 'broker_state_category': broker_state_category, 'any_visible': any_visible, 'all_visible': all_visible, 'all_links_ok': all_links_ok, 'all_broker_acknowledged': all_broker_acknowledged, 'all_broker_live': all_broker_live, 'any_terminal_status': any_terminal_status, 'pending_broker_ack': pending_broker_ack, 'ambiguous_broker_state': ambiguous_broker_state, 'broken_or_terminal_state': broken_or_terminal_state, 'quantity_state': None, 'quantity_coverage_ok': None, 'open_position_estimate': None, 'protective_sl_coverage': None, 'planned_parent_quantity': None, 'planned_tp_quantity': None, 'planned_sl_quantity': None, 'visible_order_ids': sorted(leg_data['orderId'] for leg_data in broker_orders.values() if leg_data['submitted_to_ib']), 'leg_validation': leg_validation}, sort_keys=True)}"
+            f"BRACKET VALIDATION SUMMARY | {json.dumps({'outcome': outcome, 'reason': reason, 'broker_state_category': broker_state_category, 'any_visible': any_visible, 'all_visible': all_visible, 'all_links_ok': all_links_ok, 'all_broker_acknowledged': all_broker_acknowledged, 'all_broker_live': all_broker_live, 'any_terminal_status': any_terminal_status, 'pending_broker_ack': pending_broker_ack, 'ambiguous_broker_state': ambiguous_broker_state, 'broken_or_terminal_state': broken_or_terminal_state, 'visible_order_ids': sorted(leg_data['orderId'] for leg_data in broker_orders.values() if leg_data['submitted_to_ib']), 'leg_validation': leg_validation}, sort_keys=True)}"
         )
 
         return {
@@ -18266,124 +12455,6 @@ class ScalpingBot:
 
         return None, "expiry_length_unsupported"
 
-    def normalize_contract_metadata_text(self, value):
-        if value is None:
-            return None
-        text = str(value).strip().upper()
-        return text or None
-
-    def get_contract_detail_valid_exchanges(self, detail):
-        valid_exchanges = getattr(detail, "validExchanges", None)
-        if not valid_exchanges:
-            return []
-        if isinstance(valid_exchanges, str):
-            return [
-                exchange.strip()
-                for exchange in valid_exchanges.split(",")
-                if exchange.strip()
-            ]
-        try:
-            return [
-                str(exchange).strip()
-                for exchange in valid_exchanges
-                if str(exchange).strip()
-            ]
-        except Exception:
-            return [str(valid_exchanges).strip()]
-
-    def resolve_contract_detail_exchange_match(self, detail, contract, requested_exchange):
-        requested_exchange_text = self.normalize_contract_metadata_text(requested_exchange)
-        if not requested_exchange_text:
-            return False, None, []
-
-        exchange_sources = [
-            ("exchange", getattr(contract, "exchange", None)),
-            ("primaryExchange", getattr(contract, "primaryExchange", None)),
-        ]
-        for valid_exchange in self.get_contract_detail_valid_exchanges(detail):
-            exchange_sources.append(("validExchanges", valid_exchange))
-
-        observed_values = []
-        for source, value in exchange_sources:
-            normalized_value = self.normalize_contract_metadata_text(value)
-            if not normalized_value:
-                continue
-            observed_values.append(f"{source}:{normalized_value}")
-            if normalized_value == requested_exchange_text:
-                return True, source, observed_values
-
-        return False, None, observed_values
-
-    def build_contract_selection_evidence(
-        self,
-        detail,
-        requested_symbol,
-        requested_spec=None,
-        matched_exchange_source=None,
-        selection_reason=None,
-        skipped_reason=None,
-    ):
-        contract = getattr(detail, "contract", None) if detail is not None else None
-        requested_exchange = (requested_spec or {}).get("exchange")
-        exchange_match, resolved_exchange_source, exchange_values = (
-            self.resolve_contract_detail_exchange_match(
-                detail,
-                contract,
-                requested_exchange,
-            )
-            if contract is not None
-            else (False, None, [])
-        )
-        return {
-            "requested_symbol": requested_symbol,
-            "metadata_symbol": getattr(contract, "symbol", None),
-            "localSymbol": getattr(contract, "localSymbol", None),
-            "tradingClass": getattr(contract, "tradingClass", None),
-            "secType": getattr(contract, "secType", None),
-            "exchange": getattr(contract, "exchange", None),
-            "primaryExchange": getattr(contract, "primaryExchange", None),
-            "validExchanges": self.get_contract_detail_valid_exchanges(detail),
-            "matched_exchange_source": matched_exchange_source or resolved_exchange_source,
-            "exchange_match": exchange_match,
-            "exchange_values": exchange_values,
-            "currency": getattr(contract, "currency", None),
-            "conId": getattr(contract, "conId", None),
-            "expiry": getattr(contract, "lastTradeDateOrContractMonth", None),
-            "selection_reason": selection_reason,
-            "skipped_reason": skipped_reason,
-        }
-
-    def validate_fdxm_contract_detail_identity(self, detail, contract, requested_spec):
-        requested_exchange = (requested_spec or {}).get("exchange")
-        exchange_match, matched_exchange_source, exchange_values = (
-            self.resolve_contract_detail_exchange_match(
-                detail,
-                contract,
-                requested_exchange,
-            )
-        )
-        failures = []
-
-        if self.normalize_contract_metadata_text(getattr(contract, "secType", None)) != "FUT":
-            failures.append("sec_type_mismatch")
-        if self.normalize_contract_metadata_text(getattr(contract, "tradingClass", None)) != "FDXM":
-            failures.append("trading_class_mismatch")
-        if self.normalize_contract_metadata_text(getattr(contract, "currency", None)) != "EUR":
-            failures.append("currency_mismatch")
-        if getattr(contract, "conId", None) in (None, 0):
-            failures.append("con_id_missing")
-        if not getattr(contract, "localSymbol", None):
-            failures.append("local_symbol_missing")
-        if not exchange_match:
-            failures.append("exchange_mismatch")
-
-        return {
-            "ok": not failures,
-            "failures": failures,
-            "matched_exchange_source": matched_exchange_source,
-            "exchange_values": exchange_values,
-        }
-
     def score_contract_detail_match(self, contract, requested_symbol=None, requested_spec=None, requested_contract=None):
         score = 0
         mismatch_reasons = []
@@ -18445,8 +12516,6 @@ class ScalpingBot:
         raw_count = len(details or [])
         candidates = []
         skipped_reasons = {}
-        requested_symbol_text = self.normalize_contract_metadata_text(requested_symbol)
-        fdxm_identity_mode = requested_symbol_text == "FDXM"
 
         for detail in details or []:
             contract = getattr(detail, "contract", None)
@@ -18460,52 +12529,21 @@ class ScalpingBot:
                 skipped_reasons[expiry_skip_reason] = skipped_reasons.get(expiry_skip_reason, 0) + 1
                 continue
 
-            fdxm_identity = None
-            if fdxm_identity_mode:
-                fdxm_identity = self.validate_fdxm_contract_detail_identity(
-                    detail,
-                    contract,
-                    requested_spec,
-                )
-                if not fdxm_identity["ok"]:
-                    reason_key = "metadata_" + "_and_".join(fdxm_identity["failures"])
-                    skipped_reasons[reason_key] = skipped_reasons.get(reason_key, 0) + 1
-                    logger.info(
-                        "CONTRACT_SELECTION_DETAIL_SKIPPED | "
-                        f"{json.dumps(self.build_contract_selection_evidence(detail, requested_symbol, requested_spec, skipped_reason=reason_key), sort_keys=True)}"
-                    )
-                    continue
-
             match_score, mismatch_reasons = self.score_contract_detail_match(
                 contract,
                 requested_symbol=requested_symbol,
                 requested_spec=requested_spec,
                 requested_contract=requested_contract,
             )
-            if fdxm_identity_mode and "symbol_mismatch" in mismatch_reasons:
-                mismatch_reasons = [
-                    reason for reason in mismatch_reasons
-                    if reason != "symbol_mismatch"
-                ]
-                match_score += 1
             if mismatch_reasons:
                 reason_key = "metadata_" + "_and_".join(mismatch_reasons)
                 skipped_reasons[reason_key] = skipped_reasons.get(reason_key, 0) + 1
-                logger.info(
-                    "CONTRACT_SELECTION_DETAIL_SKIPPED | "
-                    f"{json.dumps(self.build_contract_selection_evidence(detail, requested_symbol, requested_spec, skipped_reason=reason_key), sort_keys=True)}"
-                )
                 continue
 
             candidates.append({
                 "detail": detail,
                 "expiry_key": expiry_key,
                 "match_score": match_score,
-                "matched_exchange_source": (
-                    fdxm_identity.get("matched_exchange_source")
-                    if fdxm_identity is not None
-                    else None
-                ),
             })
 
         logger.info(
@@ -18537,14 +12575,10 @@ class ScalpingBot:
             f"selected_localSymbol={getattr(selected_contract, 'localSymbol', None)} "
             f"selected_tradingClass={getattr(selected_contract, 'tradingClass', None)} "
             f"selected_exchange={getattr(selected_contract, 'exchange', None)} "
-            f"selected_primaryExchange={getattr(selected_contract, 'primaryExchange', None)} "
-            f"selected_validExchanges={self.get_contract_detail_valid_exchanges(selected_detail)} "
-            f"matched_exchange_source={selected.get('matched_exchange_source')} "
             f"selected_currency={getattr(selected_contract, 'currency', None)} "
             f"selected_expiry={getattr(selected_contract, 'lastTradeDateOrContractMonth', None)} "
             f"selected_conId={getattr(selected_contract, 'conId', None)} "
-            f"match_score={selected['match_score']} "
-            "selection_reason=front_month_lowest_expiry_highest_score"
+            f"match_score={selected['match_score']}"
         )
 
         return selected_detail
@@ -18640,10 +12674,7 @@ class ScalpingBot:
         webhook_timing_start_ms = self.current_monotonic_ms()
         normalized = None
         webhook_received_time = datetime.now(timezone.utc)
-        logger.info(
-            "WEBHOOK RECEIVED | "
-            f"{json.dumps(build_sanitized_payload_summary(data), sort_keys=True)}"
-        )
+        logger.info(f"WEBHOOK RECEIVED: {data}")
 
         if not isinstance(data, dict):
             logger.error(f"INVALID PAYLOAD TYPE: {type(data)}")
@@ -18994,69 +13025,6 @@ class ScalpingBot:
             job["webhook_received_time"] = webhook_received_time
             job["classification_completed_time"] = classification_completed_time
 
-            external_entry_blocked, block_source, block_reason = self.should_block_external_entry()
-            if external_entry_blocked:
-                self.log_external_entry_blocked(
-                    job=job,
-                    normalized=normalized,
-                    location="handle_webhook_signal_before_queue",
-                    block_source=block_source,
-                    reason=block_reason,
-                )
-                logger.info(
-                    "QUEUE DECISION | "
-                    f"path=external_entry_gate "
-                    f"payload_format={normalized['payload_format']} "
-                    f"signal_id={normalized['signal_id']} "
-                    f"symbol={normalized['symbol']} "
-                    f"side={normalized['side']} "
-                    f"queued=false "
-                    f"blocked_by={block_source} "
-                    f"reason={block_reason}"
-                )
-                return self.log_webhook_processing_timing(
-                    block_reason or "external_entry_blocked",
-                    webhook_timing_start_ms,
-                    normalized,
-                    queued=False,
-                )
-
-            session_entry_blocked, session_close_state = self.should_block_new_entry_for_session_close(symbol)
-            if session_entry_blocked:
-                self.log_session_entry_blocked(
-                    symbol,
-                    side=side,
-                    job=job,
-                    normalized=normalized,
-                    location="handle_webhook_signal_before_queue",
-                    state=session_close_state,
-                )
-                logger.info(
-                    "QUEUE DECISION | "
-                    f"path=session_close_entry_cutoff "
-                    f"payload_format={normalized['payload_format']} "
-                    f"signal_id={normalized['signal_id']} "
-                    f"symbol={normalized['symbol']} "
-                    f"side={normalized['side']} "
-                    f"truth_classification={formal_contract['truth_classification']} "
-                    f"det_classification={formal_contract['det_classification']} "
-                    f"execution_lane={job['execution_lane']} "
-                    f"promoted_from_shadow={job['promoted_from_shadow']} "
-                    f"queued=false "
-                    "blocked_by=session_close_policy "
-                    "reason=session_close_entry_cutoff"
-                )
-                self.enqueue_session_close_system_job(
-                    "webhook_entry_cutoff",
-                    symbol=symbol,
-                )
-                return self.log_webhook_processing_timing(
-                    "session_close_entry_cutoff",
-                    webhook_timing_start_ms,
-                    normalized,
-                    queued=False,
-                )
-
             logger.info(
                 "QUEUE PUT | "
                 f"symbol={job['symbol']} "
@@ -19197,11 +13165,7 @@ class ScalpingBot:
             self.log_session_health("PREFLIGHT_BEFORE_RECOVERY")
 
             try:
-                if self.broker_read_is_connected(
-                    caller="execution_worker",
-                    reason_label="execution_preflight_recovery_socket_check",
-                    failure_log_level="info",
-                ):
+                if self.ib.isConnected():
                     self.force_session_recovery("EXECUTION_PREFLIGHT")
                 else:
                     self.connect_ib()
@@ -19245,39 +13209,15 @@ class ScalpingBot:
         logger.info("EXECUTION WORKER STARTED")
         logger.info(f"BOT STAGE: {BOT_STAGE}")
 
-        try:
-            self.connect_ib()
-            self.run_startup_reconciliation()
-        except Exception as exc:
-            if not self.session_initialization_failed:
-                self.mark_session_initialization_failed(str(exc))
-            logger.critical(
-                "EXECUTION_WORKER_STARTUP_FAILED_FAIL_CLOSED | "
-                f"reason={self.session_initialization_failure_reason} "
-                "worker_alive=true "
-                "execution_jobs_allowed=false"
-            )
+        self.connect_ib()
 
         while True:
             job = None
             try:
-                if self.session_initialization_failed:
-                    job = self.execution_queue.get(timeout=1.0)
-                    job["worker_pickup_time"] = datetime.now(timezone.utc)
-                    logger.critical(
-                        "EXECUTION_WORKER_FAIL_CLOSED_JOB_SKIPPED | "
-                        f"job_type={job.get('job_type')} "
-                        f"symbol={job.get('symbol')} "
-                        f"reason={self.session_initialization_failure_reason} "
-                        "decision=no_execution_or_broker_recovery_while_startup_failure_unresolved"
-                    )
-                    continue
-
                 with self.execution_lock:
                     self.reconcile_active_trade_lifecycle_from_broker_fills(
                         "execution_worker_periodic_sweep"
                     )
-                    self.process_time_exit_deadlines()
                     self.process_partial_entry_timeouts()
                     self.process_partial_timeout_parent_finality()
 
@@ -19285,7 +13225,6 @@ class ScalpingBot:
                 job["worker_pickup_time"] = datetime.now(timezone.utc)
                 logger.info(
                     "EXECUTION WORKER QUEUE ITEM ACQUIRED | "
-                    f"job_type={job.get('job_type')} "
                     f"symbol={job.get('symbol')} "
                     f"side={job.get('side')} "
                     f"grade={job.get('grade')} "
@@ -19293,25 +13232,6 @@ class ScalpingBot:
                 )
 
                 with self.execution_lock:
-                    if self.is_broker_system_job(job):
-                        self.process_broker_system_job(job)
-                        continue
-
-                    external_entry_blocked, block_source, block_reason = self.should_block_external_entry()
-                    if external_entry_blocked:
-                        self.log_external_entry_blocked(
-                            job=job,
-                            location="execution_worker_external_entry_gate",
-                            block_source=block_source,
-                            reason=block_reason,
-                        )
-                        logger.warning(
-                            "EXECUTION WORKER EXECUTION SKIPPED | "
-                            f"symbol={job.get('symbol')} "
-                            f"reason={block_reason}"
-                        )
-                        continue
-
                     if self.is_runtime_symbol_disabled(job.get("symbol")):
                         logger.warning(
                             "EXECUTION BLOCKED SYMBOL RUNTIME DISABLED | "
@@ -19336,25 +13256,6 @@ class ScalpingBot:
                             "EXECUTION WORKER EXECUTION SKIPPED | "
                             f"symbol={job.get('symbol')} "
                             f"reason={EURUSD_EXECUTION_DISABLED_REASON}"
-                        )
-                        continue
-
-                    session_entry_blocked, session_close_state = self.should_block_new_entry_for_session_close(job.get("symbol"))
-                    if session_entry_blocked:
-                        self.log_session_entry_blocked(
-                            job.get("symbol"),
-                            job=job,
-                            location="execution_worker_before_preflight",
-                            state=session_close_state,
-                        )
-                        self.run_session_close_sweep(
-                            "execution_worker_entry_hard_gate",
-                            target_symbol=job.get("symbol"),
-                        )
-                        logger.warning(
-                            "EXECUTION WORKER EXECUTION SKIPPED | "
-                            f"symbol={job.get('symbol')} "
-                            "reason=session_close_entry_cutoff"
                         )
                         continue
 
@@ -19423,10 +13324,7 @@ class ScalpingBot:
                         continue
                     job["preflight_completed_time"] = datetime.now(timezone.utc)
 
-                    logger.info(
-                        "IB CONNECTED: "
-                        f"{self.broker_read_is_connected(caller='execution_worker', reason_label='pre_order_connected_log', failure_log_level='info')}"
-                    )
+                    logger.info(f"IB CONNECTED: {self.ib.isConnected()}")
                     logger.info("STARTING ORDER EXECUTION")
 
                     self.place_bracket_order(job)
@@ -20015,21 +13913,6 @@ class ScalpingBot:
         if self.is_connectivity_execution_blocked():
             return
 
-        session_entry_blocked, session_close_state = self.should_block_new_entry_for_session_close(symbol)
-        if session_entry_blocked:
-            self.log_session_entry_blocked(
-                symbol,
-                side=side,
-                job=job,
-                location="place_bracket_order_before_order_id_allocation",
-                state=session_close_state,
-            )
-            self.run_session_close_sweep(
-                "place_bracket_order_entry_hard_gate",
-                target_symbol=symbol,
-            )
-            return
-
         order_tif = self.get_order_tif(symbol, "bracket")
         if not order_tif:
             logger.error(
@@ -20040,44 +13923,7 @@ class ScalpingBot:
             )
             return
 
-        if self.is_prd_dry_run_enabled():
-            self.finalize_prd_dry_run_order_plan(
-                job=job,
-                symbol=symbol,
-                side=side,
-                entry=entry,
-                stop=stop,
-                target=target,
-                spread_adjusted_entry=spread_adjusted_entry,
-                approved_size_after_containment=approved_size_after_containment,
-            )
-            return
-
-        try:
-            self.assert_prd_live_release_allowed(
-                symbol=symbol,
-                job=job,
-            )
-        except Exception as exc:
-            logger.critical(
-                "PRD_LIVE_RELEASE_GATE_BLOCKED_BEFORE_TRADE_REGISTRATION | "
-                f"symbol={symbol} "
-                f"side={side} "
-                f"reason={exc} "
-                "decision=no_trade_record_no_order_submitted"
-            )
-            return
-
-        self.assert_order_transmission_allowed(
-            symbol=symbol,
-            trade_id=None,
-            reason_label="bracket_order_plan_pre_submit",
-        )
-
         parent_id, tp_id, sl_id = self.allocate_bracket_order_ids()
-        job["planned_parent_quantity"] = approved_size_after_containment
-        job["planned_tp_quantity"] = approved_size_after_containment
-        job["planned_sl_quantity"] = approved_size_after_containment
 
         trade_id = self.register_trade_analysis(
             job=job,
@@ -20112,24 +13958,6 @@ class ScalpingBot:
         sl.transmit = True
         sl.tif = order_tif
         sl.orderRef = self.build_order_ref(trade_id, symbol, "SL")
-
-        with self.trade_analysis_lock:
-            record = self.trade_analysis.get(trade_id)
-            if record is not None:
-                record["order_ref_entry"] = parent.orderRef
-                record["order_ref_tp"] = tp.orderRef
-                record["order_ref_sl"] = sl.orderRef
-
-        for role, order in (("ENTRY", parent), ("TP", tp), ("SL", sl)):
-            logger.info(
-                "ORDER_REF_ASSIGNED | "
-                f"run_id={self.run_id} "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"role={role} "
-                f"order_id={getattr(order, 'orderId', None)} "
-                f"orderRef={getattr(order, 'orderRef', None)}"
-            )
 
         logger.info(
             f"ORDER DEF PARENT → orderId={parent.orderId} parentId={parent.parentId} "
@@ -20170,89 +13998,43 @@ class ScalpingBot:
 
         self.set_trade_timestamp(trade_id, "bracket_submit_start_time")
         self.append_trade_event(trade_id, "PLACE ORDER START")
-        self.update_bracket_submit_transaction(
-            trade_id,
-            bracket_submit_transaction_status="in_progress",
-            bracket_submit_exception=None,
-            bracket_submit_uncertain=False,
+
+        parent_trade = self.broker_write_place_order(
+            contract,
+            parent,
+            caller="place_bracket_order",
+            reason_label="bracket_parent_submit",
+            trade_id=trade_id,
+            symbol=symbol,
         )
-
-        parent_trade = None
-        tp_trade = None
-        sl_trade = None
-        try:
-            self.mark_bracket_submit_leg_attempted(trade_id, "parent")
-            parent_trade = self.broker_write_place_order(
-                contract,
-                parent,
-                caller="place_bracket_order",
-                reason_label="bracket_parent_submit",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-            self.mark_bracket_submit_leg_completed(trade_id, "parent", parent_trade)
-
-            self.mark_bracket_submit_leg_attempted(trade_id, "tp")
-            tp_trade = self.broker_write_place_order(
-                contract,
-                tp,
-                caller="place_bracket_order",
-                reason_label="bracket_tp_submit",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-            self.mark_bracket_submit_leg_completed(trade_id, "tp", tp_trade)
-
-            self.mark_bracket_submit_leg_attempted(trade_id, "sl")
-            sl_trade = self.broker_write_place_order(
-                contract,
-                sl,
-                caller="place_bracket_order",
-                reason_label="bracket_sl_submit",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-            self.mark_bracket_submit_leg_completed(trade_id, "sl", sl_trade)
-        except Exception as exc:
-            with self.trade_analysis_lock:
-                record_snapshot = dict(self.trade_analysis.get(trade_id) or {})
-            submit_context = self.get_bracket_submit_context_from_record(record_snapshot)
-            self.handle_bracket_submission_failure(
-                trade_id,
-                record_snapshot,
-                submit_context,
-                exc,
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
-
-        self.update_bracket_submit_transaction(
-            trade_id,
-            bracket_submit_transaction_status="submitted",
-            bracket_submit_uncertain=False,
+        tp_trade = self.broker_write_place_order(
+            contract,
+            tp,
+            caller="place_bracket_order",
+            reason_label="bracket_tp_submit",
+            trade_id=trade_id,
+            symbol=symbol,
         )
-        self.append_trade_event(trade_id, "BRACKET SUBMIT TRANSACTION SUBMITTED")
+        sl_trade = self.broker_write_place_order(
+            contract,
+            sl,
+            caller="place_bracket_order",
+            reason_label="bracket_sl_submit",
+            trade_id=trade_id,
+            symbol=symbol,
+        )
 
         self.log_trade_snapshot("POST PLACE PARENT", parent_trade)
         self.log_trade_snapshot("POST PLACE TP", tp_trade)
         self.log_trade_snapshot("POST PLACE SL", sl_trade)
 
-        try:
-            self.broker_write_sleep(
-                0.20,
-                caller="place_bracket_order",
-                reason_label="bracket_post_submit_wait",
-                trade_id=trade_id,
-                symbol=symbol,
-            )
-        except Exception as exc:
-            self.handle_post_submit_uncertainty(
-                trade_id,
-                "bracket_post_submit_wait_failed",
-                exc,
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
+        self.broker_write_sleep(
+            0.20,
+            caller="place_bracket_order",
+            reason_label="bracket_post_submit_wait",
+            trade_id=trade_id,
+            symbol=symbol,
+        )
 
         self.log_trade_snapshot("POST WAIT PARENT", parent_trade)
         self.log_trade_snapshot("POST WAIT TP", tp_trade)
@@ -20310,14 +14092,6 @@ class ScalpingBot:
                 sl_id,
                 trade_analysis_lock_context="not_locked",
             )
-            if broker_confirmation.get("reason") == "broker_state_check_failed":
-                self.handle_post_submit_uncertainty(
-                    trade_id,
-                    "bracket_confirmation_read_failed_after_submit",
-                    RuntimeError(broker_confirmation.get("reason")),
-                )
-                self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-                return
             if broker_confirmation.get("all_broker_live"):
                 confirmed = True
                 pending_broker_ack = False
@@ -20329,22 +14103,13 @@ class ScalpingBot:
             if broker_confirmation.get("pending_broker_ack"):
                 pending_broker_ack = True
 
-            try:
-                self.broker_write_sleep(
-                    0.10,
-                    caller="place_bracket_order",
-                    reason_label="bracket_confirmation_poll_wait",
-                    trade_id=trade_id,
-                    symbol=symbol,
-                )
-            except Exception as exc:
-                self.handle_post_submit_uncertainty(
-                    trade_id,
-                    "bracket_confirmation_poll_wait_failed",
-                    exc,
-                )
-                self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-                return
+            self.broker_write_sleep(
+                0.10,
+                caller="place_bracket_order",
+                reason_label="bracket_confirmation_poll_wait",
+                trade_id=trade_id,
+                symbol=symbol,
+            )
 
         self.log_trade_snapshot("POST CONFIRM PARENT", parent_trade)
         self.log_trade_snapshot("POST CONFIRM TP", tp_trade)
@@ -20357,14 +14122,6 @@ class ScalpingBot:
                 sl_id,
                 trade_analysis_lock_context="not_locked",
             )
-        if broker_confirmation.get("reason") == "broker_state_check_failed":
-            self.handle_post_submit_uncertainty(
-                trade_id,
-                "bracket_final_confirmation_read_failed_after_submit",
-                RuntimeError(broker_confirmation.get("reason")),
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
         broker_state_category = broker_confirmation.get("broker_state_category", "BROKEN_OR_TERMINAL")
         confirmed = bool(broker_confirmation.get("confirmed"))
         pending_broker_ack = bool(broker_confirmation.get("pending_broker_ack")) and not confirmed
@@ -20416,14 +14173,8 @@ class ScalpingBot:
                 symbol=symbol,
                 trade_analysis_lock_context="not_locked",
             )
-        except Exception as exc:
-            self.handle_post_submit_uncertainty(
-                trade_id,
-                "post_submit_open_trades_inspection_failed",
-                exc,
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
+        except Exception:
+            raise
 
         for open_trade in open_trades:
             order = open_trade.order
@@ -20436,274 +14187,6 @@ class ScalpingBot:
                 elif getattr(order, "orderId", None) == sl_id:
                     label = "POST OPENTRADES SL"
                 self.log_trade_snapshot(label, open_trade)
-
-        with self.trade_analysis_lock:
-            protection_record_snapshot = dict(self.trade_analysis.get(trade_id) or {})
-
-        broker_reality = None
-        protection_context = self.classify_position_protection_context(
-            protection_record_snapshot,
-            broker_reality,
-            broker_confirmation,
-        )
-        if protection_record_snapshot:
-            broker_reality = self.get_trade_broker_reality(
-                protection_record_snapshot,
-                trade_analysis_lock_context="not_locked",
-            )
-            if broker_reality.get("check_failed"):
-                self.handle_post_submit_uncertainty(
-                    trade_id,
-                    "post_submit_broker_reality_check_failed",
-                    RuntimeError(broker_reality.get("failure")),
-                )
-                self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-                return
-            protection_context = self.classify_position_protection_context(
-                protection_record_snapshot,
-                broker_reality,
-                broker_confirmation,
-            )
-
-        if (
-            broker_reality
-            and broker_reality.get("check_failed")
-            and (
-                protection_record_snapshot.get("entry_filled")
-                or self.has_realized_parent_entry(protection_record_snapshot)
-            )
-        ):
-            self.emergency_flatten_unprotected_position(
-                trade_id,
-                symbol,
-                "protective_emergency_broker_read_failed_after_submit",
-                protection_context=protection_context,
-                broker_reality=broker_reality,
-            )
-            logger.critical(
-                "PROTECTIVE_EMERGENCY_FLATTEN_BLOCKED_BROKER_READ_FAILED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"parent_order_id={parent_id} "
-                f"tp_order_id={tp_id} "
-                f"sl_order_id={sl_id} "
-                "operator_action_required=True "
-                "decision=preserve_active_lock_no_blind_flatten"
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
-
-        quantity_coverage = self.assess_bracket_quantity_coverage(
-            protection_record_snapshot,
-            broker_confirmation=broker_confirmation,
-            broker_reality=broker_reality,
-        )
-        self.log_bracket_quantity_coverage(protection_record_snapshot, quantity_coverage)
-        logger.info(
-            f"BRACKET VALIDATION SUMMARY | {json.dumps({'outcome': broker_confirmation.get('outcome'), 'reason': broker_confirmation.get('reason'), 'broker_state_category': broker_state_category, 'quantity_state': quantity_coverage.get('quantity_state'), 'quantity_coverage_ok': quantity_coverage.get('quantity_coverage_ok'), 'open_position_estimate': quantity_coverage.get('open_position_estimate'), 'protective_sl_coverage': quantity_coverage.get('protective_sl_coverage'), 'planned_parent_quantity': quantity_coverage.get('planned_parent_quantity'), 'planned_tp_quantity': quantity_coverage.get('planned_tp_quantity'), 'planned_sl_quantity': quantity_coverage.get('planned_sl_quantity'), 'parent_total_quantity': quantity_coverage.get('parent_total_quantity'), 'parent_filled_quantity': quantity_coverage.get('parent_filled_quantity'), 'parent_remaining_quantity': quantity_coverage.get('parent_remaining_quantity'), 'tp_total_quantity': quantity_coverage.get('tp_total_quantity'), 'tp_filled_quantity': quantity_coverage.get('tp_filled_quantity'), 'tp_remaining_quantity': quantity_coverage.get('tp_remaining_quantity'), 'sl_total_quantity': quantity_coverage.get('sl_total_quantity'), 'sl_filled_quantity': quantity_coverage.get('sl_filled_quantity'), 'sl_remaining_quantity': quantity_coverage.get('sl_remaining_quantity')}, sort_keys=True)}"
-        )
-        if quantity_coverage.get("quantity_mismatch_reason") and quantity_coverage.get("quantity_coverage_ok"):
-            logger.warning(
-                "BRACKET_QUANTITY_MISMATCH | "
-                f"{json.dumps(self.build_quantity_coverage_log_fields(protection_record_snapshot, quantity_coverage), sort_keys=True)}"
-            )
-
-        if confirmed and not self.is_bracket_quantity_safe_for_ack(quantity_coverage):
-            quantity_state = quantity_coverage.get("quantity_state")
-            open_position_estimate = quantity_coverage.get("open_position_estimate")
-            has_open_exposure = open_position_estimate is not None and open_position_estimate > 0
-            now_dt = datetime.now(timezone.utc)
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    previous_state = record.get("state")
-                    record["state"] = "BROKER_ACK_PENDING"
-                    record["broker_ack_pending_since"] = record.get("broker_ack_pending_since") or now_dt
-                    record["broker_ack_pending_last_check"] = now_dt
-                    record["broker_ack_pending_reason"] = quantity_state
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = broker_confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        f"BRACKET QUANTITY GATE BLOCKED previous_state={previous_state} "
-                        f"quantity_state={quantity_state} "
-                        f"open_position_estimate={open_position_estimate} "
-                        f"protective_sl_coverage={quantity_coverage.get('protective_sl_coverage')} "
-                        f"reason={quantity_coverage.get('quantity_mismatch_reason')}"
-                    )
-            self.set_execution_validation_status(
-                trade_id,
-                "validation_incomplete",
-                quantity_state,
-            )
-            if has_open_exposure:
-                self.emergency_flatten_unprotected_position(
-                    trade_id,
-                    symbol,
-                    quantity_state,
-                    protection_context=protection_context,
-                    broker_reality=broker_reality,
-                )
-                self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-                return
-            logger.warning(
-                "BRACKET_QUANTITY_UNKNOWN_WAITING | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"quantity_state={quantity_state} "
-                "decision=wait_recheck_no_open_exposure_no_emergency"
-            )
-            confirmed = False
-            pending_broker_ack = True
-            broker_state_category = "WAITABLE_ACK"
-
-        if protection_context["protection_class"] in {
-            "IN_POSITION_WITH_PROTECTIVE_EXITS",
-            "IN_POSITION_WITH_PRIMARY_SL_PROTECTION",
-        }:
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    previous_state = record["state"]
-                    record["state"] = "EXIT_WORKING"
-                    record["broker_ack_pending_reason"] = protection_context["reason"]
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = broker_confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        "PARENT_FILLED_POSITION_OPEN_PROTECTIVE_EXITS_VISIBLE "
-                        f"previous_state={previous_state} new_state={record['state']} "
-                        f"broker_state_category={broker_state_category} "
-                        f"protection_class={protection_context['protection_class']} "
-                        f"reason={protection_context['reason']} "
-                        f"visible_order_ids={broker_confirmation['visible_order_ids']}"
-                    )
-            self.set_execution_validation_status(
-                trade_id,
-                "broker_live" if broker_confirmation.get("all_broker_live") else "broker_acknowledged",
-                protection_context["reason"],
-            )
-            logger.warning(
-                "BRACKET_PARENT_FILLED_PROTECTIVE_EXITS_CONFIRMED | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"parent_order_id={parent_id} "
-                f"tp_order_id={tp_id} "
-                f"sl_order_id={sl_id} "
-                f"parent_visible={protection_context['parent_visible']} "
-                f"tp_visible={protection_context['tp_visible']} "
-                f"sl_visible={protection_context['sl_visible']} "
-                f"entry_filled={protection_record_snapshot.get('entry_filled')} "
-                f"cumulative_entry_quantity={protection_record_snapshot.get('cumulative_entry_quantity')} "
-                f"realized_entry_quantity={protection_record_snapshot.get('realized_entry_quantity')} "
-                f"position_match={protection_context['position_match']} "
-                f"position_sizes={(broker_reality or {}).get('matching_position_sizes')} "
-                f"visible_order_ids={broker_confirmation['visible_order_ids']} "
-                f"broker_state_category={broker_state_category} "
-                f"protection_class={protection_context['protection_class']} "
-                "decision=exit_working_preserve_protective_exits "
-                f"reason={protection_context['reason']}"
-            )
-            logger.warning(
-                f"{protection_context['protection_class']} | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"parent_order_id={parent_id} "
-                f"tp_order_id={tp_id} "
-                f"sl_order_id={sl_id} "
-                f"parent_visible={protection_context['parent_visible']} "
-                f"tp_visible={protection_context['tp_visible']} "
-                f"sl_visible={protection_context['sl_visible']} "
-                f"position_match={protection_context['position_match']} "
-                f"position_sizes={(broker_reality or {}).get('matching_position_sizes')} "
-                f"visible_order_ids={broker_confirmation['visible_order_ids']} "
-                f"broker_state_category={broker_state_category} "
-                "decision=protective_context_interpreted_before_ack_pending "
-                f"reason={protection_context['reason']}"
-            )
-            if not protection_context["parent_visible"]:
-                logger.info(
-                    "PARENT_MISSING_AFTER_FULL_FILL_NORMAL | "
-                    f"trade_id={trade_id} "
-                    f"symbol={symbol} "
-                    f"parent_order_id={parent_id} "
-                    f"tp_order_id={tp_id} "
-                    f"sl_order_id={sl_id} "
-                    f"tp_visible={protection_context['tp_visible']} "
-                    f"sl_visible={protection_context['sl_visible']} "
-                    f"position_match={protection_context['position_match']} "
-                    f"position_sizes={(broker_reality or {}).get('matching_position_sizes')} "
-                    f"visible_order_ids={broker_confirmation['visible_order_ids']} "
-                    f"broker_state_category={broker_state_category} "
-                    "decision=parent_absence_accepted_after_full_fill "
-                    f"reason={protection_context['reason']}"
-                )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
-
-        if protection_context["protection_class"] in {
-            "URGENT_RISK_STATE_SL_MISSING",
-            "URGENT_RISK_STATE_UNPROTECTED_POSITION",
-        }:
-            now_dt = datetime.now(timezone.utc)
-            with self.trade_analysis_lock:
-                record = self.trade_analysis.get(trade_id)
-                if record is not None:
-                    previous_state = record["state"]
-                    record["state"] = protection_context["target_state"] or record["state"]
-                    record["broker_ack_pending_since"] = record.get("broker_ack_pending_since") or now_dt
-                    record["broker_ack_pending_last_check"] = now_dt
-                    record["broker_ack_pending_reason"] = protection_context["reason"]
-                    record["broker_ack_pending_category"] = broker_state_category
-                    record["broker_ack_pending_visible_order_ids"] = broker_confirmation["visible_order_ids"]
-                    self.append_trade_event(
-                        trade_id,
-                        f"{protection_context['protection_class']} previous_state={previous_state} "
-                        f"new_state={record['state']} broker_state_category={broker_state_category} "
-                        f"visible_order_ids={broker_confirmation['visible_order_ids']} "
-                        f"reason={protection_context['reason']}"
-                    )
-            self.set_execution_validation_status(
-                trade_id,
-                "validation_incomplete",
-                protection_context["reason"],
-            )
-            log_label = (
-                "PROTECTIVE_SL_MISSING_WITH_POSITION"
-                if protection_context["protection_class"] == "URGENT_RISK_STATE_SL_MISSING"
-                else "URGENT_RISK_STATE_UNPROTECTED_POSITION"
-            )
-            logger.critical(
-                f"{log_label} | "
-                f"trade_id={trade_id} "
-                f"symbol={symbol} "
-                f"parent_order_id={parent_id} "
-                f"tp_order_id={tp_id} "
-                f"sl_order_id={sl_id} "
-                f"parent_visible={protection_context['parent_visible']} "
-                f"tp_visible={protection_context['tp_visible']} "
-                f"sl_visible={protection_context['sl_visible']} "
-                f"entry_filled={protection_record_snapshot.get('entry_filled')} "
-                f"cumulative_entry_quantity={protection_record_snapshot.get('cumulative_entry_quantity')} "
-                f"realized_entry_quantity={protection_record_snapshot.get('realized_entry_quantity')} "
-                f"position_match={protection_context['position_match']} "
-                f"position_sizes={(broker_reality or {}).get('matching_position_sizes')} "
-                f"visible_order_ids={broker_confirmation['visible_order_ids']} "
-                f"broker_state_category={broker_state_category} "
-                f"protection_class={protection_context['protection_class']} "
-                "decision=preserve_active_unresolved_no_generic_cleanup "
-                "operator_action_required=True "
-                f"reason={protection_context['reason']}"
-            )
-            self.emergency_flatten_unprotected_position(
-                trade_id,
-                symbol,
-                protection_context["reason"],
-                protection_context=protection_context,
-                broker_reality=broker_reality,
-            )
-            self.set_trade_timestamp(trade_id, "bracket_submit_end_time")
-            return
 
         if broker_state_category in {"WAITABLE_ACK", "AMBIGUOUS_ACK"}:
             self.set_execution_validation_status(
@@ -20893,7 +14376,9 @@ class ScalpingBot:
 
         while True:
             try:
-                if not self.session_socket_connected:
+                self.update_session_health()
+
+                if not self.ib.isConnected():
                     self.session_reconnect_count += 1
                     self.last_reconnect_time = datetime.now(timezone.utc)
                     logger.warning(
@@ -20901,21 +14386,23 @@ class ScalpingBot:
                         f"socket_connected=false"
                     )
                     self.log_session_health(f"RECONNECT_ATTEMPT_{self.session_reconnect_count}")
-                    self.enqueue_broker_system_job(
-                        "RECONNECT_RECOVERY",
-                        "watchdog_reconnect_required",
-                        force=False,
-                        reconnect_count=self.session_reconnect_count,
-                        since_time=self.get_reconnect_fill_reconstruction_since(self.last_reconnect_time),
-                    )
-                elif not self.session_healthy:
-                    logger.warning("FORCED SESSION RECOVERY (SOCKET ALIVE BUT SESSION UNHEALTHY)")
-                    self.log_session_health("WATCHDOG_UNHEALTHY_BEFORE_RECOVERY")
-                    self.enqueue_broker_system_job(
-                        "RECONNECT_RECOVERY",
-                        "WATCHDOG_SOCKET_ALIVE_SESSION_UNHEALTHY",
-                        force=False,
-                    )
+
+                    try:
+                        self.connect_ib()
+                        logger.info(f"RECONNECT SUCCESS #{self.session_reconnect_count}")
+                        self.log_session_health(f"RECONNECT_SUCCESS_{self.session_reconnect_count}")
+                        self.post_reconnect_fill_reconstruction_sweep(
+                            f"watchdog_reconnect_success_{self.session_reconnect_count}",
+                            since_time=self.get_reconnect_fill_reconstruction_since(self.last_reconnect_time),
+                        )
+                    except Exception:
+                        logger.exception(f"RECONNECT FAILED #{self.session_reconnect_count}")
+                        self.log_session_health(f"RECONNECT_FAILED_{self.session_reconnect_count}")
+                else:
+                    if not self.session_healthy:
+                        logger.warning("FORCED SESSION RECOVERY (SOCKET ALIVE BUT SESSION UNHEALTHY)")
+                        self.log_session_health("WATCHDOG_UNHEALTHY_BEFORE_RECOVERY")
+                        self.force_session_recovery("WATCHDOG_SOCKET_ALIVE_SESSION_UNHEALTHY")
             except Exception:
                 logger.exception("WATCHDOG ERROR")
 
@@ -20926,123 +14413,23 @@ class ScalpingBot:
 # ==========================================================
 
 app = FastAPI()
-
-def initialize_bot_once():
-    global bot
-    with bot_init_lock:
-        if bot is not None:
-            logger.warning(
-                "BOT_INITIALIZE_SKIPPED | "
-                "reason=bot_already_initialized"
-            )
-            return bot
-
-        validate_webhook_secret_config()
-        acquire_runtime_process_lock()
-        try:
-            bot = ScalpingBot()
-            logger.warning(
-                "BOT_INITIALIZED | "
-                f"bot_stage={BOT_STAGE} "
-                f"bot_patch={BOT_PATCH} "
-                f"lock_key={RUNTIME_LOCK_KEY}"
-            )
-            return bot
-        except Exception:
-            release_runtime_process_lock()
-            raise
-
-def get_bot(required=True):
-    if bot is None and required:
-        raise HTTPException(status_code=503, detail="Bot runtime not initialized")
-    return bot
-
-@app.on_event("startup")
-def startup_event():
-    initialize_bot_once()
-
-@app.on_event("shutdown")
-def shutdown_event():
-    global bot
-    runtime_bot = bot
-    if runtime_bot is not None:
-        logger.warning(
-            "BOT_SHUTDOWN_BROKER_IO_SKIPPED | "
-            "reason=shutdown_context_is_not_broker_io_owner "
-            f"session_socket_connected={getattr(runtime_bot, 'session_socket_connected', None)} "
-            "decision=release_process_lock_without_direct_ibkr_call"
-        )
-    release_runtime_process_lock()
-    logger.warning("BOT_SHUTDOWN_COMPLETE")
+bot = ScalpingBot()
 
 @app.get("/health")
 def health():
-    runtime_bot = get_bot(required=False)
-    prd_live_gate_result = (
-        runtime_bot.evaluate_prd_live_release_gates() if runtime_bot else {
-            "allowed": False,
-            "failed_gates": [],
-            "unknown_gates": ["bot_not_initialized"],
-            "policy": {
-                "prd_live_approval": parse_env_bool(os.getenv(PRD_LIVE_APPROVAL_ENV_VAR)),
-                "dry_run_enabled": False,
-            },
-        }
-    )
     return {
         "status": "ok",
         "bot_name": BOT_NAME,
         "bot_version": BOT_VERSION,
         "bot_patch": BOT_PATCH,
-        "bot_stage": BOT_STAGE,
-        "bot_initialized": runtime_bot is not None,
-        "runtime_lock_acquired": RUNTIME_LOCK_SOCKET is not None,
-        "runtime_lock_key": RUNTIME_LOCK_KEY,
-        "webhook_secret_configured": bool(get_configured_webhook_secret()),
-        "prd_live_gates_allowed": prd_live_gate_result.get("allowed"),
-        "prd_live_failed_gates": prd_live_gate_result.get("failed_gates", []),
-        "prd_live_unknown_gates": prd_live_gate_result.get("unknown_gates", []),
-        "prd_live_approval_configured": (
-            prd_live_gate_result.get("policy", {}).get("prd_live_approval") is True
-        ),
-        "prd_dry_run_enabled": (
-            prd_live_gate_result.get("policy", {}).get("dry_run_enabled") is True
-        ),
-        "broker_io_owner_mode": (
-            getattr(runtime_bot, "broker_io_owner_mode", None) if runtime_bot else None
-        ),
-        "singleton_lock_active": RUNTIME_LOCK_SOCKET is not None,
-        "startup_reconciliation_required": (
-            runtime_bot.startup_reconciliation_required if runtime_bot else None
-        ),
-        "startup_reconciliation_completed": (
-            runtime_bot.startup_reconciliation_completed if runtime_bot else None
-        ),
-        "startup_reconciliation_status": (
-            runtime_bot.startup_reconciliation_status if runtime_bot else "not_initialized"
-        ),
-        "startup_reconciliation_block_reason": (
-            runtime_bot.startup_reconciliation_block_reason if runtime_bot else "bot_not_initialized"
-        ),
-        "startup_reconciliation_ambiguous_symbols": (
-            sorted(runtime_bot.startup_reconciliation_ambiguous_symbols) if runtime_bot else []
-        ),
+        "bot_stage": BOT_STAGE
     }
 
 @app.post("/webhook/tradingview")
 async def webhook_handler(request: Request):
-    runtime_bot = get_bot()
-    configured_secret = get_configured_webhook_secret()
-    if webhook_secret_required() and not configured_secret:
-        logger.critical(
-            "WEBHOOK SECRET CONFIG MISSING | "
-            f"stage={BOT_STAGE} "
-            "decision=reject_webhook_fail_closed"
-        )
-        raise HTTPException(status_code=503, detail="Webhook secret not configured")
-
     raw_body = await request.body()
     raw_text = raw_body.decode("utf-8", errors="replace")
+    logger.info(f"WEBHOOK RAW BODY: {raw_text}")
 
     try:
         data = json.loads(raw_text)
@@ -21054,40 +14441,13 @@ async def webhook_handler(request: Request):
         logger.error(f"WEBHOOK JSON ROOT MUST BE OBJECT, GOT: {type(data)}")
         raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
-    received_secret = (
-        request.headers.get("x-webhook-secret")
-        or request.headers.get("authorization")
-        or data.get("secret")
-        or data.get("webhook_secret")
-    )
-    if configured_secret and not hmac.compare_digest(str(received_secret or ""), configured_secret):
-        logger.warning(
-            "WEBHOOK AUTH FAILED | "
-            f"symbol={data.get('symbol')} "
-            f"signal_id={data.get('signal_id')} "
-            "reason=invalid_secret"
-        )
+    if data.get("secret") != "FDAX_bot_secure_2026":
         raise HTTPException(status_code=403)
-    if not configured_secret and webhook_secret_required():
-        logger.critical(
-            "WEBHOOK AUTH FAILED | "
-            "reason=missing_secret_config "
-            f"stage={BOT_STAGE}"
-        )
-        raise HTTPException(status_code=403)
-
-    logger.info(
-        "WEBHOOK RECEIVED SANITIZED | "
-        f"{json.dumps(build_sanitized_payload_summary(data), sort_keys=True)}"
-    )
 
     try:
-        status = runtime_bot.handle_webhook_signal(data)
+        status = bot.handle_webhook_signal(data)
     except Exception:
-        logger.exception(
-            "WEBHOOK PROCESSING FAILED | "
-            f"payload_summary={json.dumps(build_sanitized_payload_summary(data), sort_keys=True)}"
-        )
+        logger.exception("WEBHOOK PROCESSING FAILED")
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
 
     return {"status": status}

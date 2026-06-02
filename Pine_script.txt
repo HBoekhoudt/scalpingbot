@@ -98,6 +98,9 @@ f_reason_pipe_to_json_array(string reasonsPipe) =>
 f_common_json() =>
     '{"schema_version":"v7","secret":"FDAX_bot_secure_2026","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","bar_time_unix_ms":' + str.tostring(time) + ''
 
+f_signal_id(string eventName, string side) =>
+    syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(time) + "|" + eventName + "|" + side
+
 // ----------------------
 // Base series (1m execution layer)
 // ----------------------
@@ -679,6 +682,9 @@ f_build_payload(
     // Pragmatic proxy: close-to-fast-EMA distance expressed in ATR units.
     pullbackDepth1mProxy = f_safe_div(math.abs(close - emaFast), atr)
     f_common_json() +
+         ',"signal_id":"' + f_signal_id(eventName, side) + '"' +
+         ',"signal_id_time_source":"bar_time_unix_ms"' +
+         ',"signal_id_side_source":"side"' +
          ',"mode":"candidate"' +
          ',"event":"' + eventName + '"' +
          ',"side":"' + side + '"' +
