@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P213 | STAGE: ACC
+# IKBR SCALPING BOT | VERSION v1.6.0 P214 | STAGE: ACC
 # ==========================================================
 
 import logging
@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
-from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder
+from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder, ExecutionFilter
 
 # ==========================================================
 # VERSIONING
@@ -26,7 +26,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P213"
+BOT_PATCH = "P214"
 BOT_STAGE = "ACC"  # TST | ACC | PRD
 
 def generate_bot_run_id():
@@ -3062,6 +3062,17 @@ class ScalpingBot:
             trade_analysis_lock_context=trade_analysis_lock_context,
         )
 
+    def broker_read_executions(self, exec_filter, caller, reason_label, trade_id=None, symbol=None, trade_analysis_lock_context="not_locked"):
+        return self.broker_read(
+            "reqExecutions",
+            lambda: self.ib.reqExecutions(exec_filter),
+            caller,
+            reason_label,
+            trade_id=trade_id,
+            symbol=symbol,
+            trade_analysis_lock_context=trade_analysis_lock_context,
+        )
+
     def broker_read_is_connected(self, caller, reason_label, trade_id=None, symbol=None, failure_log_level="warning"):
         return self.broker_read(
             "isConnected",
@@ -4582,7 +4593,29 @@ class ScalpingBot:
         except Exception:
             logger.exception("ORDER_REF_MATCH_DECISION_LOG_FAILED")
 
-    def execution_order_ref_matches_record(self, record, execution):
+    def execution_account_matches_record(self, record, execution):
+        execution_account = (
+            getattr(execution, "acctNumber", None)
+            or getattr(execution, "account", None)
+            or getattr(execution, "acct", None)
+        )
+        if not execution_account:
+            return True
+        expected_accounts = {
+            record.get("account") if isinstance(record, dict) else None,
+            record.get("broker_account") if isinstance(record, dict) else None,
+            BOT_ACCOUNT_CONTEXT,
+        }
+        normalized_expected = {
+            str(value).strip()
+            for value in expected_accounts
+            if value not in (None, "", "default")
+        }
+        if not normalized_expected:
+            return True
+        return str(execution_account).strip() in normalized_expected
+
+    def execution_order_ref_matches_record(self, record, execution, contract=None):
         order_ref = self.get_order_ref(execution=execution)
         parsed = self.parse_order_ref(order_ref)
         expected_roles = self.get_expected_order_ref_roles_for_execution(record, execution)
@@ -4593,15 +4626,39 @@ class ScalpingBot:
         if not raw_order_ref:
             if reconstructed_identity and expected_roles:
                 return True, "missing_order_ref_allowed_for_startup_reconstructed_exact_match", parsed
+            contract_ok = contract is None or self.contract_fallback_matches_record(contract, record)
+            account_ok = self.execution_account_matches_record(record, execution)
+            if expected_roles and contract_ok and account_ok:
+                self.log_order_ref_match_decision(
+                    "BROKER_FILL_WITH_MISSING_ORDER_REF_ACCEPTED",
+                    record,
+                    parsed,
+                    "missing_order_ref_exact_order_or_perm_match",
+                    execution=execution,
+                    decision="accept_current_lifecycle_match",
+                )
+                return True, "missing_order_ref_exact_order_or_perm_match", parsed
             self.log_order_ref_match_decision(
                 "BROKER_FILL_WITH_MISSING_ORDER_REF",
                 record,
                 parsed,
-                "missing_order_ref",
+                (
+                    "missing_order_ref_contract_mismatch"
+                    if expected_roles and not contract_ok
+                    else "missing_order_ref_account_mismatch"
+                    if expected_roles and not account_ok
+                    else "missing_order_ref"
+                ),
                 execution=execution,
                 decision="reject_current_lifecycle_match",
             )
-            return False, "missing_order_ref", parsed
+            return False, (
+                "missing_order_ref_contract_mismatch"
+                if expected_roles and not contract_ok
+                else "missing_order_ref_account_mismatch"
+                if expected_roles and not account_ok
+                else "missing_order_ref"
+            ), parsed
 
         if reconstructed_identity and (
             raw_order_ref in known_record_order_refs
@@ -6830,7 +6887,11 @@ class ScalpingBot:
 
     def resolve_reconstructed_fill_leg_with_fallback(self, record, fill, execution):
         exact_leg, exact_source = self.resolve_reconstructed_fill_leg(record, execution)
-        identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(record, execution)
+        identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(
+            record,
+            execution,
+            contract=getattr(fill, "contract", None),
+        )
         if not identity_ok:
             self.log_broker_fill_without_lifecycle_event(
                 record.get("trade_id"),
@@ -6997,6 +7058,130 @@ class ScalpingBot:
             bucket["suppressed_count"] = bucket.get("suppressed_count", 0) + 1
             return False, bucket["suppressed_count"], True
 
+    def get_reconciliation_execution_filter_start(self, record):
+        starts = [
+            record.get("webhook_received_time"),
+            record.get("classification_completed_time"),
+            record.get("queue_put_time"),
+            record.get("worker_pickup_time"),
+            record.get("execution_start_time"),
+            record.get("bracket_submit_start_time"),
+        ]
+        starts = [
+            value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            for value in starts
+            if isinstance(value, datetime)
+        ]
+        if not starts:
+            return datetime.now(timezone.utc) - timedelta(hours=1)
+        return min(starts) - timedelta(minutes=5)
+
+    def build_execution_filter_for_record(self, record):
+        exec_filter = ExecutionFilter()
+        since_time = self.get_reconciliation_execution_filter_start(record)
+        exec_filter.time = since_time.strftime("%Y%m%d %H:%M:%S")
+        account = record.get("account") or record.get("broker_account") or BOT_ACCOUNT_CONTEXT
+        if account not in (None, "", "default"):
+            exec_filter.acctCode = str(account)
+        return exec_filter
+
+    def broker_fill_references_record_identity(self, record, fill):
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            return False
+        order_id = getattr(execution, "orderId", None)
+        perm_id = getattr(execution, "permId", None)
+        if order_id in {
+            record.get("parent_order_id"),
+            record.get("tp_order_id"),
+            record.get("sl_order_id"),
+            record.get("emergency_flatten_order_id"),
+        }:
+            return True
+        if perm_id not in (None, 0) and perm_id in {
+            record.get("parent_perm_id"),
+            record.get("tp_perm_id"),
+            record.get("sl_perm_id"),
+            record.get("emergency_flatten_perm_id"),
+        }:
+            return True
+        order_ref = self.get_order_ref(execution=execution)
+        return self.broker_order_ref_matches_record(record, order_ref)
+
+    def get_fill_source_identity(self, fill):
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            return f"missing_execution:{id(fill)}"
+        fill_time, _, _ = self.get_effective_execution_time(fill, execution)
+        return self.get_execution_identity(execution, fill_time)
+
+    def read_req_execution_fills_for_record(self, record):
+        exec_filter = self.build_execution_filter_for_record(record)
+        try:
+            fills = self.broker_read_executions(
+                exec_filter,
+                caller="build_in_session_broker_fill_reconciliation_candidate",
+                reason_label="broker_fill_reconciliation_req_executions",
+                trade_id=record.get("trade_id"),
+                symbol=record.get("symbol"),
+                trade_analysis_lock_context="not_locked",
+            )
+        except Exception as exc:
+            logger.warning(
+                "BROKER_FILL_RECOVERY_REQ_EXECUTIONS_FAILED | "
+                f"trade_id={record.get('trade_id')} "
+                f"symbol={record.get('symbol')} "
+                f"failure={exc}"
+            )
+            return []
+        logger.warning(
+            "BROKER_FILL_RECOVERY_REQ_EXECUTIONS_READ | "
+            f"trade_id={record.get('trade_id')} "
+            f"symbol={record.get('symbol')} "
+            f"returned_count={len(fills or [])} "
+            f"filter_time={getattr(exec_filter, 'time', None)} "
+            f"filter_account={getattr(exec_filter, 'acctCode', None)}"
+        )
+        return fills or []
+
+    def build_reconciliation_fill_sources(self, record, local_fills):
+        fill_sources = []
+        seen_identities = set()
+        local_relevant_count = 0
+
+        for fill in local_fills or []:
+            identity = self.get_fill_source_identity(fill)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            if self.broker_fill_references_record_identity(record, fill):
+                local_relevant_count += 1
+            fill_sources.append(("local_cache", fill))
+
+        if local_relevant_count <= 0:
+            logger.warning(
+                "BROKER_FILL_LOCAL_CACHE_NO_RELEVANT_FILLS | "
+                f"trade_id={record.get('trade_id')} "
+                f"symbol={record.get('symbol')} "
+                f"local_fill_count={len(local_fills or [])} "
+                "decision=req_executions_recovery"
+            )
+            for fill in self.read_req_execution_fills_for_record(record):
+                identity = self.get_fill_source_identity(fill)
+                if identity in seen_identities:
+                    logger.info(
+                        "BROKER_FILL_RECOVERY_DUPLICATE_SOURCE_IGNORED | "
+                        f"trade_id={record.get('trade_id')} "
+                        f"symbol={record.get('symbol')} "
+                        f"fill_source=req_executions "
+                        f"identity={identity}"
+                    )
+                    continue
+                seen_identities.add(identity)
+                fill_sources.append(("req_executions", fill))
+
+        return fill_sources
+
     def build_in_session_broker_fill_reconciliation_candidate(self, record):
         trade_id = record.get("trade_id")
         start_should_log, start_suppressed_count, start_suppressed = self.should_log_reconciliation_noise(
@@ -7079,7 +7264,9 @@ class ScalpingBot:
         matched_count = 0
         fallback_ambiguous_count = 0
 
-        for fill in fills:
+        fill_sources = self.build_reconciliation_fill_sources(record, fills)
+
+        for fill_source, fill in fill_sources:
             execution = getattr(fill, "execution", None)
             if execution is None:
                 continue
@@ -7105,9 +7292,9 @@ class ScalpingBot:
                         trade_id,
                         match_source,
                         (
-                            "reconciliation_fallback_not_applied"
+                            f"reconciliation_fallback_not_applied fill_source={fill_source}"
                             if fallback_diagnostics is None
-                            else f"reconciliation_fallback_not_applied diagnostics={fallback_diagnostics}"
+                            else f"reconciliation_fallback_not_applied fill_source={fill_source} diagnostics={fallback_diagnostics}"
                         ),
                         fill=fill,
                         execution=execution,
@@ -7122,6 +7309,7 @@ class ScalpingBot:
                         "log_category=ambiguous "
                         "decision=preserve_current_lifecycle "
                         f"reason={match_source} "
+                        f"fill_source={fill_source} "
                         f"fallback_candidates={fallback_candidates} "
                         f"{self.format_broker_identity_fields(fill=fill, execution=execution, contract=getattr(fill, 'contract', None))}"
                     )
@@ -7185,6 +7373,7 @@ class ScalpingBot:
                 f"trade_id={trade_id} "
                 f"symbol={record.get('symbol')} "
                 f"leg={leg} "
+                f"fill_source={fill_source} "
                 f"match_source={match_source} "
                 f"identity={identity} "
                 f"quantity={quantity} "
@@ -12561,7 +12750,11 @@ class ScalpingBot:
             if record is None:
                 return
 
-            identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(record, execution)
+            identity_ok, identity_reason, parsed_order_ref = self.execution_order_ref_matches_record(
+                record,
+                execution,
+                contract=getattr(fill, "contract", None),
+            )
             if not identity_ok:
                 self.log_broker_fill_without_lifecycle_event(
                     trade_id,
@@ -19274,6 +19467,17 @@ class ScalpingBot:
                     continue
 
                 with self.execution_lock:
+                    try:
+                        self.broker_write_sleep(
+                            0.01,
+                            caller="execution_worker",
+                            reason_label="execution_worker_idle_event_pump",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "EXECUTION_WORKER_EVENT_PUMP_FAILED | "
+                            f"reason=execution_worker_idle_event_pump failure={exc}"
+                        )
                     self.reconcile_active_trade_lifecycle_from_broker_fills(
                         "execution_worker_periodic_sweep"
                     )
