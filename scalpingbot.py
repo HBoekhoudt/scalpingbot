@@ -1,5 +1,5 @@
 # ==========================================================
-# IKBR SCALPING BOT | VERSION v1.6.0 P214 | STAGE: ACC
+# IKBR SCALPING BOT | VERSION v1.6.0 P227 | STAGE: ACC
 # ==========================================================
 
 import logging
@@ -14,7 +14,9 @@ import socket
 import hashlib
 import hmac
 import uuid
+import sqlite3
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
@@ -26,7 +28,7 @@ from ib_insync import IB, Future, Forex, LimitOrder, StopOrder, MarketOrder, Exe
 
 BOT_NAME = "IKBR_SCALPING_BOT"
 BOT_VERSION = "v1.6.0"
-BOT_PATCH = "P214"
+BOT_PATCH = "P227"
 BOT_STAGE = "ACC"  # TST | ACC | PRD
 
 def generate_bot_run_id():
@@ -43,6 +45,8 @@ PRD_DRY_RUN_ENV_VAR = "IKBR_PRD_DRY_RUN"
 EXECUTION_TRANSMISSION_MODE_ENV_VAR = "EXECUTION_TRANSMISSION_MODE"
 LIVE_ORDER_APPROVAL_ENV_VAR = "IKBR_ALLOW_LIVE_ORDERS"
 PRD_LIVE_APPROVAL_ENV_VAR = "IKBR_PRD_LIVE_APPROVED"
+EXECUTION_QUALITY_GATE_MODE_ENV_VAR = "IKBR_EXECUTION_QUALITY_GATE_MODE"
+EXECUTION_QUALITY_GATE_PRD_APPROVAL_ENV_VAR = "IKBR_EXECUTION_QUALITY_GATE_PRD_APPROVED"
 BOT_ACCOUNT_CONTEXT = os.getenv("IKBR_ACCOUNT_CONTEXT", "default")
 SENSITIVE_PAYLOAD_KEYS = {
     "secret",
@@ -56,6 +60,44 @@ SENSITIVE_PAYLOAD_KEYS = {
     "webhooksecret",
 }
 REDACTED_VALUE = "[REDACTED]"
+TELEMETRY_SCHEMA_VERSION = 1
+TELEMETRY_DB_PATH = os.path.join("runtime_state", "telemetry_events.sqlite3")
+try:
+    TELEMETRY_QUEUE_MAXSIZE = int(os.getenv("IKBR_TELEMETRY_QUEUE_MAXSIZE", "5000"))
+except Exception:
+    TELEMETRY_QUEUE_MAXSIZE = 5000
+if TELEMETRY_QUEUE_MAXSIZE <= 0:
+    TELEMETRY_QUEUE_MAXSIZE = 5000
+TELEMETRY_SQLITE_BUSY_TIMEOUT_MS = 5000
+ROLLING_EDGE_CACHE_TTL_SECONDS = 45.0
+ROLLING_EDGE_DB_TIMEOUT_SECONDS = 0.5
+ROLLING_EDGE_SHORT_WINDOW = 20
+ROLLING_EDGE_LONG_WINDOW = 50
+ROLLING_EDGE_MIN_SAMPLE_FOR_CONCLUSION = 30
+ROLLING_EDGE_MIN_ANALYSIS_READY_RATIO = 0.8
+ROLLING_EDGE_SLIPPAGE_WARNING_R = 0.25
+SLIPPAGE_DEFENSE_CACHE_TTL_SECONDS = 45.0
+SLIPPAGE_DEFENSE_DB_TIMEOUT_SECONDS = 0.5
+SLIPPAGE_DEFENSE_MIN_SAMPLE = 20
+SLIPPAGE_DEFENSE_MAX_SIGNAL_AGE_SECONDS = 10.0
+SLIPPAGE_DEFENSE_MAX_QUEUE_AGE_SECONDS = 3.0
+SLIPPAGE_DEFENSE_MAX_ENTRY_DRIFT_R = 0.25
+SLIPPAGE_DEFENSE_HISTORICAL_SLIPPAGE_WARNING_R = 0.25
+EXECUTION_QUALITY_GATE_DEFAULT_MODE_ACC = "shadow"
+EXECUTION_QUALITY_GATE_DEFAULT_MODE_PRD = "off"
+EXECUTION_QUALITY_GATE_VALID_MODES = {
+    "off",
+    "shadow",
+    "enforce_acc_only",
+    "enforce_prd_after_approval",
+}
+TRADE_LEARNING_CACHE_TTL_SECONDS = 45.0
+TRADE_LEARNING_DB_TIMEOUT_SECONDS = 0.5
+TRADE_LEARNING_MIN_SAMPLE = 30
+TRADE_LEARNING_RECENT_WINDOW = 20
+TRADE_LEARNING_MIN_COMPARISON_SAMPLE = 10
+TRADE_LEARNING_SLIPPAGE_DRAG_WARNING_R = 0.25
+TRADE_LEARNING_DEGRADATION_DELTA_R = 0.25
 RUNTIME_LOCK_SOCKET = None
 RUNTIME_LOCK_KEY = None
 bot = None
@@ -472,6 +514,1581 @@ def build_sanitized_payload_summary(payload):
         "sanitized_payload": redact_sensitive_payload(payload),
     }
 
+def telemetry_json_default(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    if isinstance(value, set):
+        return sorted(value)
+    return str(value)
+
+class SQLiteTelemetrySink:
+
+    def __init__(self, path=TELEMETRY_DB_PATH):
+        self.path = path
+        self.connection = None
+
+    def connect(self):
+        if self.connection is not None:
+            return self.connection
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        connection = sqlite3.connect(
+            self.path,
+            timeout=max(1.0, TELEMETRY_SQLITE_BUSY_TIMEOUT_MS / 1000.0),
+        )
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(f"PRAGMA busy_timeout={TELEMETRY_SQLITE_BUSY_TIMEOUT_MS}")
+        self.connection = connection
+        return connection
+
+    def ensure_schema(self):
+        connection = self.connect()
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telemetry_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                run_id TEXT,
+                bot_stage TEXT,
+                account_context TEXT,
+                event_type TEXT NOT NULL,
+                event_group TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                symbol TEXT,
+                trade_id TEXT,
+                order_id TEXT,
+                signal_id TEXT,
+                state TEXT,
+                reason TEXT,
+                latency_ms REAL,
+                payload_json TEXT
+            )
+            """
+        )
+        for column in (
+            "timestamp_utc",
+            "event_type",
+            "event_group",
+            "severity",
+            "symbol",
+            "trade_id",
+            "signal_id",
+            "order_id",
+            "run_id",
+        ):
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_telemetry_events_{column} "
+                f"ON telemetry_events ({column})"
+            )
+        connection.commit()
+
+    def write(self, event):
+        self.ensure_schema()
+        created_at = datetime.now(timezone.utc).isoformat()
+        timestamp_utc = event.get("timestamp_utc") or created_at
+        payload = redact_sensitive_payload(event.get("payload") or {})
+        payload_json = json.dumps(payload, sort_keys=True, default=telemetry_json_default)
+        self.connection.execute(
+            """
+            INSERT INTO telemetry_events (
+                created_at,
+                timestamp_utc,
+                schema_version,
+                run_id,
+                bot_stage,
+                account_context,
+                event_type,
+                event_group,
+                severity,
+                symbol,
+                trade_id,
+                order_id,
+                signal_id,
+                state,
+                reason,
+                latency_ms,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                timestamp_utc,
+                event.get("schema_version", TELEMETRY_SCHEMA_VERSION),
+                event.get("run_id"),
+                event.get("bot_stage"),
+                event.get("account_context"),
+                event.get("event_type"),
+                event.get("event_group"),
+                event.get("severity", "info"),
+                event.get("symbol"),
+                event.get("trade_id"),
+                event.get("order_id"),
+                event.get("signal_id"),
+                event.get("state"),
+                event.get("reason"),
+                event.get("latency_ms"),
+                payload_json,
+            ),
+        )
+        self.connection.commit()
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+class TelemetryWriter:
+
+    def __init__(
+        self,
+        sink=None,
+        run_id=None,
+        bot_stage=None,
+        account_context=None,
+        maxsize=TELEMETRY_QUEUE_MAXSIZE,
+    ):
+        self.sink = sink or SQLiteTelemetrySink()
+        self.run_id = run_id
+        self.bot_stage = bot_stage or BOT_STAGE
+        self.account_context = account_context or BOT_ACCOUNT_CONTEXT
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.stop_requested = threading.Event()
+        self.thread = None
+        self.maxsize = maxsize
+        self.database_path = getattr(self.sink, "path", None)
+        self.counter_lock = threading.Lock()
+        self.counters = {
+            "emitted_count": 0,
+            "written_count": 0,
+            "dropped_count": 0,
+            "writer_error_count": 0,
+            "last_successful_write_at": None,
+            "last_writer_error_at": None,
+            "last_writer_error_message": None,
+        }
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(
+            target=self._run,
+            name="telemetry_writer",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def increment_counter(self, name, amount=1):
+        with self.counter_lock:
+            self.counters[name] = self.counters.get(name, 0) + amount
+
+    def mark_successful_write(self):
+        with self.counter_lock:
+            self.counters["written_count"] = self.counters.get("written_count", 0) + 1
+            self.counters["last_successful_write_at"] = datetime.now(timezone.utc).isoformat()
+
+    def mark_writer_error(self, message):
+        with self.counter_lock:
+            self.counters["writer_error_count"] = self.counters.get("writer_error_count", 0) + 1
+            self.counters["last_writer_error_at"] = datetime.now(timezone.utc).isoformat()
+            self.counters["last_writer_error_message"] = str(message)
+
+    def snapshot_counters(self):
+        with self.counter_lock:
+            snapshot = dict(self.counters)
+        snapshot["queue_size"] = self.queue.qsize()
+        snapshot["queue_maxsize"] = self.maxsize
+        snapshot["writer_alive"] = bool(self.thread and self.thread.is_alive())
+        snapshot["database_path"] = self.database_path
+        return snapshot
+
+    def emit(
+        self,
+        event_type,
+        event_group,
+        severity="info",
+        symbol=None,
+        trade_id=None,
+        order_id=None,
+        signal_id=None,
+        state=None,
+        reason=None,
+        latency_ms=None,
+        payload=None,
+    ):
+        self.increment_counter("emitted_count")
+        event = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "schema_version": TELEMETRY_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "bot_stage": self.bot_stage,
+            "account_context": self.account_context,
+            "event_type": event_type,
+            "event_group": event_group,
+            "severity": severity,
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "signal_id": signal_id,
+            "state": state,
+            "reason": reason,
+            "latency_ms": latency_ms,
+            "payload": payload or {},
+        }
+        try:
+            self.queue.put_nowait(event)
+            return True
+        except queue.Full:
+            self.increment_counter("dropped_count")
+            return False
+        except Exception:
+            self.increment_counter("dropped_count")
+            return False
+
+    def _run(self):
+        try:
+            try:
+                self.sink.ensure_schema()
+            except Exception as exc:
+                self.mark_writer_error(exc)
+                logger.exception("TELEMETRY_SCHEMA_INIT_FAILED")
+
+            while not self.stop_requested.is_set():
+                try:
+                    event = self.queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    if event is None:
+                        return
+                    self.sink.write(event)
+                    self.mark_successful_write()
+                except Exception as exc:
+                    self.mark_writer_error(exc)
+                    logger.exception(
+                        "TELEMETRY_WRITE_FAILED | "
+                        f"event_type={(event or {}).get('event_type')}"
+                    )
+                finally:
+                    self.queue.task_done()
+        finally:
+            try:
+                self.sink.close()
+            except Exception:
+                logger.exception("TELEMETRY_SINK_CLOSE_FAILED")
+
+    def flush(self, timeout_seconds=5.0):
+        deadline = time.time() + max(0.0, timeout_seconds)
+        while self.queue.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.05)
+        return self.queue.unfinished_tasks == 0
+
+    def stop(self, timeout_seconds=5.0):
+        self.flush(timeout_seconds=timeout_seconds)
+        self.stop_requested.set()
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=max(0.1, timeout_seconds))
+
+class RollingEdgeShadowEvaluator:
+
+    BUCKET_FALLBACKS = (
+        ("symbol_grade_strategy_session_side", ("symbol", "grade", "strategy_family", "session", "side")),
+        ("symbol_grade_strategy_side", ("symbol", "grade", "strategy_family", "side")),
+        ("symbol_grade", ("symbol", "grade")),
+        ("symbol", ("symbol",)),
+        ("global", ()),
+    )
+
+    def __init__(
+        self,
+        db_path=TELEMETRY_DB_PATH,
+        cache_ttl_seconds=ROLLING_EDGE_CACHE_TTL_SECONDS,
+        db_timeout_seconds=ROLLING_EDGE_DB_TIMEOUT_SECONDS,
+        min_sample_for_conclusion=ROLLING_EDGE_MIN_SAMPLE_FOR_CONCLUSION,
+        long_window=ROLLING_EDGE_LONG_WINDOW,
+        short_window=ROLLING_EDGE_SHORT_WINDOW,
+    ):
+        self.db_path = db_path
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self.db_timeout_seconds = db_timeout_seconds
+        self.min_sample_for_conclusion = min_sample_for_conclusion
+        self.long_window = long_window
+        self.short_window = short_window
+        self.cache_lock = threading.Lock()
+        self.cache_loaded_at = 0.0
+        self.cache_records = None
+        self.cache_error = None
+
+    def normalize_text(self, value, default="unknown"):
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text if text else default
+
+    def safe_float(self, value):
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float)):
+            result = float(value)
+        else:
+            text = str(value).strip()
+            if not text or text.lower() in {"none", "null", "nan"}:
+                return None
+            try:
+                result = float(text)
+            except Exception:
+                return None
+        if result != result:
+            return None
+        return result
+
+    def average(self, values):
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def calculate_max_drawdown(self, records):
+        equity = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for record in sorted(records, key=lambda item: (item.get("timestamp_utc") or "", item.get("id") or 0)):
+            net_pnl = record.get("net_pnl")
+            if net_pnl is None:
+                continue
+            equity += net_pnl
+            if equity > peak:
+                peak = equity
+            drawdown = equity - peak
+            if drawdown < max_drawdown:
+                max_drawdown = drawdown
+        return round(max_drawdown, 10)
+
+    def build_trade_record_from_row(self, row):
+        row_id, timestamp_utc, symbol, reason, payload_json = row
+        try:
+            payload = json.loads(payload_json or "{}")
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("event_schema_version") != "trade_closed.v2":
+            return None
+
+        session_context = payload.get("session_context")
+        if not isinstance(session_context, dict):
+            session_context = {}
+        session_name = session_context.get("session_name") or payload.get("session_name")
+        session_profile = session_context.get("session_profile") or payload.get("session_profile")
+        session = session_name or session_profile or "unknown"
+
+        entry_slippage = self.safe_float(payload.get("entry_slippage"))
+        exit_slippage = self.safe_float(payload.get("exit_slippage"))
+        planned_r_points = self.safe_float(payload.get("planned_r_points"))
+        slippage_values = [
+            value
+            for value in (entry_slippage, exit_slippage)
+            if value is not None
+        ]
+        slippage_impact_r = None
+        if planned_r_points is not None and planned_r_points > 0 and slippage_values:
+            slippage_impact_r = sum(slippage_values) / planned_r_points
+
+        exit_reason = self.normalize_text(reason or payload.get("exit_reason"), default="")
+        emergency_flatten_exit_quantity = self.safe_float(payload.get("emergency_flatten_exit_quantity"))
+        return {
+            "id": row_id,
+            "timestamp_utc": timestamp_utc,
+            "symbol": self.normalize_text(symbol or payload.get("symbol")),
+            "grade": self.normalize_text(payload.get("grade")),
+            "strategy_family": self.normalize_text(payload.get("strategy_family")),
+            "session": self.normalize_text(session),
+            "side": self.normalize_text(payload.get("side")),
+            "exit_reason": exit_reason,
+            "analysis_ready": payload.get("analysis_ready") is True,
+            "net_pnl": self.safe_float(payload.get("net_pnl")),
+            "net_r": self.safe_float(payload.get("net_r")),
+            "slippage_impact_r": slippage_impact_r,
+            "time_exit": exit_reason == TIME_EXIT_REASON,
+            "emergency_flatten": (
+                (emergency_flatten_exit_quantity is not None and emergency_flatten_exit_quantity > 0)
+                or "EMERGENCY_FLATTEN" in exit_reason.upper()
+            ),
+        }
+
+    def load_records_from_database(self):
+        path = os.path.abspath(self.db_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"telemetry_database_not_found:{self.db_path}")
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=self.db_timeout_seconds)
+        try:
+            connection.row_factory = None
+            rows = connection.execute(
+                """
+                SELECT id, timestamp_utc, symbol, reason, payload_json
+                FROM telemetry_events
+                WHERE event_type = ?
+                ORDER BY timestamp_utc ASC, id ASC
+                """,
+                ("TRADE_CLOSED",),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        records = []
+        for row in rows:
+            record = self.build_trade_record_from_row(row)
+            if record is not None and record.get("net_pnl") is not None:
+                records.append(record)
+        return records
+
+    def get_cached_records(self):
+        now_value = time.time()
+        with self.cache_lock:
+            if self.cache_records is not None and now_value - self.cache_loaded_at <= self.cache_ttl_seconds:
+                return self.cache_records, self.cache_error, True
+            if self.cache_error is not None and now_value - self.cache_loaded_at <= self.cache_ttl_seconds:
+                return None, self.cache_error, True
+
+        try:
+            records = self.load_records_from_database()
+            with self.cache_lock:
+                self.cache_records = records
+                self.cache_error = None
+                self.cache_loaded_at = now_value
+            return records, None, False
+        except Exception as exc:
+            error = f"{type(exc).__name__}:{exc}"
+            with self.cache_lock:
+                self.cache_records = None
+                self.cache_error = error
+                self.cache_loaded_at = now_value
+            return None, error, False
+
+    def build_candidate_context(self, job):
+        normalized_signal = job.get("normalized_signal") if isinstance(job, dict) else None
+        if not isinstance(normalized_signal, dict):
+            normalized_signal = {}
+        session_name = normalized_signal.get("session_name") or job.get("session_name")
+        session_profile = job.get("session_profile")
+        session = session_name or session_profile or "unknown"
+        return {
+            "symbol": self.normalize_text(job.get("symbol")),
+            "grade": self.normalize_text(job.get("grade")),
+            "strategy_family": self.normalize_text(job.get("strategy_family")),
+            "session": self.normalize_text(session),
+            "side": self.normalize_text(job.get("side")),
+        }
+
+    def bucket_key(self, context, fields):
+        return tuple(context.get(field, "unknown") for field in fields)
+
+    def bucket_label(self, key):
+        return "|".join(key) if key else "global"
+
+    def records_for_bucket(self, records, fields, key):
+        if not fields:
+            return list(records)
+        return [
+            record for record in records
+            if tuple(record.get(field, "unknown") for field in fields) == key
+        ]
+
+    def select_bucket(self, records, context):
+        candidates = []
+        for index, (level_name, fields) in enumerate(self.BUCKET_FALLBACKS, start=1):
+            key = self.bucket_key(context, fields)
+            bucket_records = self.records_for_bucket(records, fields, key)
+            candidates.append((index, level_name, key, fields, bucket_records))
+            if len(bucket_records) >= self.min_sample_for_conclusion:
+                return index, level_name, key, bucket_records
+
+        for index, level_name, key, _fields, bucket_records in candidates:
+            if bucket_records:
+                return index, level_name, key, bucket_records
+
+        index, level_name, key, _fields, bucket_records = candidates[-1]
+        return index, level_name, key, bucket_records
+
+    def latest_window(self, records, size):
+        return sorted(records, key=lambda item: (item.get("timestamp_utc") or "", item.get("id") or 0))[-size:]
+
+    def calculate_metrics(self, records):
+        sample_size = len(records)
+        analysis_ready_count = sum(1 for record in records if record.get("analysis_ready"))
+        net_pnl_values = [record["net_pnl"] for record in records if record.get("net_pnl") is not None]
+        net_r_values = [record["net_r"] for record in records if record.get("net_r") is not None]
+        positive_net_pnl = [value for value in net_pnl_values if value > 0]
+        negative_net_pnl = [value for value in net_pnl_values if value < 0]
+        slippage_impacts = [
+            record["slippage_impact_r"]
+            for record in records
+            if record.get("slippage_impact_r") is not None
+        ]
+
+        net_pnl_total = sum(net_pnl_values) if net_pnl_values else None
+        profit_factor = None
+        profit_factor_reason = None
+        if positive_net_pnl and negative_net_pnl:
+            profit_factor = sum(positive_net_pnl) / abs(sum(negative_net_pnl))
+        elif positive_net_pnl and not negative_net_pnl:
+            profit_factor_reason = "no_losses"
+        elif not positive_net_pnl and negative_net_pnl:
+            profit_factor = 0.0
+        else:
+            profit_factor_reason = "no_wins_or_losses"
+
+        winrate = None
+        if net_pnl_values:
+            winrate = len(positive_net_pnl) / len(net_pnl_values)
+
+        return {
+            "sample_size": sample_size,
+            "analysis_ready_count": analysis_ready_count,
+            "net_pnl_total": net_pnl_total,
+            "expectancy_eur": (net_pnl_total / len(net_pnl_values)) if net_pnl_values else None,
+            "expectancy_r": self.average(net_r_values),
+            "winrate": winrate,
+            "profit_factor": profit_factor,
+            "profit_factor_reason": profit_factor_reason,
+            "max_drawdown": self.calculate_max_drawdown(records),
+            "avg_slippage_impact_r": self.average(slippage_impacts),
+            "time_exit_ratio": (
+                sum(1 for record in records if record.get("time_exit")) / sample_size
+                if sample_size else None
+            ),
+            "emergency_flatten_ratio": (
+                sum(1 for record in records if record.get("emergency_flatten")) / sample_size
+                if sample_size else None
+            ),
+        }
+
+    def degradation_warning(self, short_metrics, long_metrics):
+        short_expectancy = short_metrics.get("expectancy_r")
+        long_expectancy = long_metrics.get("expectancy_r")
+        if short_expectancy is not None and long_expectancy is not None:
+            if short_expectancy <= long_expectancy - 0.25:
+                return True
+        short_pnl = short_metrics.get("net_pnl_total")
+        long_pnl = long_metrics.get("net_pnl_total")
+        return short_pnl is not None and long_pnl is not None and short_pnl < 0 and long_pnl > 0
+
+    def determine_decision(self, long_metrics, short_metrics):
+        sample_size = long_metrics.get("sample_size") or 0
+        analysis_ready_count = long_metrics.get("analysis_ready_count") or 0
+        ready_ratio = analysis_ready_count / sample_size if sample_size else None
+        reason = "neutral_observed"
+        would_allow = None
+
+        if sample_size < self.min_sample_for_conclusion:
+            reason = "insufficient_sample"
+        elif ready_ratio is not None and ready_ratio < ROLLING_EDGE_MIN_ANALYSIS_READY_RATIO:
+            reason = "incomplete_data"
+        elif (
+            long_metrics.get("avg_slippage_impact_r") is not None
+            and long_metrics["avg_slippage_impact_r"] > ROLLING_EDGE_SLIPPAGE_WARNING_R
+        ):
+            reason = "slippage_warning"
+            would_allow = False
+        elif (
+            (long_metrics.get("expectancy_r") is not None and long_metrics["expectancy_r"] < 0)
+            or (long_metrics.get("net_pnl_total") is not None and long_metrics["net_pnl_total"] < 0)
+        ):
+            reason = "edge_negative_observed"
+            would_allow = False
+        elif self.degradation_warning(short_metrics, long_metrics):
+            reason = "degradation_warning"
+            would_allow = False
+        elif (
+            long_metrics.get("expectancy_r") is not None
+            and long_metrics["expectancy_r"] > 0
+            and long_metrics.get("net_pnl_total") is not None
+            and long_metrics["net_pnl_total"] > 0
+        ):
+            reason = "edge_positive_observed"
+            would_allow = True
+
+        return reason, would_allow
+
+    def unavailable_decision(self, job, error):
+        context = self.build_candidate_context(job if isinstance(job, dict) else {})
+        return {
+            "mode": "shadow",
+            "would_allow": None,
+            "reason": "telemetry_unavailable",
+            "telemetry_error": str(error),
+            "bucket_used": "unavailable",
+            "bucket_fallback_level": None,
+            "bucket_fallback_name": None,
+            "candidate": context,
+            "sample_size": 0,
+            "analysis_ready_count": 0,
+            "long_window": {},
+            "short_window": {},
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+        }
+
+    def evaluate(self, job):
+        records, error, cache_hit = self.get_cached_records()
+        if error is not None:
+            decision = self.unavailable_decision(job, error)
+            decision["cache_hit"] = cache_hit
+            return decision
+
+        context = self.build_candidate_context(job)
+        level, level_name, key, bucket_records = self.select_bucket(records or [], context)
+        long_records = self.latest_window(bucket_records, self.long_window)
+        short_records = self.latest_window(bucket_records, self.short_window)
+        long_metrics = self.calculate_metrics(long_records)
+        short_metrics = self.calculate_metrics(short_records)
+        reason, would_allow = self.determine_decision(long_metrics, short_metrics)
+        return {
+            "mode": "shadow",
+            "would_allow": would_allow,
+            "reason": reason,
+            "bucket_used": self.bucket_label(key),
+            "bucket_fallback_level": level,
+            "bucket_fallback_name": level_name,
+            "candidate": context,
+            "sample_size": long_metrics.get("sample_size"),
+            "analysis_ready_count": long_metrics.get("analysis_ready_count"),
+            "net_pnl_total": long_metrics.get("net_pnl_total"),
+            "expectancy_eur": long_metrics.get("expectancy_eur"),
+            "expectancy_r": long_metrics.get("expectancy_r"),
+            "winrate": long_metrics.get("winrate"),
+            "profit_factor": long_metrics.get("profit_factor"),
+            "profit_factor_reason": long_metrics.get("profit_factor_reason"),
+            "max_drawdown": long_metrics.get("max_drawdown"),
+            "avg_slippage_impact_r": long_metrics.get("avg_slippage_impact_r"),
+            "time_exit_ratio": long_metrics.get("time_exit_ratio"),
+            "emergency_flatten_ratio": long_metrics.get("emergency_flatten_ratio"),
+            "short_window": short_metrics,
+            "long_window": long_metrics,
+            "cache_hit": cache_hit,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "db_path": self.db_path,
+        }
+
+class SlippageDefenseShadowEvaluator(RollingEdgeShadowEvaluator):
+
+    def __init__(
+        self,
+        db_path=TELEMETRY_DB_PATH,
+        cache_ttl_seconds=SLIPPAGE_DEFENSE_CACHE_TTL_SECONDS,
+        db_timeout_seconds=SLIPPAGE_DEFENSE_DB_TIMEOUT_SECONDS,
+        min_sample=SLIPPAGE_DEFENSE_MIN_SAMPLE,
+        max_signal_age_seconds=SLIPPAGE_DEFENSE_MAX_SIGNAL_AGE_SECONDS,
+        max_queue_age_seconds=SLIPPAGE_DEFENSE_MAX_QUEUE_AGE_SECONDS,
+        max_entry_drift_r=SLIPPAGE_DEFENSE_MAX_ENTRY_DRIFT_R,
+        historical_slippage_warning_r=SLIPPAGE_DEFENSE_HISTORICAL_SLIPPAGE_WARNING_R,
+    ):
+        super().__init__(
+            db_path=db_path,
+            cache_ttl_seconds=cache_ttl_seconds,
+            db_timeout_seconds=db_timeout_seconds,
+            min_sample_for_conclusion=min_sample,
+            long_window=min_sample,
+            short_window=min_sample,
+        )
+        self.min_sample = min_sample
+        self.max_signal_age_seconds = max_signal_age_seconds
+        self.max_queue_age_seconds = max_queue_age_seconds
+        self.max_entry_drift_r = max_entry_drift_r
+        self.historical_slippage_warning_r = historical_slippage_warning_r
+
+    def parse_timestamp(self, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                numeric_value = float(value)
+                if numeric_value > 100000000000:
+                    numeric_value = numeric_value / 1000.0
+                return datetime.fromtimestamp(numeric_value, timezone.utc)
+            except Exception:
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def seconds_between_any(self, start, end):
+        start_dt = self.parse_timestamp(start)
+        end_dt = self.parse_timestamp(end)
+        if start_dt is None or end_dt is None:
+            return None
+        try:
+            return round((end_dt - start_dt).total_seconds(), 3)
+        except Exception:
+            return None
+
+    def get_normalized_signal(self, job):
+        normalized_signal = job.get("normalized_signal") if isinstance(job, dict) else None
+        return normalized_signal if isinstance(normalized_signal, dict) else {}
+
+    def resolve_signal_time(self, job):
+        if not isinstance(job, dict):
+            return None
+        normalized_signal = self.get_normalized_signal(job)
+        return (
+            job.get("signal_time")
+            or normalized_signal.get("timestamp_utc")
+            or normalized_signal.get("time")
+        )
+
+    def resolve_queue_put_time(self, job):
+        if not isinstance(job, dict):
+            return None
+        return job.get("queue_put_time") or job.get("enqueue_time")
+
+    def resolve_worker_pickup_time(self, job):
+        if not isinstance(job, dict):
+            return None
+        return job.get("worker_pickup_time") or datetime.now(timezone.utc)
+
+    def resolve_candidate_entry(self, job):
+        if not isinstance(job, dict):
+            return None
+        return self.safe_float(
+            job.get("candidate_entry")
+            if job.get("candidate_entry") is not None
+            else job.get("planned_executable_entry")
+            if job.get("planned_executable_entry") is not None
+            else job.get("entry")
+        )
+
+    def calculate_entry_drift(self, job):
+        if not isinstance(job, dict):
+            return None, None, None, None, None
+        reference_price = self.safe_float(job.get("reference_price"))
+        planned_executable_entry = self.safe_float(job.get("planned_executable_entry"))
+        candidate_entry = self.resolve_candidate_entry(job)
+        stop_distance_points = self.safe_float(job.get("stop_distance_points"))
+        entry_drift_points = None
+        entry_drift_r = None
+        if reference_price is not None and candidate_entry is not None:
+            entry_drift_points = abs(candidate_entry - reference_price)
+            if stop_distance_points is not None and stop_distance_points > 0:
+                entry_drift_r = entry_drift_points / stop_distance_points
+        return reference_price, planned_executable_entry, candidate_entry, entry_drift_points, entry_drift_r
+
+    def build_slippage_record_from_row(self, row):
+        row_id, timestamp_utc, symbol, _reason, payload_json = row
+        try:
+            payload = json.loads(payload_json or "{}")
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("event_schema_version") != "trade_closed.v2":
+            return None
+
+        session_context = payload.get("session_context")
+        if not isinstance(session_context, dict):
+            session_context = {}
+        session_name = session_context.get("session_name") or payload.get("session_name")
+        session_profile = session_context.get("session_profile") or payload.get("session_profile")
+        session = session_name or session_profile or "unknown"
+
+        entry_slippage = self.safe_float(payload.get("entry_slippage"))
+        exit_slippage = self.safe_float(payload.get("exit_slippage"))
+        planned_r_points = self.safe_float(payload.get("planned_r_points"))
+        slippage_values = [
+            value for value in (entry_slippage, exit_slippage)
+            if value is not None
+        ]
+        if planned_r_points is None or planned_r_points <= 0 or not slippage_values:
+            return None
+
+        return {
+            "id": row_id,
+            "timestamp_utc": timestamp_utc,
+            "symbol": self.normalize_text(symbol or payload.get("symbol")),
+            "grade": self.normalize_text(payload.get("grade")),
+            "strategy_family": self.normalize_text(payload.get("strategy_family")),
+            "session": self.normalize_text(session),
+            "side": self.normalize_text(payload.get("side")),
+            "slippage_impact_r": sum(slippage_values) / planned_r_points,
+        }
+
+    def load_records_from_database(self):
+        path = os.path.abspath(self.db_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"telemetry_database_not_found:{self.db_path}")
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=self.db_timeout_seconds)
+        try:
+            connection.row_factory = None
+            rows = connection.execute(
+                """
+                SELECT id, timestamp_utc, symbol, reason, payload_json
+                FROM telemetry_events
+                WHERE event_type = ?
+                ORDER BY timestamp_utc ASC, id ASC
+                """,
+                ("TRADE_CLOSED",),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        records = []
+        for row in rows:
+            record = self.build_slippage_record_from_row(row)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def build_decision_base(self, job, phase):
+        safe_job = job if isinstance(job, dict) else {}
+        context = self.build_candidate_context(safe_job)
+        return {
+            "mode": "shadow",
+            "phase": phase,
+            "would_allow": None,
+            "reason": "neutral_observed",
+            "symbol": context.get("symbol"),
+            "grade": context.get("grade"),
+            "strategy_family": context.get("strategy_family"),
+            "session": context.get("session"),
+            "side": context.get("side"),
+            "signal_id": safe_job.get("signal_id"),
+            "candidate": context,
+            "current_spread_status": "not_available",
+        }
+
+    def bucket_has_minimum_sample(self, bucket_records):
+        return len(bucket_records) >= self.min_sample
+
+    def select_slippage_bucket(self, records, context):
+        candidates = []
+        for index, (level_name, fields) in enumerate(self.BUCKET_FALLBACKS, start=1):
+            key = self.bucket_key(context, fields)
+            bucket_records = self.records_for_bucket(records, fields, key)
+            candidates.append((index, level_name, key, bucket_records))
+            if self.bucket_has_minimum_sample(bucket_records):
+                return index, level_name, key, bucket_records, True
+
+        for index, level_name, key, bucket_records in candidates:
+            if bucket_records:
+                return index, level_name, key, bucket_records, False
+
+        index, level_name, key, bucket_records = candidates[-1]
+        return index, level_name, key, bucket_records, False
+
+    def historical_slippage_metrics(self, records, context):
+        level, level_name, key, bucket_records, has_min_sample = self.select_slippage_bucket(records, context)
+        impacts = [
+            record.get("slippage_impact_r")
+            for record in bucket_records
+            if record.get("slippage_impact_r") is not None
+        ]
+        return {
+            "historical_avg_slippage_impact_r": self.average(impacts),
+            "historical_sample_size": len(bucket_records),
+            "historical_bucket_used": self.bucket_label(key),
+            "historical_bucket_fallback_level": level,
+            "historical_bucket_fallback_name": level_name,
+            "historical_bucket_has_min_sample": has_min_sample,
+            "historical_min_sample": self.min_sample,
+        }
+
+    def determine_pre_queue_decision(self, decision):
+        signal_age_sec = decision.get("signal_age_sec")
+        entry_drift_r = decision.get("entry_drift_r")
+        historical_avg_slippage_impact_r = decision.get("historical_avg_slippage_impact_r")
+        historical_bucket_has_min_sample = decision.get("historical_bucket_has_min_sample") is True
+
+        if signal_age_sec is not None and signal_age_sec > self.max_signal_age_seconds:
+            return "stale_signal_warning", False
+        if entry_drift_r is not None and entry_drift_r > self.max_entry_drift_r:
+            return "entry_drift_warning", False
+        if (
+            historical_bucket_has_min_sample
+            and historical_avg_slippage_impact_r is not None
+            and historical_avg_slippage_impact_r > self.historical_slippage_warning_r
+        ):
+            return "historical_slippage_warning", False
+        if not historical_bucket_has_min_sample:
+            return "insufficient_slippage_sample", None
+        if historical_avg_slippage_impact_r is None:
+            return "neutral_observed", None
+        return "slippage_clear", True
+
+    def unavailable_decision(self, phase, job, error):
+        decision = self.build_decision_base(job if isinstance(job, dict) else {}, phase)
+        decision.update({
+            "reason": "telemetry_unavailable",
+            "telemetry_error": str(error),
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "db_path": self.db_path,
+        })
+        if phase == "pre_queue":
+            decision.update({
+                "signal_age_sec": None,
+                "max_signal_age_sec": self.max_signal_age_seconds,
+                "reference_price": None,
+                "planned_executable_entry": None,
+                "candidate_entry": None,
+                "entry_drift_points": None,
+                "entry_drift_r": None,
+                "allowed_entry_drift_r": self.max_entry_drift_r,
+                "historical_avg_slippage_impact_r": None,
+                "historical_sample_size": 0,
+                "historical_bucket_used": "unavailable",
+            })
+        return decision
+
+    def evaluate_pre_queue(self, job):
+        records, error, cache_hit = self.get_cached_records()
+        if error is not None:
+            decision = self.unavailable_decision("pre_queue", job, error)
+            decision["cache_hit"] = cache_hit
+            return decision
+
+        decision = self.build_decision_base(job, "pre_queue")
+        signal_time = self.resolve_signal_time(job)
+        signal_age_sec = self.seconds_between_any(signal_time, datetime.now(timezone.utc))
+        reference_price, planned_executable_entry, candidate_entry, entry_drift_points, entry_drift_r = (
+            self.calculate_entry_drift(job)
+        )
+        historical_metrics = self.historical_slippage_metrics(records or [], decision["candidate"])
+        decision.update({
+            "signal_age_sec": signal_age_sec,
+            "max_signal_age_sec": self.max_signal_age_seconds,
+            "reference_price": reference_price,
+            "planned_executable_entry": planned_executable_entry,
+            "candidate_entry": candidate_entry,
+            "entry_drift_points": entry_drift_points,
+            "entry_drift_r": entry_drift_r,
+            "allowed_entry_drift_r": self.max_entry_drift_r,
+            "historical_slippage_warning_r": self.historical_slippage_warning_r,
+            "cache_hit": cache_hit,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "db_path": self.db_path,
+        })
+        decision.update(historical_metrics)
+        reason, would_allow = self.determine_pre_queue_decision(decision)
+        decision["reason"] = reason
+        decision["would_allow"] = would_allow
+        return decision
+
+    def evaluate_worker_pickup(self, job):
+        decision = self.build_decision_base(job, "worker_pickup")
+        queue_put_time = self.resolve_queue_put_time(job)
+        worker_pickup_time = self.resolve_worker_pickup_time(job)
+        queue_age_sec = self.seconds_between_any(queue_put_time, worker_pickup_time)
+        if queue_age_sec is None:
+            reason = "queue_age_unavailable"
+            would_allow = None
+        elif queue_age_sec > self.max_queue_age_seconds:
+            reason = "queue_age_warning"
+            would_allow = False
+        else:
+            reason = "slippage_clear"
+            would_allow = True
+
+        decision.update({
+            "would_allow": would_allow,
+            "reason": reason,
+            "queue_age_sec": queue_age_sec,
+            "max_queue_age_sec": self.max_queue_age_seconds,
+            "worker_pickup_time": worker_pickup_time,
+            "queue_put_time": queue_put_time,
+        })
+        return decision
+
+    def evaluate(self, job, phase="pre_queue"):
+        if phase == "worker_pickup":
+            return self.evaluate_worker_pickup(job)
+        return self.evaluate_pre_queue(job)
+
+class TradeLearningAdvisor(RollingEdgeShadowEvaluator):
+
+    def __init__(
+        self,
+        db_path=TELEMETRY_DB_PATH,
+        cache_ttl_seconds=TRADE_LEARNING_CACHE_TTL_SECONDS,
+        db_timeout_seconds=TRADE_LEARNING_DB_TIMEOUT_SECONDS,
+        min_sample=TRADE_LEARNING_MIN_SAMPLE,
+        recent_window=TRADE_LEARNING_RECENT_WINDOW,
+        min_comparison_sample=TRADE_LEARNING_MIN_COMPARISON_SAMPLE,
+        slippage_drag_warning_r=TRADE_LEARNING_SLIPPAGE_DRAG_WARNING_R,
+        degradation_delta_r=TRADE_LEARNING_DEGRADATION_DELTA_R,
+    ):
+        super().__init__(
+            db_path=db_path,
+            cache_ttl_seconds=cache_ttl_seconds,
+            db_timeout_seconds=db_timeout_seconds,
+            min_sample_for_conclusion=min_sample,
+            long_window=min_sample,
+            short_window=recent_window,
+        )
+        self.min_sample = min_sample
+        self.recent_window = recent_window
+        self.min_comparison_sample = min_comparison_sample
+        self.slippage_drag_warning_r = slippage_drag_warning_r
+        self.degradation_delta_r = degradation_delta_r
+
+    def build_learning_record_from_row(self, row):
+        row_id, timestamp_utc, symbol, reason, payload_json = row
+        try:
+            payload = json.loads(payload_json or "{}")
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("event_schema_version") != "trade_closed.v2":
+            return None
+        if payload.get("analysis_ready") is not True:
+            return None
+
+        session_context = payload.get("session_context")
+        if not isinstance(session_context, dict):
+            session_context = {}
+        session_name = session_context.get("session_name") or payload.get("session_name")
+        session_profile = session_context.get("session_profile") or payload.get("session_profile")
+        session = session_name or session_profile or "unknown"
+
+        entry_slippage = self.safe_float(payload.get("entry_slippage"))
+        exit_slippage = self.safe_float(payload.get("exit_slippage"))
+        planned_r_points = self.safe_float(payload.get("planned_r_points"))
+        slippage_values = [
+            value for value in (entry_slippage, exit_slippage)
+            if value is not None
+        ]
+        slippage_impact_r = None
+        if planned_r_points is not None and planned_r_points > 0 and slippage_values:
+            slippage_impact_r = sum(slippage_values) / planned_r_points
+
+        exit_reason = self.normalize_text(reason or payload.get("exit_reason"), default="")
+        emergency_flatten_exit_quantity = self.safe_float(payload.get("emergency_flatten_exit_quantity"))
+        return {
+            "id": row_id,
+            "timestamp_utc": timestamp_utc,
+            "symbol": self.normalize_text(symbol or payload.get("symbol")),
+            "grade": self.normalize_text(payload.get("grade")),
+            "strategy_family": self.normalize_text(payload.get("strategy_family")),
+            "session": self.normalize_text(session),
+            "side": self.normalize_text(payload.get("side")),
+            "exit_reason": exit_reason,
+            "net_pnl": self.safe_float(payload.get("net_pnl")),
+            "net_r": self.safe_float(payload.get("net_r")),
+            "slippage_impact_r": slippage_impact_r,
+            "duration_in_trade_sec": self.safe_float(payload.get("duration_in_trade_sec")),
+            "time_exit": exit_reason == TIME_EXIT_REASON,
+            "emergency_flatten": (
+                (emergency_flatten_exit_quantity is not None and emergency_flatten_exit_quantity > 0)
+                or "EMERGENCY_FLATTEN" in exit_reason.upper()
+            ),
+        }
+
+    def load_records_from_database(self):
+        path = os.path.abspath(self.db_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"telemetry_database_not_found:{self.db_path}")
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=self.db_timeout_seconds)
+        try:
+            connection.row_factory = None
+            rows = connection.execute(
+                """
+                SELECT id, timestamp_utc, symbol, reason, payload_json
+                FROM telemetry_events
+                WHERE event_type = ?
+                ORDER BY timestamp_utc ASC, id ASC
+                """,
+                ("TRADE_CLOSED",),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        records = []
+        for row in rows:
+            record = self.build_learning_record_from_row(row)
+            if record is not None and record.get("net_r") is not None:
+                records.append(record)
+        return records
+
+    def calculate_learning_metrics(self, records):
+        sample_size = len(records)
+        net_r_values = [record["net_r"] for record in records if record.get("net_r") is not None]
+        net_pnl_values = [record["net_pnl"] for record in records if record.get("net_pnl") is not None]
+        positive_net_pnl = [value for value in net_pnl_values if value > 0]
+        negative_net_pnl = [value for value in net_pnl_values if value < 0]
+        slippage_impacts = [
+            record["slippage_impact_r"]
+            for record in records
+            if record.get("slippage_impact_r") is not None
+        ]
+        durations = [
+            record["duration_in_trade_sec"]
+            for record in records
+            if record.get("duration_in_trade_sec") is not None
+        ]
+
+        profit_factor = None
+        profit_factor_reason = None
+        if positive_net_pnl and negative_net_pnl:
+            profit_factor = sum(positive_net_pnl) / abs(sum(negative_net_pnl))
+        elif positive_net_pnl and not negative_net_pnl:
+            profit_factor_reason = "no_losses"
+        elif not positive_net_pnl and negative_net_pnl:
+            profit_factor = 0.0
+        else:
+            profit_factor_reason = "no_wins_or_losses"
+
+        return {
+            "sample_size": sample_size,
+            "expectancy_r": self.average(net_r_values),
+            "net_pnl_total": sum(net_pnl_values) if net_pnl_values else None,
+            "winrate": (
+                len([value for value in net_r_values if value > 0]) / len(net_r_values)
+                if net_r_values else None
+            ),
+            "profit_factor": profit_factor,
+            "profit_factor_reason": profit_factor_reason,
+            "avg_slippage_impact_r": self.average(slippage_impacts),
+            "time_exit_ratio": (
+                sum(1 for record in records if record.get("time_exit")) / sample_size
+                if sample_size else None
+            ),
+            "emergency_flatten_ratio": (
+                sum(1 for record in records if record.get("emergency_flatten")) / sample_size
+                if sample_size else None
+            ),
+            "avg_duration_sec": self.average(durations),
+        }
+
+    def comparison_extremes(self, records, field_name, data_warnings):
+        groups = {}
+        for record in records:
+            key = self.normalize_text(record.get(field_name))
+            groups.setdefault(key, []).append(record)
+
+        valid_groups = []
+        for key, group_records in groups.items():
+            if len(group_records) < self.min_comparison_sample:
+                continue
+            metrics = self.calculate_learning_metrics(group_records)
+            valid_groups.append((key, metrics))
+
+        if len(valid_groups) < 2:
+            data_warnings.append(f"insufficient_{field_name}_comparison_data")
+            return None, None
+
+        valid_groups = [
+            item for item in valid_groups
+            if item[1].get("expectancy_r") is not None
+        ]
+        if len(valid_groups) < 2:
+            data_warnings.append(f"insufficient_{field_name}_expectancy_data")
+            return None, None
+
+        best_key, _best_metrics = max(valid_groups, key=lambda item: item[1]["expectancy_r"])
+        weakest_key, _weakest_metrics = min(valid_groups, key=lambda item: item[1]["expectancy_r"])
+        return best_key, weakest_key
+
+    def build_decision_base(self, job):
+        context = self.build_candidate_context(job if isinstance(job, dict) else {})
+        return {
+            "mode": "shadow",
+            "would_adjust": False,
+            "reason": "learning_neutral",
+            "recommendations": ["continue_observing"],
+            "confidence": "low",
+            "confidence_reason": "not_evaluated",
+            "decision_effect": "observability_only",
+            "symbol": context.get("symbol"),
+            "grade": context.get("grade"),
+            "strategy_family": context.get("strategy_family"),
+            "session": context.get("session"),
+            "side": context.get("side"),
+            "signal_id": job.get("signal_id") if isinstance(job, dict) else None,
+            "candidate": context,
+            "data_warnings": [],
+        }
+
+    def unavailable_decision(self, job, error):
+        decision = self.build_decision_base(job if isinstance(job, dict) else {})
+        decision.update({
+            "would_adjust": None,
+            "reason": "learning_telemetry_unavailable",
+            "recommendations": ["continue_observing"],
+            "confidence": "none",
+            "confidence_reason": "telemetry_unavailable",
+            "bucket_used": "unavailable",
+            "bucket_fallback_level": None,
+            "bucket_fallback_name": None,
+            "sample_size": 0,
+            "telemetry_error": str(error),
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "db_path": self.db_path,
+        })
+        return decision
+
+    def confidence_for(self, sample_size, data_warnings):
+        if sample_size >= 50 and not data_warnings:
+            return "high", "sample_ge_50_without_data_warnings"
+        if sample_size >= self.min_sample and not data_warnings:
+            return "medium", "sample_ge_min_without_data_warnings"
+        if sample_size >= self.min_sample:
+            return "low", "comparison_data_incomplete"
+        return "low", "sample_below_minimum"
+
+    def determine_learning_advice(self, metrics, recent_metrics, data_warnings, context):
+        sample_size = metrics.get("sample_size") or 0
+        expectancy_r = metrics.get("expectancy_r")
+        recent_expectancy_r = recent_metrics.get("expectancy_r")
+        long_expectancy_r = metrics.get("expectancy_r")
+        net_pnl_total = metrics.get("net_pnl_total")
+        avg_slippage_impact_r = metrics.get("avg_slippage_impact_r")
+        best_session = metrics.get("best_session")
+        weakest_session = metrics.get("weakest_session")
+        best_grade = metrics.get("best_grade")
+        weakest_grade = metrics.get("weakest_grade")
+
+        degradation_detected = (
+            recent_expectancy_r is not None
+            and long_expectancy_r is not None
+            and recent_expectancy_r <= long_expectancy_r - self.degradation_delta_r
+        )
+
+        reason = "learning_neutral"
+        would_adjust = False
+        recommendations = ["continue_observing"]
+
+        if sample_size < self.min_sample:
+            reason = "learning_insufficient_sample"
+            recommendations = ["continue_observing", "monitor_bucket"]
+        elif degradation_detected:
+            reason = "learning_degradation_detected"
+            would_adjust = True
+            recommendations = ["monitor_bucket", "consider_reduce_priority_after_confirmation"]
+        elif avg_slippage_impact_r is not None and avg_slippage_impact_r > self.slippage_drag_warning_r:
+            reason = "learning_slippage_drag_detected"
+            would_adjust = True
+            recommendations = ["investigate_slippage", "monitor_bucket"]
+        elif (
+            (expectancy_r is not None and expectancy_r < 0)
+            or (net_pnl_total is not None and net_pnl_total < 0)
+        ):
+            reason = "learning_negative_edge_detected"
+            would_adjust = True
+            recommendations = ["monitor_bucket", "consider_disable_bucket_after_confirmation"]
+        elif (
+            weakest_session is not None
+            and context.get("session") == weakest_session
+            and best_session is not None
+            and best_session != weakest_session
+        ):
+            reason = "learning_session_weakness_detected"
+            would_adjust = True
+            recommendations = ["review_session_filter", "monitor_bucket"]
+        elif (
+            weakest_grade is not None
+            and context.get("grade") == weakest_grade
+            and best_grade is not None
+            and best_grade != weakest_grade
+        ):
+            reason = "learning_grade_underperforming"
+            would_adjust = True
+            recommendations = ["review_grade_filter", "monitor_bucket"]
+        elif expectancy_r is not None and expectancy_r > 0 and net_pnl_total is not None and net_pnl_total > 0:
+            reason = "learning_positive_edge_confirmed"
+            recommendations = ["edge_confirmed_no_action"]
+
+        return reason, would_adjust, recommendations, degradation_detected
+
+    def evaluate(self, job):
+        records, error, cache_hit = self.get_cached_records()
+        if error is not None:
+            decision = self.unavailable_decision(job, error)
+            decision["cache_hit"] = cache_hit
+            return decision
+
+        context = self.build_candidate_context(job if isinstance(job, dict) else {})
+        level, level_name, key, bucket_records = self.select_bucket(records or [], context)
+        long_records = self.latest_window(bucket_records, max(len(bucket_records), self.min_sample))
+        recent_records = self.latest_window(bucket_records, self.recent_window)
+
+        data_warnings = []
+        metrics = self.calculate_learning_metrics(long_records)
+        recent_metrics = self.calculate_learning_metrics(recent_records)
+        best_session, weakest_session = self.comparison_extremes(long_records, "session", data_warnings)
+        best_grade, weakest_grade = self.comparison_extremes(long_records, "grade", data_warnings)
+        metrics["best_session"] = best_session
+        metrics["weakest_session"] = weakest_session
+        metrics["best_grade"] = best_grade
+        metrics["weakest_grade"] = weakest_grade
+
+        reason, would_adjust, recommendations, degradation_detected = self.determine_learning_advice(
+            metrics,
+            recent_metrics,
+            data_warnings,
+            context,
+        )
+        confidence, confidence_reason = self.confidence_for(metrics.get("sample_size") or 0, data_warnings)
+
+        decision = self.build_decision_base(job if isinstance(job, dict) else {})
+        decision.update({
+            "would_adjust": would_adjust,
+            "reason": reason,
+            "recommendations": recommendations,
+            "confidence": confidence,
+            "confidence_reason": confidence_reason,
+            "bucket_used": self.bucket_label(key),
+            "bucket_fallback_level": level,
+            "bucket_fallback_name": level_name,
+            "sample_size": metrics.get("sample_size"),
+            "expectancy_r": metrics.get("expectancy_r"),
+            "recent_expectancy_r": recent_metrics.get("expectancy_r"),
+            "long_expectancy_r": metrics.get("expectancy_r"),
+            "net_pnl_total": metrics.get("net_pnl_total"),
+            "winrate": metrics.get("winrate"),
+            "profit_factor": metrics.get("profit_factor"),
+            "profit_factor_reason": metrics.get("profit_factor_reason"),
+            "avg_slippage_impact_r": metrics.get("avg_slippage_impact_r"),
+            "time_exit_ratio": metrics.get("time_exit_ratio"),
+            "emergency_flatten_ratio": metrics.get("emergency_flatten_ratio"),
+            "avg_duration_sec": metrics.get("avg_duration_sec"),
+            "best_session": metrics.get("best_session"),
+            "weakest_session": metrics.get("weakest_session"),
+            "best_grade": metrics.get("best_grade"),
+            "weakest_grade": metrics.get("weakest_grade"),
+            "degradation_detected": degradation_detected,
+            "data_warnings": data_warnings,
+            "cache_hit": cache_hit,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "db_path": self.db_path,
+        })
+        return decision
+
+class ExecutionQualityGate:
+
+    EDGE_BLOCK_REASONS = {
+        "edge_negative_observed",
+        "degradation_warning",
+        "slippage_warning",
+    }
+    SLIPPAGE_PRE_QUEUE_BLOCK_REASONS = {
+        "historical_slippage_warning",
+        "stale_signal_warning",
+        "entry_drift_warning",
+    }
+    NON_BLOCKING_REASONS = {
+        "insufficient_sample",
+        "insufficient_slippage_sample",
+        "telemetry_unavailable",
+        "neutral_observed",
+        "incomplete_data",
+        "queue_age_warning",
+        "queue_age_unavailable",
+    }
+
+    def __init__(
+        self,
+        bot_stage=BOT_STAGE,
+        env_getter=os.getenv,
+        default_mode_acc=EXECUTION_QUALITY_GATE_DEFAULT_MODE_ACC,
+        default_mode_prd=EXECUTION_QUALITY_GATE_DEFAULT_MODE_PRD,
+    ):
+        self.bot_stage = bot_stage
+        self.env_getter = env_getter
+        self.default_mode_acc = default_mode_acc
+        self.default_mode_prd = default_mode_prd
+
+    def normalize_text(self, value, default="unknown"):
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text if text else default
+
+    def default_mode_for_stage(self):
+        if self.bot_stage == "ACC":
+            return self.default_mode_acc
+        if self.bot_stage == "PRD":
+            return self.default_mode_prd
+        return "shadow"
+
+    def resolve_mode(self):
+        raw_mode = self.env_getter(EXECUTION_QUALITY_GATE_MODE_ENV_VAR)
+        configured_mode = str(raw_mode).strip().lower() if raw_mode is not None else ""
+        if not configured_mode:
+            configured_mode = self.default_mode_for_stage()
+        if configured_mode in EXECUTION_QUALITY_GATE_VALID_MODES:
+            return configured_mode, raw_mode, None
+        return "shadow", raw_mode, configured_mode
+
+    def prd_approval_present(self):
+        return parse_env_bool(self.env_getter(EXECUTION_QUALITY_GATE_PRD_APPROVAL_ENV_VAR)) is True
+
+    def enforcement_active_for_mode(self, mode, prd_approval_present):
+        if mode == "enforce_acc_only":
+            return self.bot_stage == "ACC"
+        if mode == "enforce_prd_after_approval":
+            return self.bot_stage == "PRD" and prd_approval_present is True
+        return False
+
+    def build_context(self, job, edge_decision=None, slippage_decision=None):
+        safe_job = job if isinstance(job, dict) else {}
+        normalized_signal = safe_job.get("normalized_signal")
+        if not isinstance(normalized_signal, dict):
+            normalized_signal = {}
+
+        candidate = None
+        for decision in (slippage_decision, edge_decision):
+            if isinstance(decision, dict) and isinstance(decision.get("candidate"), dict):
+                candidate = decision["candidate"]
+                break
+        if not isinstance(candidate, dict):
+            candidate = {}
+
+        session = (
+            candidate.get("session")
+            or normalized_signal.get("session_name")
+            or safe_job.get("session_name")
+            or safe_job.get("session_profile")
+        )
+        return {
+            "symbol": self.normalize_text(candidate.get("symbol") or safe_job.get("symbol")),
+            "grade": self.normalize_text(candidate.get("grade") or safe_job.get("grade")),
+            "strategy_family": self.normalize_text(
+                candidate.get("strategy_family") or safe_job.get("strategy_family")
+            ),
+            "session": self.normalize_text(session),
+            "side": self.normalize_text(candidate.get("side") or safe_job.get("side")),
+            "signal_id": safe_job.get("signal_id"),
+        }
+
+    def add_edge_block_source(self, block_sources, edge_decision):
+        if not isinstance(edge_decision, dict):
+            return
+        reason = edge_decision.get("reason")
+        if reason in self.EDGE_BLOCK_REASONS and edge_decision.get("would_allow") is False:
+            block_sources.append({
+                "source": "rolling_edge",
+                "reason": reason,
+                "bucket_used": edge_decision.get("bucket_used"),
+                "sample_size": edge_decision.get("sample_size"),
+            })
+
+    def add_slippage_block_source(self, block_sources, slippage_decision):
+        if not isinstance(slippage_decision, dict):
+            return
+        reason = slippage_decision.get("reason")
+        phase = slippage_decision.get("phase")
+        if (
+            phase == "pre_queue"
+            and reason in self.SLIPPAGE_PRE_QUEUE_BLOCK_REASONS
+            and slippage_decision.get("would_allow") is False
+        ):
+            block_sources.append({
+                "source": "slippage_defense_pre_queue",
+                "reason": reason,
+                "bucket_used": slippage_decision.get("historical_bucket_used"),
+                "sample_size": slippage_decision.get("historical_sample_size"),
+            })
+
+    def summarize_block_sources(self, block_sources):
+        return [
+            f"{source.get('source')}:{source.get('reason')}"
+            for source in block_sources
+            if isinstance(source, dict)
+        ]
+
+    def evaluate(self, job, edge_decision=None, slippage_pre_queue_decision=None, learning_decision=None):
+        mode, raw_mode, unknown_mode = self.resolve_mode()
+        prd_approval = self.prd_approval_present()
+        enforcement_active = self.enforcement_active_for_mode(mode, prd_approval)
+        context = self.build_context(job, edge_decision, slippage_pre_queue_decision)
+
+        block_sources = []
+        self.add_edge_block_source(block_sources, edge_decision)
+        self.add_slippage_block_source(block_sources, slippage_pre_queue_decision)
+
+        would_block = bool(block_sources)
+        blocked = bool(would_block and enforcement_active)
+        if would_block:
+            reason = "execution_quality_gate_block_candidate"
+        elif mode == "off":
+            reason = "execution_quality_gate_off"
+        else:
+            reason = "execution_quality_gate_clear"
+
+        learning_reason = None
+        learning_would_adjust = None
+        if isinstance(learning_decision, dict):
+            learning_reason = learning_decision.get("reason")
+            learning_would_adjust = learning_decision.get("would_adjust")
+
+        return {
+            "mode": mode,
+            "configured_mode": raw_mode,
+            "enforcement_active": enforcement_active,
+            "would_block": would_block,
+            "blocked": blocked,
+            "reason": reason,
+            "block_sources": self.summarize_block_sources(block_sources),
+            "block_source_details": block_sources,
+            "decision_effect": "execution_block" if blocked else "observability_only",
+            "symbol": context.get("symbol"),
+            "grade": context.get("grade"),
+            "strategy_family": context.get("strategy_family"),
+            "session": context.get("session"),
+            "side": context.get("side"),
+            "signal_id": context.get("signal_id"),
+            "edge_reason": edge_decision.get("reason") if isinstance(edge_decision, dict) else None,
+            "edge_would_allow": edge_decision.get("would_allow") if isinstance(edge_decision, dict) else None,
+            "edge_sample_size": edge_decision.get("sample_size") if isinstance(edge_decision, dict) else None,
+            "edge_bucket_used": edge_decision.get("bucket_used") if isinstance(edge_decision, dict) else None,
+            "slippage_pre_queue_reason": (
+                slippage_pre_queue_decision.get("reason")
+                if isinstance(slippage_pre_queue_decision, dict)
+                else None
+            ),
+            "slippage_pre_queue_would_allow": (
+                slippage_pre_queue_decision.get("would_allow")
+                if isinstance(slippage_pre_queue_decision, dict)
+                else None
+            ),
+            "slippage_historical_sample_size": (
+                slippage_pre_queue_decision.get("historical_sample_size")
+                if isinstance(slippage_pre_queue_decision, dict)
+                else None
+            ),
+            "slippage_historical_bucket_used": (
+                slippage_pre_queue_decision.get("historical_bucket_used")
+                if isinstance(slippage_pre_queue_decision, dict)
+                else None
+            ),
+            "learning_reason": learning_reason,
+            "learning_would_adjust": learning_would_adjust,
+            "prd_approval_present": prd_approval,
+            "unknown_mode_fallback": unknown_mode,
+            "bot_stage": self.bot_stage,
+        }
+
 def get_runtime_lock_key():
     return f"{BOT_NAME}:{BOT_STAGE}:client_id={DEFAULT_IB_CLIENT_ID}:account={BOT_ACCOUNT_CONTEXT}"
 
@@ -546,6 +2163,16 @@ class ScalpingBot:
             f"bot_patch={BOT_PATCH} "
             f"bot_stage={BOT_STAGE}"
         )
+        self.telemetry_writer = TelemetryWriter(
+            run_id=self.run_id,
+            bot_stage=BOT_STAGE,
+            account_context=BOT_ACCOUNT_CONTEXT,
+        )
+        self.telemetry_writer.start()
+        self.rolling_edge_evaluator = RollingEdgeShadowEvaluator()
+        self.slippage_defense_evaluator = SlippageDefenseShadowEvaluator()
+        self.trade_learning_advisor = TradeLearningAdvisor()
+        self.execution_quality_gate = ExecutionQualityGate(bot_stage=BOT_STAGE)
 
         self.contract_cache = {}
         self.contract_min_ticks = {}
@@ -609,6 +2236,11 @@ class ScalpingBot:
         self.live_daily_stop_trigger_trade_id = None
         self.paper_daily_stop_day_key = None
         self.paper_symbol_daily_sl_stops = {}
+        self.daily_symbol_permission_lock = threading.RLock()
+        self.daily_symbol_permission_day_key = None
+        self.daily_symbol_permissions = {}
+        self.daily_symbol_permission_load_failed = False
+        self.daily_symbol_permission_load_failure_reason = None
         self.session_close_config_logged = False
         self.session_close_last_system_job_queued = {}
         self.session_close_symbol_states = {}
@@ -681,9 +2313,656 @@ class ScalpingBot:
             for symbol in INSTRUMENT_SPECS.keys()
         }
 
+        self.load_daily_symbol_permission_state()
+
         threading.Thread(target=self.execution_worker, daemon=True).start()
         threading.Thread(target=self.ib_watchdog, daemon=True).start()
         threading.Thread(target=self.session_close_monitor, daemon=True).start()
+
+    # ==========================================================
+    # TELEMETRY
+    # ==========================================================
+
+    def emit_telemetry_event(
+        self,
+        event_type,
+        event_group,
+        severity="info",
+        symbol=None,
+        trade_id=None,
+        order_id=None,
+        signal_id=None,
+        state=None,
+        reason=None,
+        latency_ms=None,
+        payload=None,
+    ):
+        writer = getattr(self, "telemetry_writer", None)
+        if writer is None:
+            return False
+        try:
+            return writer.emit(
+                event_type=event_type,
+                event_group=event_group,
+                severity=severity,
+                symbol=symbol,
+                trade_id=trade_id,
+                order_id=order_id,
+                signal_id=signal_id,
+                state=state,
+                reason=reason,
+                latency_ms=latency_ms,
+                payload=payload,
+            )
+        except Exception:
+            logger.exception(
+                "TELEMETRY_EMIT_FAILED | "
+                f"event_type={event_type}"
+            )
+            return False
+
+    def get_telemetry_counters(self):
+        writer = getattr(self, "telemetry_writer", None)
+        if writer is None:
+            return {
+                "emitted_count": 0,
+                "written_count": 0,
+                "dropped_count": 0,
+                "writer_error_count": 0,
+                "last_successful_write_at": None,
+                "last_writer_error_at": None,
+                "last_writer_error_message": None,
+                "queue_size": None,
+                "queue_maxsize": TELEMETRY_QUEUE_MAXSIZE,
+                "writer_alive": False,
+                "database_path": TELEMETRY_DB_PATH,
+            }
+        return writer.snapshot_counters()
+
+    def stop_telemetry_writer(self):
+        writer = getattr(self, "telemetry_writer", None)
+        if writer is None:
+            return
+        writer.stop(timeout_seconds=5.0)
+
+    def emit_queue_decision_event(
+        self,
+        normalized,
+        queued,
+        path,
+        blocked_by=None,
+        reason=None,
+        formal_contract=None,
+        gate_result=None,
+        policy=None,
+        latency_ms=None,
+        extra=None,
+    ):
+        if not isinstance(normalized, dict):
+            return False
+        payload = {
+            "path": path,
+            "queued": queued,
+            "blocked_by": blocked_by,
+            "reason": reason,
+            "payload_format": normalized.get("payload_format"),
+            "symbol": normalized.get("symbol"),
+            "side": normalized.get("side"),
+            "signal_id": normalized.get("signal_id"),
+            "strategy_family": normalized.get("strategy_family"),
+            "routing_status": normalized.get("routing_status"),
+            "routing_reason_code": normalized.get("routing_reason_code"),
+            "family_consistency_ok": normalized.get("family_consistency_ok"),
+        }
+        if isinstance(formal_contract, dict):
+            payload["formal_contract"] = {
+                "truth_classification": formal_contract.get("truth_classification"),
+                "det_classification": formal_contract.get("det_classification"),
+                "execution_intent_status": formal_contract.get("execution_intent_status"),
+                "generic_execution_permission": formal_contract.get("generic_execution_permission"),
+            }
+        if isinstance(gate_result, dict):
+            payload["gate_result"] = {
+                "gate_branch": gate_result.get("gate_branch"),
+                "queue_allowed": gate_result.get("queue_allowed"),
+                "execution_lane": gate_result.get("execution_lane"),
+                "promoted_from_shadow": gate_result.get("promoted_from_shadow"),
+                "execution_grade": gate_result.get("execution_grade"),
+                "reason": gate_result.get("reason"),
+            }
+        if isinstance(policy, dict):
+            payload["stage_policy"] = {
+                "policy_branch": policy.get("policy_branch"),
+                "allow_queue": policy.get("allow_queue"),
+                "reason": policy.get("reason"),
+            }
+        if isinstance(extra, dict):
+            payload["extra"] = extra
+        return self.emit_telemetry_event(
+            event_type="QUEUE_DECISION",
+            event_group="QUEUE",
+            severity="info",
+            symbol=normalized.get("symbol"),
+            signal_id=normalized.get("signal_id"),
+            state="queued" if queued else "not_queued",
+            reason=reason or blocked_by or path,
+            latency_ms=latency_ms,
+            payload=payload,
+        )
+
+    def emit_risk_gate_decision_event(self, job, gate_name, risk_regime):
+        if not isinstance(job, dict) or not isinstance(risk_regime, dict):
+            return False
+        execution_allowed = bool(risk_regime.get("execution_allowed"))
+        return self.emit_telemetry_event(
+            event_type="RISK_GATE_DECISION",
+            event_group="RISK_GATE",
+            severity="info" if execution_allowed else "warning",
+            symbol=job.get("symbol"),
+            signal_id=job.get("signal_id"),
+            state="allowed" if execution_allowed else "blocked",
+            reason=risk_regime.get("reason"),
+            payload={
+                "gate_name": gate_name,
+                "stage": risk_regime.get("stage"),
+                "risk_branch": risk_regime.get("risk_branch"),
+                "execution_allowed": execution_allowed,
+                "day_key": risk_regime.get("day_key"),
+                "trigger_trade_id": risk_regime.get("trigger_trade_id"),
+                "reason": risk_regime.get("reason"),
+                "job_type": job.get("job_type"),
+                "payload_format": job.get("payload_format"),
+                "side": job.get("side"),
+                "grade": job.get("grade"),
+            },
+        )
+
+    def evaluate_rolling_edge_shadow_decision(self, job):
+        if not isinstance(job, dict):
+            return None
+        evaluator = getattr(self, "rolling_edge_evaluator", None)
+        if evaluator is None:
+            evaluator = RollingEdgeShadowEvaluator()
+            self.rolling_edge_evaluator = evaluator
+
+        try:
+            decision = evaluator.evaluate(job)
+        except Exception as exc:
+            decision = evaluator.unavailable_decision(job, f"{type(exc).__name__}:{exc}")
+
+        candidate = decision.get("candidate") if isinstance(decision, dict) else {}
+        if not isinstance(candidate, dict):
+            candidate = {}
+        logger.info(
+            "ROLLING EXPECTANCY SHADOW DECISION | "
+            f"symbol={candidate.get('symbol')} "
+            f"grade={candidate.get('grade')} "
+            f"strategy_family={candidate.get('strategy_family')} "
+            f"session={candidate.get('session')} "
+            f"side={candidate.get('side')} "
+            f"bucket={decision.get('bucket_used') if isinstance(decision, dict) else None} "
+            f"bucket_fallback_level={decision.get('bucket_fallback_level') if isinstance(decision, dict) else None} "
+            f"would_allow={decision.get('would_allow') if isinstance(decision, dict) else None} "
+            f"reason={decision.get('reason') if isinstance(decision, dict) else None} "
+            f"sample_size={decision.get('sample_size') if isinstance(decision, dict) else None} "
+            f"expectancy_r={decision.get('expectancy_r') if isinstance(decision, dict) else None} "
+            f"net_pnl_total={decision.get('net_pnl_total') if isinstance(decision, dict) else None} "
+            f"avg_slippage_impact_r={decision.get('avg_slippage_impact_r') if isinstance(decision, dict) else None} "
+            "mode=shadow decision_effect=observability_only"
+        )
+        self.emit_edge_gate_decision_event(job, decision)
+        return decision
+
+    def emit_edge_gate_decision_event(self, job, decision):
+        if not isinstance(job, dict) or not isinstance(decision, dict):
+            return False
+        return self.emit_telemetry_event(
+            event_type="EDGE_GATE_DECISION",
+            event_group="EDGE_GATE",
+            severity="info" if decision.get("would_allow") is not False else "warning",
+            symbol=job.get("symbol"),
+            signal_id=job.get("signal_id"),
+            state="shadow",
+            reason=decision.get("reason"),
+            payload={
+                "mode": "shadow",
+                "would_allow": decision.get("would_allow"),
+                "reason": decision.get("reason"),
+                "bucket_used": decision.get("bucket_used"),
+                "bucket_fallback_level": decision.get("bucket_fallback_level"),
+                "bucket_fallback_name": decision.get("bucket_fallback_name"),
+                "candidate": decision.get("candidate"),
+                "sample_size": decision.get("sample_size"),
+                "analysis_ready_count": decision.get("analysis_ready_count"),
+                "net_pnl_total": decision.get("net_pnl_total"),
+                "expectancy_eur": decision.get("expectancy_eur"),
+                "expectancy_r": decision.get("expectancy_r"),
+                "winrate": decision.get("winrate"),
+                "profit_factor": decision.get("profit_factor"),
+                "profit_factor_reason": decision.get("profit_factor_reason"),
+                "max_drawdown": decision.get("max_drawdown"),
+                "avg_slippage_impact_r": decision.get("avg_slippage_impact_r"),
+                "time_exit_ratio": decision.get("time_exit_ratio"),
+                "emergency_flatten_ratio": decision.get("emergency_flatten_ratio"),
+                "short_window": decision.get("short_window"),
+                "long_window": decision.get("long_window"),
+                "cache_hit": decision.get("cache_hit"),
+                "cache_ttl_seconds": decision.get("cache_ttl_seconds"),
+                "telemetry_error": decision.get("telemetry_error"),
+            },
+        )
+
+    def evaluate_slippage_defense_shadow_decision(self, job, phase):
+        if not isinstance(job, dict):
+            return None
+        phase = "worker_pickup" if phase == "worker_pickup" else "pre_queue"
+        evaluator = getattr(self, "slippage_defense_evaluator", None)
+        if evaluator is None:
+            evaluator = SlippageDefenseShadowEvaluator()
+            self.slippage_defense_evaluator = evaluator
+
+        try:
+            if phase == "worker_pickup":
+                decision = evaluator.evaluate_worker_pickup(job)
+            else:
+                decision = evaluator.evaluate_pre_queue(job)
+        except Exception as exc:
+            decision = evaluator.unavailable_decision(phase, job, f"{type(exc).__name__}:{exc}")
+
+        logger.info(
+            "SLIPPAGE DEFENSE SHADOW DECISION | "
+            f"phase={decision.get('phase') if isinstance(decision, dict) else phase} "
+            f"symbol={decision.get('symbol') if isinstance(decision, dict) else job.get('symbol')} "
+            f"grade={decision.get('grade') if isinstance(decision, dict) else job.get('grade')} "
+            f"strategy_family={decision.get('strategy_family') if isinstance(decision, dict) else job.get('strategy_family')} "
+            f"session={decision.get('session') if isinstance(decision, dict) else None} "
+            f"side={decision.get('side') if isinstance(decision, dict) else job.get('side')} "
+            f"signal_id={decision.get('signal_id') if isinstance(decision, dict) else job.get('signal_id')} "
+            f"would_allow={decision.get('would_allow') if isinstance(decision, dict) else None} "
+            f"reason={decision.get('reason') if isinstance(decision, dict) else None} "
+            f"signal_age_sec={decision.get('signal_age_sec') if isinstance(decision, dict) else None} "
+            f"queue_age_sec={decision.get('queue_age_sec') if isinstance(decision, dict) else None} "
+            f"entry_drift_r={decision.get('entry_drift_r') if isinstance(decision, dict) else None} "
+            f"historical_avg_slippage_impact_r={decision.get('historical_avg_slippage_impact_r') if isinstance(decision, dict) else None} "
+            f"historical_sample_size={decision.get('historical_sample_size') if isinstance(decision, dict) else None} "
+            f"current_spread_status={decision.get('current_spread_status') if isinstance(decision, dict) else 'not_available'} "
+            "mode=shadow decision_effect=observability_only"
+        )
+        self.emit_slippage_defense_decision_event(job, decision)
+        return decision
+
+    def emit_slippage_defense_decision_event(self, job, decision):
+        if not isinstance(job, dict) or not isinstance(decision, dict):
+            return False
+        return self.emit_telemetry_event(
+            event_type="SLIPPAGE_DEFENSE_DECISION",
+            event_group="SLIPPAGE_DEFENSE",
+            severity="info" if decision.get("would_allow") is not False else "warning",
+            symbol=job.get("symbol"),
+            signal_id=job.get("signal_id"),
+            state=decision.get("phase"),
+            reason=decision.get("reason"),
+            payload=dict(decision),
+        )
+
+    def evaluate_trade_learning_advice(self, job):
+        if not isinstance(job, dict):
+            return None
+        advisor = getattr(self, "trade_learning_advisor", None)
+        if advisor is None:
+            advisor = TradeLearningAdvisor()
+            self.trade_learning_advisor = advisor
+
+        try:
+            decision = advisor.evaluate(job)
+        except Exception as exc:
+            decision = advisor.unavailable_decision(job, f"{type(exc).__name__}:{exc}")
+
+        logger.info(
+            "TRADE LEARNING ADVICE | "
+            f"symbol={decision.get('symbol') if isinstance(decision, dict) else job.get('symbol')} "
+            f"grade={decision.get('grade') if isinstance(decision, dict) else job.get('grade')} "
+            f"strategy_family={decision.get('strategy_family') if isinstance(decision, dict) else job.get('strategy_family')} "
+            f"session={decision.get('session') if isinstance(decision, dict) else None} "
+            f"side={decision.get('side') if isinstance(decision, dict) else job.get('side')} "
+            f"signal_id={decision.get('signal_id') if isinstance(decision, dict) else job.get('signal_id')} "
+            f"bucket={decision.get('bucket_used') if isinstance(decision, dict) else None} "
+            f"would_adjust={decision.get('would_adjust') if isinstance(decision, dict) else None} "
+            f"reason={decision.get('reason') if isinstance(decision, dict) else None} "
+            f"confidence={decision.get('confidence') if isinstance(decision, dict) else None} "
+            f"sample_size={decision.get('sample_size') if isinstance(decision, dict) else None} "
+            f"expectancy_r={decision.get('expectancy_r') if isinstance(decision, dict) else None} "
+            f"recent_expectancy_r={decision.get('recent_expectancy_r') if isinstance(decision, dict) else None} "
+            f"avg_slippage_impact_r={decision.get('avg_slippage_impact_r') if isinstance(decision, dict) else None} "
+            "mode=shadow decision_effect=observability_only"
+        )
+        self.emit_trade_learning_advice_event(job, decision)
+        return decision
+
+    def emit_trade_learning_advice_event(self, job, decision):
+        if not isinstance(job, dict) or not isinstance(decision, dict):
+            return False
+        return self.emit_telemetry_event(
+            event_type="TRADE_LEARNING_ADVICE",
+            event_group="TRADE_LEARNING",
+            severity="warning" if decision.get("would_adjust") is True else "info",
+            symbol=job.get("symbol"),
+            signal_id=job.get("signal_id"),
+            state="shadow",
+            reason=decision.get("reason"),
+            payload=dict(decision),
+        )
+
+    def evaluate_execution_quality_gate_decision(
+        self,
+        job,
+        edge_decision=None,
+        slippage_pre_queue_decision=None,
+        learning_decision=None,
+    ):
+        if not isinstance(job, dict):
+            return None
+        gate = getattr(self, "execution_quality_gate", None)
+        if gate is None:
+            gate = ExecutionQualityGate(bot_stage=BOT_STAGE)
+            self.execution_quality_gate = gate
+
+        try:
+            decision = gate.evaluate(
+                job,
+                edge_decision=edge_decision,
+                slippage_pre_queue_decision=slippage_pre_queue_decision,
+                learning_decision=learning_decision,
+            )
+        except Exception as exc:
+            decision = {
+                "mode": "shadow",
+                "enforcement_active": False,
+                "would_block": False,
+                "blocked": False,
+                "reason": "execution_quality_gate_error",
+                "block_sources": [],
+                "decision_effect": "observability_only",
+                "symbol": job.get("symbol"),
+                "grade": job.get("grade"),
+                "strategy_family": job.get("strategy_family"),
+                "side": job.get("side"),
+                "signal_id": job.get("signal_id"),
+                "telemetry_error": f"{type(exc).__name__}:{exc}",
+                "bot_stage": BOT_STAGE,
+            }
+
+        logger.info(
+            "EXECUTION QUALITY GATE DECISION | "
+            f"mode={decision.get('mode') if isinstance(decision, dict) else None} "
+            f"enforcement_active={decision.get('enforcement_active') if isinstance(decision, dict) else None} "
+            f"would_block={decision.get('would_block') if isinstance(decision, dict) else None} "
+            f"blocked={decision.get('blocked') if isinstance(decision, dict) else None} "
+            f"reason={decision.get('reason') if isinstance(decision, dict) else None} "
+            f"block_sources={decision.get('block_sources') if isinstance(decision, dict) else None} "
+            f"symbol={decision.get('symbol') if isinstance(decision, dict) else job.get('symbol')} "
+            f"grade={decision.get('grade') if isinstance(decision, dict) else job.get('grade')} "
+            f"strategy_family={decision.get('strategy_family') if isinstance(decision, dict) else job.get('strategy_family')} "
+            f"session={decision.get('session') if isinstance(decision, dict) else None} "
+            f"side={decision.get('side') if isinstance(decision, dict) else job.get('side')} "
+            f"signal_id={decision.get('signal_id') if isinstance(decision, dict) else job.get('signal_id')} "
+            f"decision_effect={decision.get('decision_effect') if isinstance(decision, dict) else 'observability_only'}"
+        )
+        self.emit_execution_quality_gate_decision_event(job, decision)
+        return decision
+
+    def emit_execution_quality_gate_decision_event(self, job, decision):
+        if not isinstance(job, dict) or not isinstance(decision, dict):
+            return False
+        return self.emit_telemetry_event(
+            event_type="EXECUTION_QUALITY_GATE_DECISION",
+            event_group="EXECUTION_QUALITY_GATE",
+            severity="warning" if decision.get("blocked") else "info",
+            symbol=job.get("symbol"),
+            signal_id=job.get("signal_id"),
+            state="blocked" if decision.get("blocked") else "observed",
+            reason=decision.get("reason"),
+            payload=dict(decision),
+        )
+
+    def build_trade_closed_telemetry_payload(self, record):
+        """Build an analysis-ready TRADE_CLOSED payload without mutating trading state."""
+        if not isinstance(record, dict):
+            return {
+                "event_schema_version": "trade_closed.v2",
+                "analysis_ready": False,
+                "missing_fields": ["record"],
+                "derived_metrics_status": {"net_r": "missing_inputs", "execution_quality": "unavailable"},
+            }
+
+        missing_fields = set()
+
+        def get_field(field_name, required=False):
+            value = record.get(field_name)
+            if required and (value is None or value == ""):
+                missing_fields.add(field_name)
+            return value
+
+        def to_float(value, field_name=None, required=False):
+            if value is None or value == "":
+                if required and field_name:
+                    missing_fields.add(field_name)
+                return None
+            try:
+                return float(value)
+            except Exception:
+                if field_name:
+                    missing_fields.add(field_name)
+                return None
+
+        symbol = get_field("symbol", required=True)
+        entry_price = to_float(get_field("entry_price", required=True), "entry_price", required=True)
+        stop_price = to_float(get_field("stop_price", required=True), "stop_price", required=True)
+        target_price = to_float(get_field("target_price", required=True), "target_price", required=True)
+        entry_fill_price = to_float(get_field("entry_fill_price", required=True), "entry_fill_price", required=True)
+        exit_fill_price = to_float(get_field("exit_fill_price", required=True), "exit_fill_price", required=True)
+        net_pnl = to_float(get_field("net_pnl", required=True), "net_pnl", required=True)
+        realized_entry_quantity = to_float(
+            get_field("realized_entry_quantity", required=True),
+            "realized_entry_quantity",
+            required=True,
+        )
+
+        for field_name in (
+            "trade_id",
+            "side",
+            "grade",
+            "strategy_family",
+            "exit_reason",
+            "gross_pnl",
+            "commission",
+        ):
+            get_field(field_name, required=True)
+
+        risk_distance_points = to_float(record.get("stop_distance_points"), "stop_distance_points")
+        if risk_distance_points is None and entry_price is not None and stop_price is not None:
+            risk_distance_points = abs(entry_price - stop_price)
+        if risk_distance_points is None or risk_distance_points <= 0:
+            missing_fields.add("risk_distance_points")
+
+        point_value = None
+        if symbol:
+            try:
+                point_value = float(self.get_point_value(symbol))
+            except Exception:
+                missing_fields.add("point_value")
+        else:
+            missing_fields.add("point_value")
+
+        tick_size = None
+        if symbol:
+            try:
+                tick_size = float(self.get_tick_size(symbol))
+            except Exception:
+                tick_size = None
+
+        planned_r_ticks = None
+        if risk_distance_points is not None and tick_size not in (None, 0):
+            planned_r_ticks = round(risk_distance_points / tick_size, 10)
+
+        planned_money_risk = None
+        net_r = None
+        net_r_missing_fields = set()
+        if net_pnl is None:
+            net_r_missing_fields.add("net_pnl")
+        if risk_distance_points is None or risk_distance_points <= 0:
+            net_r_missing_fields.add("risk_distance_points")
+        if point_value is None or point_value <= 0:
+            net_r_missing_fields.add("point_value")
+        if realized_entry_quantity is None or realized_entry_quantity <= 0:
+            net_r_missing_fields.add("realized_entry_quantity")
+
+        if not net_r_missing_fields:
+            planned_money_risk = risk_distance_points * point_value * realized_entry_quantity
+            if planned_money_risk > 0:
+                net_r = round(net_pnl / planned_money_risk, 10)
+            else:
+                net_r_missing_fields.add("planned_money_risk")
+
+        missing_fields.update(net_r_missing_fields)
+
+        try:
+            execution_metrics = self.calculate_execution_quality_metrics(record)
+            execution_quality_status = "complete"
+        except Exception:
+            execution_metrics = {
+                "entry_slippage": None,
+                "target_slippage": None,
+                "stop_slippage": None,
+                "exit_slippage": None,
+                "expected_gross_pnl": None,
+                "realized_vs_expected_gross": None,
+            }
+            execution_quality_status = "unavailable"
+
+        timing_metrics = self.build_trade_timing_metrics(record)
+        session_context = {
+            "session_name": record.get("session_name"),
+            "minutes_from_open": record.get("minutes_from_open"),
+            "session_profile": None,
+            "amsterdam_day_key": None,
+        }
+        if symbol:
+            try:
+                session_context["session_profile"] = self.get_instrument_spec(symbol).get("session_profile")
+            except Exception:
+                pass
+        try:
+            session_context["amsterdam_day_key"] = self.get_amsterdam_day_key(
+                record.get("exit_fill_time") or record.get("entry_fill_time")
+            )
+        except Exception:
+            session_context["amsterdam_day_key"] = None
+
+        if session_context["session_name"] is None:
+            missing_fields.add("session_name")
+
+        payload = {
+            "event_schema_version": "trade_closed.v2",
+            "analysis_ready": False,
+            "missing_fields": [],
+            "derived_metrics_status": {
+                "net_r": "complete" if net_r is not None else "missing_inputs",
+                "execution_quality": execution_quality_status,
+            },
+            "trade_id": record.get("trade_id"),
+            "run_id": record.get("run_id"),
+            "symbol": symbol,
+            "bot_stage": record.get("bot_stage"),
+            "state": record.get("state"),
+            "side": record.get("side"),
+            "grade": record.get("grade"),
+            "strategy_family": record.get("strategy_family"),
+            "payload_format": record.get("payload_format"),
+            "execution_lane": record.get("execution_lane"),
+            "promoted_from_shadow": record.get("promoted_from_shadow"),
+            "signal_id": record.get("signal_id"),
+            "session_context": session_context,
+            "signal_time": record.get("signal_time"),
+            "enqueue_time": record.get("enqueue_time"),
+            "entry_fill_time": record.get("entry_fill_time"),
+            "exit_fill_time": record.get("exit_fill_time"),
+            "signal_entry_price": record.get("entry_signal_price"),
+            "planned_entry": record.get("entry_price"),
+            "spread_adjusted_entry": record.get("entry_spread_adjusted"),
+            "actual_entry_fill": record.get("entry_fill_price"),
+            "stop": record.get("stop_price"),
+            "target": record.get("target_price"),
+            "planned_r_points": risk_distance_points,
+            "planned_r_ticks": planned_r_ticks,
+            "planned_money_risk": round(planned_money_risk, 10) if planned_money_risk is not None else None,
+            "point_value": point_value,
+            "tick_size": tick_size,
+            "actual_exit_fill": record.get("exit_fill_price"),
+            "exit_reason": record.get("exit_reason"),
+            "gross_pnl": record.get("gross_pnl"),
+            "commission": record.get("commission"),
+            "net_pnl": record.get("net_pnl"),
+            "net_r": net_r,
+            "entry_slippage": execution_metrics.get("entry_slippage"),
+            "exit_slippage": execution_metrics.get("exit_slippage"),
+            "target_slippage": execution_metrics.get("target_slippage"),
+            "stop_slippage": execution_metrics.get("stop_slippage"),
+            "expected_gross_pnl": execution_metrics.get("expected_gross_pnl"),
+            "realized_vs_expected_gross": execution_metrics.get("realized_vs_expected_gross"),
+            "queue_wait_sec": timing_metrics.get("queue_wait_sec"),
+            "webhook_to_classification_sec": timing_metrics.get("webhook_to_classification_sec"),
+            "classification_to_queue_sec": timing_metrics.get("classification_to_queue_sec"),
+            "pickup_to_preflight_sec": timing_metrics.get("pickup_to_preflight_sec"),
+            "preflight_to_submit_sec": timing_metrics.get("preflight_to_submit_sec"),
+            "submit_to_broker_ack_sec": timing_metrics.get("submit_to_broker_ack_sec"),
+            "submit_to_entry_fill_sec": timing_metrics.get("submit_to_entry_fill_sec"),
+            "entry_to_exit_sec": timing_metrics.get("entry_to_exit_sec"),
+            "total_trade_lifecycle_sec": timing_metrics.get("total_trade_lifecycle_sec"),
+            "duration_to_fill_sec": self.seconds_between(
+                record.get("execution_start_time"),
+                record.get("entry_fill_time"),
+            ),
+            "duration_in_trade_sec": self.seconds_between(
+                record.get("entry_fill_time"),
+                record.get("exit_fill_time"),
+            ),
+            "time_exit_status": record.get("time_exit_status"),
+            "time_exit_reason": record.get("time_exit_reason"),
+            "emergency_flatten_status": record.get("protective_emergency_status"),
+            "emergency_flatten_reason": record.get("emergency_flatten_reason"),
+            "emergency_flatten_quantity": record.get("emergency_flatten_quantity"),
+            "tp_exit_quantity": record.get("tp_exit_quantity"),
+            "sl_exit_quantity": record.get("sl_exit_quantity"),
+            "emergency_flatten_exit_quantity": record.get("emergency_flatten_exit_quantity"),
+            "realized_entry_quantity": record.get("realized_entry_quantity"),
+            "realized_exit_quantity": record.get("realized_exit_quantity"),
+            "execution_validation_status": record.get("execution_validation_status"),
+            "containment_status": record.get("containment_status"),
+            "containment_action": record.get("containment_action"),
+        }
+        payload["missing_fields"] = sorted(missing_fields)
+        payload["analysis_ready"] = not payload["missing_fields"] and net_r is not None
+        return payload
+
+    def emit_trade_closed_event(self, record):
+        if not isinstance(record, dict):
+            return False
+        if record.get("telemetry_trade_closed_emitted"):
+            return False
+        payload = self.build_trade_closed_telemetry_payload(record)
+        record["telemetry_trade_closed_emitted"] = True
+        return self.emit_telemetry_event(
+            event_type="TRADE_CLOSED",
+            event_group="TRADE_LIFECYCLE",
+            severity="info",
+            symbol=record.get("symbol"),
+            trade_id=record.get("trade_id"),
+            signal_id=record.get("signal_id"),
+            state=record.get("state"),
+            reason=record.get("exit_reason"),
+            payload=payload,
+        )
 
     # ==========================================================
     # PRICE LOGIC
@@ -2127,6 +4406,209 @@ class ScalpingBot:
 
         return day_key
 
+    def get_daily_symbol_permission_state_path(self):
+        def safe_part(value):
+            text = str(value or "default").strip()
+            return "".join(
+                character if character.isalnum() or character in {"-", "_"} else "_"
+                for character in text
+            ) or "default"
+
+        filename = (
+            f"{safe_part(BOT_NAME)}_"
+            f"{safe_part(BOT_STAGE)}_"
+            f"{safe_part(BOT_ACCOUNT_CONTEXT)}_daily_symbol_permission.json"
+        )
+        return os.path.join("runtime_state", filename)
+
+    def normalize_daily_symbol_permission_state(self, loaded_state):
+        if not isinstance(loaded_state, dict):
+            raise ValueError("daily_symbol_permission_state_not_object")
+
+        day_key = loaded_state.get("day_key")
+        if day_key is not None:
+            day_key = str(day_key)
+
+        raw_symbols = loaded_state.get("symbols", {})
+        if not isinstance(raw_symbols, dict):
+            raise ValueError("daily_symbol_permission_symbols_not_object")
+
+        symbols = {}
+        for symbol, state in raw_symbols.items():
+            normalized_symbol = str(symbol or "").strip().upper()
+            if not normalized_symbol or not isinstance(state, dict):
+                continue
+            normalized_state = dict(state)
+            normalized_state["symbol"] = normalized_symbol
+            symbols[normalized_symbol] = normalized_state
+
+        return day_key, symbols
+
+    def load_daily_symbol_permission_state(self):
+        path = self.get_daily_symbol_permission_state_path()
+        with self.daily_symbol_permission_lock:
+            self.daily_symbol_permission_day_key = None
+            self.daily_symbol_permissions = {}
+            self.daily_symbol_permission_load_failed = False
+            self.daily_symbol_permission_load_failure_reason = None
+
+            if not os.path.exists(path):
+                logger.warning(
+                    "ACC SYMBOL DAILY PERMISSION LOADED | "
+                    f"path={path} "
+                    "state=empty_missing_file"
+                )
+                return True
+
+            try:
+                with open(path, "r", encoding="utf-8") as state_file:
+                    loaded_state = json.load(state_file)
+                day_key, symbols = self.normalize_daily_symbol_permission_state(loaded_state)
+                self.daily_symbol_permission_day_key = day_key
+                self.daily_symbol_permissions = symbols
+                logger.warning(
+                    "ACC SYMBOL DAILY PERMISSION LOADED | "
+                    f"path={path} "
+                    f"day_key={day_key} "
+                    f"symbols={sorted(symbols.keys())}"
+                )
+                return True
+            except Exception as exc:
+                self.daily_symbol_permission_load_failed = True
+                self.daily_symbol_permission_load_failure_reason = str(exc)
+                logger.critical(
+                    "ACC SYMBOL DAILY PERMISSION LOAD_FAILED | "
+                    f"path={path} "
+                    f"reason={exc} "
+                    "decision=fail_closed_for_acc_entries"
+                )
+                return False
+
+    def save_daily_symbol_permission_state_locked(self):
+        path = self.get_daily_symbol_permission_state_path()
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        payload = {
+            "bot_name": BOT_NAME,
+            "bot_stage": BOT_STAGE,
+            "account_context": BOT_ACCOUNT_CONTEXT,
+            "day_key": self.daily_symbol_permission_day_key,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "symbols": self.daily_symbol_permissions,
+        }
+        with open(tmp_path, "w", encoding="utf-8") as state_file:
+            json.dump(payload, state_file, sort_keys=True, default=self.to_iso)
+        os.replace(tmp_path, path)
+        logger.warning(
+            "ACC SYMBOL DAILY PERMISSION SAVED | "
+            f"path={path} "
+            f"day_key={self.daily_symbol_permission_day_key} "
+            f"symbols={sorted(self.daily_symbol_permissions.keys())}"
+        )
+
+    def refresh_daily_symbol_permission_state(self, reason_label, reference_time=None):
+        day_key = self.get_amsterdam_day_key(reference_time)
+        with self.daily_symbol_permission_lock:
+            if self.daily_symbol_permission_day_key is None:
+                self.daily_symbol_permission_day_key = day_key
+                return day_key
+
+            if self.daily_symbol_permission_day_key != day_key:
+                previous_day_key = self.daily_symbol_permission_day_key
+                previous_permissions = dict(self.daily_symbol_permissions)
+                self.daily_symbol_permission_day_key = day_key
+                self.daily_symbol_permissions = {}
+                logger.warning(
+                    "ACC SYMBOL DAILY PERMISSION RESET | "
+                    f"old_day_key={previous_day_key} "
+                    f"new_day_key={day_key} "
+                    f"previous_permissions={json.dumps(previous_permissions, sort_keys=True, default=self.to_iso)} "
+                    f"reason={reason_label}"
+                )
+                self.save_daily_symbol_permission_state_locked()
+
+        return day_key
+
+    def has_entry_exposure_for_daily_permission(self, record):
+        if not isinstance(record, dict):
+            return False
+        try:
+            realized_entry_quantity = float(record.get("realized_entry_quantity") or 0.0)
+        except Exception:
+            realized_entry_quantity = 0.0
+        return bool(record.get("entry_filled") is True and realized_entry_quantity > 0)
+
+    def classify_daily_symbol_permission_outcome(self, record):
+        if not self.has_entry_exposure_for_daily_permission(record):
+            return None
+
+        try:
+            realized_entry_quantity = float(record.get("realized_entry_quantity") or 0.0)
+            tp_exit_quantity = float(record.get("tp_exit_quantity") or 0.0)
+            sl_exit_quantity = float(record.get("sl_exit_quantity") or 0.0)
+            emergency_flatten_exit_quantity = float(record.get("emergency_flatten_exit_quantity") or 0.0)
+        except Exception:
+            return "NON_FULL_TP_BLOCK"
+
+        full_tp = (
+            record.get("closed") is True
+            and record.get("entry_filled") is True
+            and realized_entry_quantity > 0
+            and record.get("exit_reason") == "TP"
+            and tp_exit_quantity >= realized_entry_quantity - 1e-9
+            and sl_exit_quantity == 0
+            and emergency_flatten_exit_quantity == 0
+        )
+        return "FULL_TP" if full_tp else "NON_FULL_TP_BLOCK"
+
+    def update_daily_symbol_permission_from_terminal_trade(self, record):
+        if BOT_STAGE not in {"ACC", "PRD"} and record.get("bot_stage") not in {"ACC", "PRD"}:
+            return
+
+        outcome = self.classify_daily_symbol_permission_outcome(record)
+        if outcome is None:
+            return
+
+        symbol = str(record.get("symbol") or "").upper()
+        if not symbol:
+            return
+
+        day_key = self.refresh_daily_symbol_permission_state(
+            "ACC_TERMINAL_EXPOSURE_TRADE",
+            record.get("exit_fill_time") or datetime.now(timezone.utc),
+        )
+        permission_status = "ALLOW_AFTER_FULL_TP" if outcome == "FULL_TP" else "BLOCK_NON_FULL_TP"
+        state = {
+            "symbol": symbol,
+            "day_key": day_key,
+            "permission_status": permission_status,
+            "terminal_outcome": outcome,
+            "trade_id": record.get("trade_id"),
+            "exit_reason": record.get("exit_reason"),
+            "entry_filled": bool(record.get("entry_filled")),
+            "realized_entry_quantity": record.get("realized_entry_quantity"),
+            "tp_exit_quantity": record.get("tp_exit_quantity"),
+            "sl_exit_quantity": record.get("sl_exit_quantity"),
+            "emergency_flatten_exit_quantity": record.get("emergency_flatten_exit_quantity"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with self.daily_symbol_permission_lock:
+            self.daily_symbol_permissions[symbol] = state
+            self.save_daily_symbol_permission_state_locked()
+
+        logger.warning(
+            "ACC SYMBOL DAILY PERMISSION UPDATED | "
+            f"stage={BOT_STAGE} "
+            f"day_key={day_key} "
+            f"symbol={symbol} "
+            f"trade_id={record.get('trade_id')} "
+            f"terminal_outcome={outcome} "
+            f"permission_status={permission_status} "
+            f"exit_reason={record.get('exit_reason')}"
+        )
+
     def activate_paper_symbol_daily_sl_stop(self, symbol, trade_id, exit_time=None):
         day_key = self.refresh_paper_daily_stop_state("ACC_SYMBOL_SL_TRIGGER", exit_time)
         stop = self.paper_symbol_daily_sl_stops.get(symbol)
@@ -2167,52 +4649,96 @@ class ScalpingBot:
     def evaluate_paper_execution_risk_regime(self, job):
         stage = BOT_STAGE
 
-        if stage != "ACC":
+        if stage not in {"ACC", "PRD"}:
             return {
                 "stage": stage,
                 "risk_branch": "non_acc_regime",
                 "execution_allowed": True,
-                "reason": "acc_symbol_daily_sl_stop_not_applicable",
+                "reason": "acc_symbol_daily_permission_not_applicable",
             }
 
-        day_key = self.refresh_paper_daily_stop_state("ACC_EXECUTION_GATE")
+        day_key = self.refresh_daily_symbol_permission_state("ACC_EXECUTION_GATE")
         incoming_symbol = job["symbol"]
-        stop = self.paper_symbol_daily_sl_stops.get(incoming_symbol)
 
-        if stop and stop.get("active") and stop.get("day_key") == day_key:
-            reason = "acc_symbol_daily_sl_stop_active"
-            logger.warning(
-                "ACC SYMBOL DAILY SL STOP DENIAL | "
+        with self.daily_symbol_permission_lock:
+            if self.daily_symbol_permission_load_failed:
+                reason = "acc_symbol_daily_permission_state_load_failed"
+                logger.critical(
+                    "ACC SYMBOL DAILY PERMISSION DENIAL | "
+                    f"stage={stage} "
+                    f"day_key={day_key} "
+                    f"incoming_symbol={incoming_symbol} "
+                    f"reason={reason} "
+                    f"load_failure={self.daily_symbol_permission_load_failure_reason} "
+                    "decision=fail_closed"
+                )
+                return {
+                    "stage": stage,
+                    "risk_branch": "acc_symbol_daily_permission_load_failed",
+                    "execution_allowed": False,
+                    "day_key": day_key,
+                    "trigger_trade_id": None,
+                    "reason": reason,
+                }
+
+            symbol_permission = self.daily_symbol_permissions.get(str(incoming_symbol).upper())
+
+        if symbol_permission and symbol_permission.get("day_key") == day_key:
+            if symbol_permission.get("permission_status") != "ALLOW_AFTER_FULL_TP":
+                reason = "acc_symbol_daily_permission_block"
+                logger.warning(
+                    "ACC SYMBOL DAILY PERMISSION DENIAL | "
+                    f"stage={stage} "
+                    f"day_key={day_key} "
+                    f"incoming_symbol={incoming_symbol} "
+                    f"trigger_trade_id={symbol_permission.get('trade_id')} "
+                    f"terminal_outcome={symbol_permission.get('terminal_outcome')} "
+                    f"permission_status={symbol_permission.get('permission_status')} "
+                    f"reason={reason}"
+                )
+                return {
+                    "stage": stage,
+                    "risk_branch": "acc_symbol_daily_permission_block",
+                    "execution_allowed": False,
+                    "day_key": day_key,
+                    "trigger_trade_id": symbol_permission.get("trade_id"),
+                    "reason": reason,
+                }
+
+            logger.info(
+                "ACC SYMBOL DAILY PERMISSION ALLOW | "
                 f"stage={stage} "
                 f"day_key={day_key} "
                 f"incoming_symbol={incoming_symbol} "
-                f"trigger_trade_id={stop.get('trigger_trade_id')} "
-                f"reason={reason}"
+                f"last_trade_id={symbol_permission.get('trade_id')} "
+                f"terminal_outcome={symbol_permission.get('terminal_outcome')} "
+                f"permission_status={symbol_permission.get('permission_status')} "
+                "reason=last_terminal_exposure_trade_full_tp"
             )
             return {
                 "stage": stage,
-                "risk_branch": "acc_symbol_daily_sl_stop_active",
-                "execution_allowed": False,
+                "risk_branch": "acc_symbol_daily_permission_allow_after_full_tp",
+                "execution_allowed": True,
                 "day_key": day_key,
-                "trigger_trade_id": stop.get("trigger_trade_id"),
-                "reason": reason,
+                "trigger_trade_id": symbol_permission.get("trade_id"),
+                "reason": "last_terminal_exposure_trade_full_tp",
             }
 
         logger.info(
-            "ACC SYMBOL DAILY SL STOP CLEAR | "
+            "ACC SYMBOL DAILY PERMISSION ALLOW | "
             f"stage={stage} "
             f"day_key={day_key} "
             f"incoming_symbol={incoming_symbol} "
             "trigger_trade_id=None "
-            "reason=acc_symbol_daily_sl_stop_clear"
+            "reason=no_terminal_exposure_trade_for_symbol_today"
         )
         return {
             "stage": stage,
-            "risk_branch": "acc_symbol_daily_sl_stop_clear",
+            "risk_branch": "acc_symbol_daily_permission_clear",
             "execution_allowed": True,
             "day_key": day_key,
             "trigger_trade_id": None,
-            "reason": "acc_symbol_daily_sl_stop_clear",
+            "reason": "no_terminal_exposure_trade_for_symbol_today",
         }
 
     def to_iso(self, value):
@@ -5594,6 +8120,18 @@ class ScalpingBot:
             "contract_sec_type": job.get("contract_sec_type"),
             "side": job["side"],
             "grade": job.get("grade", ""),
+            "strategy_family": job.get("strategy_family"),
+            "payload_format": job.get("payload_format"),
+            "session_name": (
+                job.get("normalized_signal", {}).get("session_name")
+                if isinstance(job.get("normalized_signal"), dict)
+                else None
+            ),
+            "minutes_from_open": (
+                job.get("normalized_signal", {}).get("minutes_from_open")
+                if isinstance(job.get("normalized_signal"), dict)
+                else None
+            ),
             "truth_classification": job.get("truth_classification", ""),
             "det_classification": job.get("det_classification", ""),
             "primary_reason": job.get("primary_reason", ""),
@@ -12510,20 +15048,6 @@ class ScalpingBot:
                         symbol_bucket.get("time_exit_count", 0) + 1
                     )
 
-                paper_sl_component_present = (
-                    record["exit_reason"] == "SL"
-                    or (
-                        record["exit_reason"] == "MIXED_EXIT"
-                        and float(record.get("sl_exit_quantity") or 0.0) > 0
-                    )
-                )
-
-                if record.get("bot_stage") == "ACC" and paper_sl_component_present:
-                    self.activate_paper_symbol_daily_sl_stop(
-                        record["symbol"],
-                        record["trade_id"],
-                        record["exit_fill_time"]
-                    )
             else:
                 if record["entry_filled"] and not exit_complete:
                     self.append_anomaly(trade_id, "INCOMPLETE_ENTRY_WITHOUT_FULL_EXIT")
@@ -12548,6 +15072,10 @@ class ScalpingBot:
                     self.aggregate_stats["incomplete_count"] += 1
                     if self.is_shadow_test_trade(record):
                         self.aggregate_stats["shadow_test_incomplete_count"] += 1
+
+            self.update_daily_symbol_permission_from_terminal_trade(record)
+            if record.get("closed") is True and record.get("state") == "CLOSED":
+                self.emit_trade_closed_event(record)
 
             if exit_complete:
                 finalize_decision = "summarize_exit_complete"
@@ -18929,6 +21457,14 @@ class ScalpingBot:
                     "routing_authority=bot_side_family_resolution "
                     "blocked_by=routing_layer"
                 )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="routing_block",
+                    blocked_by="routing_layer",
+                    reason=routing_block_status,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                )
                 return self.log_webhook_processing_timing(
                     routing_block_status,
                     webhook_timing_start_ms,
@@ -19026,6 +21562,17 @@ class ScalpingBot:
                     "blocked_by=stage_execution_policy "
                     f"reason={policy['reason']}"
                 )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path=policy["policy_branch"],
+                    blocked_by="stage_execution_policy",
+                    reason=policy["reason"],
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                )
                 return self.log_webhook_processing_timing(
                     "enriched_candidate_classified_no_execution",
                     webhook_timing_start_ms,
@@ -19050,6 +21597,17 @@ class ScalpingBot:
                     f"queued=false "
                     "blocked_by=det_execution_gate "
                     f"reason={gate_result['reason']}"
+                )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path=gate_result["gate_branch"],
+                    blocked_by="det_execution_gate",
+                    reason=gate_result["reason"],
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
                 )
                 return self.log_webhook_processing_timing(
                     "enriched_candidate_classified_no_execution",
@@ -19105,6 +21663,17 @@ class ScalpingBot:
                     "blocked_by=missing_price_reference "
                     f"reason=missing_price_reference"
                 )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="det_gated_execution",
+                    blocked_by="missing_price_reference",
+                    reason="missing_price_reference",
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                )
                 return self.log_webhook_processing_timing(
                     "enriched_candidate_missing_price",
                     webhook_timing_start_ms,
@@ -19132,6 +21701,17 @@ class ScalpingBot:
                     f"side={side} "
                     f"queued=false "
                     "blocked_by=candidate_entry_derivation"
+                )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="candidate_entry_derivation_failed",
+                    blocked_by="candidate_entry_derivation",
+                    reason="candidate_entry_derivation_failed",
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
                 )
                 return self.log_webhook_processing_timing(
                     "enriched_candidate_entry_derivation_failed",
@@ -19161,6 +21741,24 @@ class ScalpingBot:
                     f"queued=false "
                     "blocked_by=entry_band_validation"
                 )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="entry_band_validation_failed",
+                    blocked_by="entry_band_validation",
+                    reason="entry_band_validation_failed",
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                    extra={
+                        "grade": execution_grade,
+                        "reference_price": reference_price,
+                        "candidate_executable_entry": candidate_executable_entry,
+                        "actual_drift": actual_drift,
+                        "allowed_limit_price_distance": allowed_limit,
+                    },
+                )
                 return self.log_webhook_processing_timing(
                     "enriched_candidate_entry_band_rejected",
                     webhook_timing_start_ms,
@@ -19173,6 +21771,18 @@ class ScalpingBot:
 
             if key == self.last_signal and now - self.last_signal_time < 5:
                 logger.info("Duplicate ignored")
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="duplicate_signal_guard",
+                    blocked_by="duplicate_signal_guard",
+                    reason="duplicate_ignored",
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                    extra={"duplicate_key": key},
+                )
                 return self.log_webhook_processing_timing(
                     "duplicate_ignored",
                     webhook_timing_start_ms,
@@ -19250,6 +21860,60 @@ class ScalpingBot:
                     queued=False,
                 )
 
+            slippage_pre_queue_decision = self.evaluate_slippage_defense_shadow_decision(job, "pre_queue")
+            edge_decision = self.evaluate_rolling_edge_shadow_decision(job)
+            learning_decision = self.evaluate_trade_learning_advice(job)
+            execution_quality_decision = self.evaluate_execution_quality_gate_decision(
+                job,
+                edge_decision=edge_decision,
+                slippage_pre_queue_decision=slippage_pre_queue_decision,
+                learning_decision=learning_decision,
+            )
+            if isinstance(execution_quality_decision, dict) and execution_quality_decision.get("blocked") is True:
+                logger.warning(
+                    "QUEUE DECISION | "
+                    f"path=execution_quality_gate "
+                    f"payload_format={normalized['payload_format']} "
+                    f"signal_id={normalized['signal_id']} "
+                    f"symbol={normalized['symbol']} "
+                    f"side={normalized['side']} "
+                    f"truth_classification={formal_contract['truth_classification']} "
+                    f"det_classification={formal_contract['det_classification']} "
+                    f"execution_lane={job['execution_lane']} "
+                    f"promoted_from_shadow={job['promoted_from_shadow']} "
+                    f"execution_intent_status={formal_contract['execution_intent_status']} "
+                    f"generic_execution_permission={formal_contract['generic_execution_permission']} "
+                    f"shadow_override_reason={job['shadow_override_reason']} "
+                    "queued=false "
+                    "blocked_by=execution_quality_gate "
+                    f"reason={execution_quality_decision.get('reason')} "
+                    f"block_sources={execution_quality_decision.get('block_sources')}"
+                )
+                self.emit_queue_decision_event(
+                    normalized,
+                    queued=False,
+                    path="execution_quality_gate",
+                    reason="execution_quality_gate_block",
+                    formal_contract=formal_contract,
+                    gate_result=gate_result,
+                    policy=policy,
+                    blocked_by="execution_quality_gate",
+                    latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                    extra={
+                        "quality_gate_decision": execution_quality_decision,
+                        "reference_price": job.get("reference_price"),
+                        "planned_executable_entry": job.get("planned_executable_entry"),
+                        "grade": job.get("grade"),
+                        "execution_lane": job.get("execution_lane"),
+                    },
+                )
+                return self.log_webhook_processing_timing(
+                    "execution_quality_gate_block",
+                    webhook_timing_start_ms,
+                    normalized,
+                    queued=False,
+                )
+
             logger.info(
                 "QUEUE PUT | "
                 f"symbol={job['symbol']} "
@@ -19291,6 +21955,24 @@ class ScalpingBot:
                     f"generic_execution_permission={formal_contract['generic_execution_permission']} "
                     f"shadow_override_reason={job['shadow_override_reason']} "
                     f"queued=true"
+            )
+            self.emit_queue_decision_event(
+                normalized,
+                queued=True,
+                path="det_gated_execution",
+                reason="queued",
+                formal_contract=formal_contract,
+                gate_result=gate_result,
+                policy=policy,
+                latency_ms=self.elapsed_ms(webhook_timing_start_ms),
+                extra={
+                    "reference_price": job.get("reference_price"),
+                    "planned_executable_entry": job.get("planned_executable_entry"),
+                    "grade": job.get("grade"),
+                    "execution_lane": job.get("execution_lane"),
+                    "promoted_from_shadow": job.get("promoted_from_shadow"),
+                    "shadow_override_reason": job.get("shadow_override_reason"),
+                },
             )
             return self.log_webhook_processing_timing(
                 "queued",
@@ -19501,6 +22183,8 @@ class ScalpingBot:
                         self.process_broker_system_job(job)
                         continue
 
+                    self.evaluate_slippage_defense_shadow_decision(job, "worker_pickup")
+
                     external_entry_blocked, block_source, block_reason = self.should_block_external_entry()
                     if external_entry_blocked:
                         self.log_external_entry_blocked(
@@ -19581,6 +22265,7 @@ class ScalpingBot:
                         continue
 
                     risk_regime = self.evaluate_live_execution_risk_regime(job)
+                    self.emit_risk_gate_decision_event(job, "live_daily_sl_stop", risk_regime)
                     if not risk_regime["execution_allowed"]:
                         logger.warning(
                             "EXECUTION RISK REGIME BLOCKED | "
@@ -19599,6 +22284,7 @@ class ScalpingBot:
                         continue
 
                     paper_risk_regime = self.evaluate_paper_execution_risk_regime(job)
+                    self.emit_risk_gate_decision_event(job, "daily_symbol_permission", paper_risk_regime)
                     if not paper_risk_regime["execution_allowed"]:
                         logger.warning(
                             "EXECUTION RISK REGIME BLOCKED | "
@@ -19612,7 +22298,7 @@ class ScalpingBot:
                         logger.warning(
                             "EXECUTION WORKER EXECUTION SKIPPED | "
                             f"symbol={job.get('symbol')} "
-                            "reason=acc_symbol_daily_sl_stop"
+                            "reason=acc_symbol_daily_permission_block"
                         )
                         continue
 
@@ -21176,6 +23862,7 @@ def shutdown_event():
             f"session_socket_connected={getattr(runtime_bot, 'session_socket_connected', None)} "
             "decision=release_process_lock_without_direct_ibkr_call"
         )
+        runtime_bot.stop_telemetry_writer()
     release_runtime_process_lock()
     logger.warning("BOT_SHUTDOWN_COMPLETE")
 
@@ -21231,6 +23918,15 @@ def health():
         "startup_reconciliation_ambiguous_symbols": (
             sorted(runtime_bot.startup_reconciliation_ambiguous_symbols) if runtime_bot else []
         ),
+        "telemetry_database_path": (
+            TELEMETRY_DB_PATH
+        ),
+        "telemetry_queue_maxsize": (
+            TELEMETRY_QUEUE_MAXSIZE
+        ),
+        "telemetry_counters": (
+            runtime_bot.get_telemetry_counters() if runtime_bot else None
+        ),
     }
 
 @app.post("/webhook/tradingview")
@@ -21283,6 +23979,16 @@ async def webhook_handler(request: Request):
     logger.info(
         "WEBHOOK RECEIVED SANITIZED | "
         f"{json.dumps(build_sanitized_payload_summary(data), sort_keys=True)}"
+    )
+    runtime_bot.emit_telemetry_event(
+        event_type="WEBHOOK_ACCEPTED",
+        event_group="WEBHOOK",
+        severity="info",
+        symbol=data.get("symbol"),
+        signal_id=data.get("signal_id"),
+        state="accepted",
+        reason="auth_ok",
+        payload=build_sanitized_payload_summary(data),
     )
 
     try:
